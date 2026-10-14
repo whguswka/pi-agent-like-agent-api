@@ -14,7 +14,7 @@ pi 에는 hook 설정 파일이 따로 없다. hook 은 확장(TypeScript 파일
    - 오래 걸린 작업이 끝나면 알림: `"notify_after_seconds": 60`
    - 계획을 먼저 세우고 확인받기: `/plan`, `/mode`
 3. 파일 위치를 정한다: pi 설정 폴더의 `extensions/my-<이름>.ts`
-   - pi 설정 폴더는 이 SKILL.md 의 위치(스킬 목록의 location)에서 `skills/hook-creator/SKILL.md` 를 뺀 곳이다 (예: `C:/Users/<사용자>/.pi/agent/`).
+   - pi 설정 폴더는 이 SKILL.md 의 위치(스킬 목록의 location)에서 `skills/hook-creator/SKILL.md` 를 뺀 곳이다 (예: `/home/jovyan/.pi/agent/`).
      그 절대 경로로 쓴다.
    - 이름은 `my-` 로 시작한다. 키트 확장(guard, notify, kit, undo, modes, memory, files, wiki, `lib/`)은 고치지 않는다: 업데이트 때 새 판으로 덮어쓴다. `my-` 확장은 업데이트해도 그대로 남는다.
    - 작업 폴더 밖이라 쓰기 전에 확인 창이 뜬다.
