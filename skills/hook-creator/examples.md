@@ -86,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const RULES_FILE = "Z:/팀/pi/rules.md"; // 한 줄에 규칙 하나 ('- ' 는 빼고 읽음). 없으면 아무것도 하지 않음
+const RULES_FILE = "/mnt/team/pi/rules.md"; // 한 줄에 규칙 하나 ('- ' 는 빼고 읽음). 없으면 아무것도 하지 않음
 
 export default function (pi: ExtensionAPI) {
 	let rules: string[] = [];
