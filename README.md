@@ -7,7 +7,7 @@
 pi 는 터미널에서 동작합니다. 할 일을 말로 지시하면 LLM 과 주고받으면서 파일을 읽고 고치고, 명령을 실행해 결과를 확인합니다.
 
 > **처음이면 [한 장 요약 (빠른 시작)](docs/빠른시작.md)** 부터 보세요. 설치, LLM 연결, 매일 쓰는 법, 자주 쓰는 명령(`/plan`, `@파일`, `/undo`, `/remember` 등)이 한 장에 있습니다.
-> LLM 서버 연결은 [API 연결](docs/API-연결.md), 사람이 직접 하는 일(반입, 설치, 업데이트, 되돌리기)은 [수동 작업 절차](docs/수동-작업-절차.md), 판마다 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 있습니다.
+> LLM 서버 연결은 [API 연결](docs/API-연결.md), 사람이 직접 하는 일(반입, 설치, 업데이트, 되돌리기)은 [수동 작업 절차](docs/수동-작업-절차.md), 버전마다 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 있습니다.
 
 ```
 [브라우저] ── Kubeflow 노트북 (code-server / VS Code 웹)
@@ -15,7 +15,7 @@ pi 는 터미널에서 동작합니다. 할 일을 말로 지시하면 LLM 과 �
                                 └── 두뇌(LLM): OpenAI 호환 API (vLLM 등). 주소와 모델 이름은 ~/.pi/agent/models.json
 ```
 - JupyterLab 터미널 같은 다른 Linux 터미널에서도 같은 방법으로 씁니다.
-- 이 저장소는 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 에서 웹 채팅 연결 부분을 빼고, API 로 쓰는 부분만 Kubeflow 노트북용으로 남긴 판입니다.
+- 이 저장소는 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 에서 웹 채팅 연결 부분을 빼고, API 로 쓰는 부분만 Kubeflow 노트북용으로 남긴 키트입니다.
 
 ## 목차
 1. [준비물](#1-준비물)
@@ -137,7 +137,7 @@ pi -p "이 폴더의 파이썬 파일 목록과 역할을 알려줘"     # 한 �
 | 자주 하는 일 | 기본 명령 `/init` `/handoff` `/review` `/test` `/commit` `/explain` ([5장](#5-지침-스킬-메모리)) |
 | 명령 목록 | `/` 를 치면 나옴 |
 | 빠른 도움말 | `/kit` (키, 세션, 명령·스킬 목록, 설정 파일 위치를 편집기 위에 보여 줌. 다시 입력하면 닫힘). 팀 공유 폴더 등록은 `/kit share <폴더>` |
-| 상태 요약 | `/doctor` (판 번호, pi 폴더, Node. 문제가 생기면 이 화면을 찍어 보내 주세요) |
+| 상태 요약 | `/doctor` (버전 번호, pi 폴더, Node. 문제가 생기면 이 화면을 찍어 보내 주세요) |
 
 **@파일**: 입력창에서 `@` 를 치면 작업 폴더의 파일 목록이 뜹니다. 글자를 더 치면 좁혀지고(`@src/ma`), `Tab` 으로 고릅니다.
 - `.git`, `node_modules`, `__pycache__`, `.venv` 등은 빼고 6단계 깊이까지 보여 줍니다.
@@ -155,7 +155,7 @@ code-server(VS Code 웹)는 브라우저 안에서 돌기 때문에, 몇몇 키�
 | `Ctrl+W` | 브라우저 탭이 닫힘 | 단어 지우기는 `Alt+Backspace` |
 | `Ctrl+T`, `Ctrl+N` | 브라우저의 새 탭·새 창 | 누르지 않기 |
 
-**Shift+Enter 로 줄 바꾸기 (한 번 설정):** VS Code 1.109 보다 예전 판(예: code-server 4.93)의 터미널은 `Shift+Enter` 를 `Enter` 와 똑같이 보내서, pi 가 줄을 바꾸지 않고 바로 보냅니다.
+**Shift+Enter 로 줄 바꾸기 (한 번 설정):** VS Code 1.109 보다 예전 버전(예: code-server 4.93)의 터미널은 `Shift+Enter` 를 `Enter` 와 똑같이 보내서, pi 가 줄을 바꾸지 않고 바로 보냅니다.
 1. `F1` (또는 `Ctrl+Shift+P`) 을 누르고 `Preferences: Open Keyboard Shortcuts (JSON)` 을 고릅니다.
 2. 열린 파일의 `[` `]` 안에 아래를 넣고 저장합니다 (다른 항목이 있으면 그 사이에 쉼표).
    ```json
@@ -168,7 +168,7 @@ code-server(VS Code 웹)는 브라우저 안에서 돌기 때문에, 몇몇 키�
    ```
 - 저장한 뒤에도 `Shift+Enter` 가 바로 보내면 브라우저 탭을 새로 고칩니다 (브라우저의 새로 고침 단추. 켜 둔 pi 는 그대로 이어집니다).
 - 이 설정은 code-server 의 사용자 설정 폴더(홈 아래)에 남습니다. 그 뒤로 bash 같은 다른 프로그램에서 `Shift+Enter` 를 누르면 글자 몇 개가 들어갈 수 있습니다.
-- VS Code 1.109 이후 판(예: code-server 4.121)은 이 설정 없이도 `Shift+Enter` 로 줄이 바뀝니다.
+- VS Code 1.109 이후 버전(예: code-server 4.121)은 이 설정 없이도 `Shift+Enter` 로 줄이 바뀝니다.
 - 긴 지시는 파일에 적어 두고 `@파일` 로 보내도 됩니다.
 - VS Code 가 가져가는 키를 터미널로 보내려면 설정의 `terminal.integrated.sendKeybindingsToShell` 을 켭니다 (그동안 터미널 안에서는 VS Code 단축키가 듣지 않음). 브라우저가 가져가는 키(`Ctrl+W` 등)는 그래도 안 됩니다.
 
@@ -312,7 +312,7 @@ description: 주간 업무 보고서를 쓸 때 사용. 이번 주 git 기록을
 | `korean-report` | 주간보고·작업 결과 보고서·회의록 (개조식, 양식 파일 포함) |
 | `debugging` | 재현 → 오류 읽기 → 원인 좁히기 → 고치기 → 확인 순서 |
 
-**기본 명령·스킬과 업데이트:** 고치지 않은 것은 새 판으로 바꾸고, 직접 고친 것은 그대로 둡니다 (설치할 때 "직접 고친 것은 그대로 둠" 으로 알려 줌). 지운 것은 다시 넣지 않습니다.
+**기본 명령·스킬과 업데이트:** 고치지 않은 것은 새 버전으로 바꾸고, 직접 고친 것은 그대로 둡니다 (설치할 때 "직접 고친 것은 그대로 둠" 으로 알려 줌). 지운 것은 다시 넣지 않습니다.
 
 스킬을 두는 곳:
 
@@ -372,7 +372,7 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 - `hook-creator` 스킬에게 "명령 실행 전에 ○○ 막아줘", "작업이 끝나면 ○○ 기록해줘" 처럼 부탁하면 `my-<이름>.ts` 로 만들어 줍니다.
   예 6개(명령 기록, 파일 보호, 결과에 안내 덧붙이기, 팀 규칙 파일, 입력 바꾸기, 끝날 때 기록)는 `~/.pi/agent/skills/hook-creator/examples.md` 에 있습니다.
 - 적용은 `/reload` (또는 pi 를 다시 실행). 끄려면 파일 이름 끝에 `.off` 를 붙이고 `/reload`.
-- `my-` 로 시작하는 내 확장은 업데이트해도 그대로 남습니다. 키트 확장(`guard.ts` 등)을 직접 고치면 업데이트 때 새 판으로 바뀝니다.
+- `my-` 로 시작하는 내 확장은 업데이트해도 그대로 남습니다. 키트 확장(`guard.ts` 등)을 직접 고치면 업데이트 때 새 버전으로 바뀝니다.
 - 확장은 pi 와 같은 권한으로 돕니다. 직접 쓰거나 내용을 확인한 코드만 두세요.
 
 ### LLM 위키 (/wiki)
@@ -423,30 +423,30 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 
 ## 7. 새 버전으로 바꾸기
 1. 실행 중인 pi 를 모두 끕니다 (`/quit`).
-2. 새 판 zip 을 2-1 처럼 노트북 홈에 올립니다.
+2. 새 버전 zip 을 2-1 처럼 노트북 홈에 올립니다.
 3. 터미널에서 (받은 파일 이름이 다르면 그 이름으로):
    ```bash
    cd ~ && bash ~/tools/pi/update.sh ~/pi-agent-like-agent-api-main.zip
    ```
-- 하는 일: 받은 파일 확인 → 지금 폴더를 `~/tools/pi.old` 로 이름 바꾸기 → 새 판을 `~/tools/pi` 에 → `install.sh` 로 설정 반영.
-- 끝에 `지금 판 -> 새 판` 과 이 판에서 바뀐 점을 보여 줍니다. 그다음 `pi` 를 실행하면 새 판으로 시작합니다. `/doctor` 의 판 번호로 확인합니다.
-- 받은 파일이 지금과 같은 판이면 멈춥니다 (이전 판 폴더를 덮지 않도록). 같은 판을 다시 깔려면 끝에 `--force`.
-- **가벼운 업데이트 zip:** GitHub 저장소의 **Releases** 에서 그 판의 `pi-agent-like-agent-api-<판>-update.zip` 을 받으면 pi 본체(`runtime/`)를 뺀 약 0.2MB 라 반입이 가볍습니다. 같은 명령에 그 파일을 줍니다.
-  지금 깔린 pi 본체가 새 판의 것과 같은지 해시로 확인한 뒤 그대로 쓰고, 다르면(pi 본체가 바뀐 판. CHANGELOG·Releases 에 적음) 아무것도 바꾸지 않고 전체 zip 이 필요하다고 알려 줍니다. 몇 판을 건너뛰어도 됩니다.
-  2026-10-16.1 보다 예전 판의 `update.sh` 는 이 zip 을 모르므로, 그 판에서는 한 번 전체 zip 으로 바꿉니다.
-- zip 을 풀 프로그램(`unzip`, Python)이 둘 다 없는 노트북이면, GitHub 의 Tags 에서 그 판의 `tar.gz` 를 받아 같은 명령에 주면 됩니다 (`tar` 로 풂).
-- 메시지별 할 일과 `update.sh` 가 안 될 때의 손 절차: [수동 작업 절차 3장](docs/수동-작업-절차.md#3-새-판으로-바꾸기)
+- 하는 일: 받은 파일 확인 → 지금 폴더를 `~/tools/pi.old` 로 이름 바꾸기 → 새 버전을 `~/tools/pi` 에 → `install.sh` 로 설정 반영.
+- 끝에 `지금 버전 -> 새 버전` 과 이 버전에서 바뀐 점을 보여 줍니다. 그다음 `pi` 를 실행하면 새 버전으로 시작합니다. `/doctor` 의 버전 번호로 확인합니다.
+- 받은 파일이 지금과 같은 버전이면 멈춥니다 (이전 버전 폴더를 덮지 않도록). 같은 버전을 다시 깔려면 끝에 `--force`.
+- **가벼운 업데이트 zip:** GitHub 저장소의 **Releases** 에서 그 버전의 `pi-agent-like-agent-api-<버전>-update.zip` 을 받으면 pi 본체(`runtime/`)를 뺀 약 0.2MB 라 반입이 가볍습니다. 같은 명령에 그 파일을 줍니다.
+  지금 깔린 pi 본체가 새 버전의 것과 같은지 해시로 확인한 뒤 그대로 쓰고, 다르면(pi 본체가 바뀐 버전. CHANGELOG·Releases 에 적음) 아무것도 바꾸지 않고 전체 zip 이 필요하다고 알려 줍니다. 몇 버전을 건너뛰어도 됩니다.
+  2026-10-16.1 보다 예전 버전의 `update.sh` 는 이 zip 을 모르므로, 그 버전에서는 한 번 전체 zip 으로 바꿉니다.
+- zip 을 풀 프로그램(`unzip`, Python)이 둘 다 없는 노트북이면, GitHub 의 Tags 에서 그 버전의 `tar.gz` 를 받아 같은 명령에 주면 됩니다 (`tar` 로 풂).
+- 메시지별 할 일과 `update.sh` 가 안 될 때의 손 절차: [수동 작업 절차 3장](docs/수동-작업-절차.md#3-새-버전으로-바꾸기)
 
 그대로 남는 것:
-- `~/.pi/agent` 의 설정(`settings.json`, `models.json`)에는 **새 판에 추가된 항목만** 넣습니다. LLM 주소·모델처럼 직접 고친 값과 직접 지운 항목은 그대로이고, 바뀐 파일은 `갱신:` 으로 알려 주며 이전 파일은 `.bak` 으로 남깁니다.
+- `~/.pi/agent` 의 설정(`settings.json`, `models.json`)에는 **새 버전에 추가된 항목만** 넣습니다. LLM 주소·모델처럼 직접 고친 값과 직접 지운 항목은 그대로이고, 바뀐 파일은 `갱신:` 으로 알려 주며 이전 파일은 `.bak` 으로 남깁니다.
 - 내 설정 파일(`~/.pi/agent/bridge.json`), 지침(AGENTS.md), 스킬, 세션 기록은 그대로입니다.
-- 확장(`~/.pi/agent/extensions/`)은 새 것으로 바뀝니다. 새 판에서 빠진 키트 확장은 `~/.pi/agent/extensions.removed/` 로 옮깁니다 (직접 만든 확장은 그대로).
-- 기본 명령·스킬(`~/.pi/agent/prompts`, `skills`)은 고치지 않은 것만 새 판으로 바뀝니다. 직접 고친 것과 지운 것은 그대로입니다.
+- 확장(`~/.pi/agent/extensions/`)은 새 것으로 바뀝니다. 새 버전에서 빠진 키트 확장은 `~/.pi/agent/extensions.removed/` 로 옮깁니다 (직접 만든 확장은 그대로).
+- 기본 명령·스킬(`~/.pi/agent/prompts`, `skills`)은 고치지 않은 것만 새 버전으로 바뀝니다. 직접 고친 것과 지운 것은 그대로입니다.
 - 잘 동작하면 `~/tools/pi.old` 는 지워도 됩니다 (지우면 그 뒤로는 zip 으로만 되돌릴 수 있음).
 
-**이전 판으로 되돌리기:** `~/tools/pi.old` 에는 바로 앞 판 하나만 남습니다 (다음 업데이트 때 지워짐). 받은 zip 은 보관해 두세요.
-- 이전 판 zip 이 있으면: `cd ~ && bash ~/tools/pi/update.sh <이전 판 zip>` (지금 판은 `pi.old` 로 남고, 그 판에 없는 확장은 치움)
-- zip 이 없으면 `pi.old` 로 되돌리는 절차: [수동 작업 절차 5장](docs/수동-작업-절차.md#5-이전-판으로-되돌리기)
+**이전 버전으로 되돌리기:** `~/tools/pi.old` 에는 바로 앞 버전 하나만 남습니다 (다음 업데이트 때 지워짐). 받은 zip 은 보관해 두세요.
+- 이전 버전 zip 이 있으면: `cd ~ && bash ~/tools/pi/update.sh <이전 버전 zip>` (지금 버전은 `pi.old` 로 남고, 그 버전에 없는 확장은 치움)
+- zip 이 없으면 `pi.old` 로 되돌리는 절차: [수동 작업 절차 5장](docs/수동-작업-절차.md#5-이전-버전으로-되돌리기)
 
 ## 8. 설정
 | 파일 | 내용 |
@@ -481,7 +481,7 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 - `guard` 로 시작하는 항목과 `notify_after_seconds` 는 고치면 바로 적용되고, `default_mode` 는 pi 를 시작할 때 읽습니다.
 
 ## 9. 문제 해결
-먼저 pi 안에서 `/doctor` 를 쳐 보세요 (판 번호, pi 폴더, Node). 해결이 안 되면 그 화면과 오류 메시지를 찍어 보내 주세요.
+먼저 pi 안에서 `/doctor` 를 쳐 보세요 (버전 번호, pi 폴더, Node). 해결이 안 되면 그 화면과 오류 메시지를 찍어 보내 주세요.
 
 | 증상 | 해결 |
 |---|---|
@@ -495,7 +495,7 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 | 시작 화면에 `Warning: fd not found` / `ripgrep not found` | 무시해도 됩니다. 기본 도구(명령 실행, 파일 읽기·쓰기·고치기)는 이 둘 없이 동작하고, 입력창의 `@` 파일 목록도 fd 없이 나옵니다 |
 | 오래 쓰다 보면 느려지거나 엉뚱하게 답함 | 대화가 너무 길어진 탓입니다. `/compact` 로 줄이거나 `/new` 로 새 세션을 시작하세요 (필요한 맥락은 AGENTS.md 나 `/handoff` 메모로) |
 | 파드를 다시 시작했더니 pi 가 없음 | pi 와 Node 를 홈 아래에 두었는지(`~/tools/pi`, `pip install --user`), 새 터미널에서 `pi --version` |
-| 업데이트가 `이미 같은 판` 으로 멈춤 | 받은 파일이 새 판인지 확인 ([7장](#7-새-버전으로-바꾸기)) |
+| 업데이트가 `이미 같은 버전` 으로 멈춤 | 받은 파일이 새 버전인지 확인 ([7장](#7-새-버전으로-바꾸기)) |
 | pi 설정 파일 오류 (`settings.json`, `models.json`) | JSON 형식 확인 (마지막 항목 뒤 쉼표 빼기, 따옴표). 설치·업데이트 때 남긴 `.bak` 으로 되돌릴 수 있습니다 |
 | pi 가 끝난 뒤 터미널 화면이 이상함 | `reset` 입력 |
 
@@ -504,11 +504,11 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 |---|---|
 | `runtime/` | pi 0.87.1 과 JS 라이브러리 3종 (npm 공식 배포본 그대로) |
 | `bin/`, `compat/` | 실행기, Node 탐색, Node 20 호환 레이어 |
-| `install.sh`, `update.sh`, `check-node.sh`, `VERSION` | 설치, 새 판으로 바꾸기, Node 진단 스크립트, 판 번호 |
+| `install.sh`, `update.sh`, `check-node.sh`, `VERSION` | 설치, 새 버전으로 바꾸기, Node 진단 스크립트, 버전 번호 |
 | `profiles/` | 설정 템플릿과 기본 지침(`jupyter`: Kubeflow 노트북용), 확장(`common`: 위험 명령 확인, 작업 모드 `/plan`·`/mode`, 되돌리기 `/undo`, 기억하기 `/remember`, `@파일`, 작업 끝 알림, `/kit`·`/doctor`, LLM 위키 `/wiki`) |
 | `prompts/`, `skills/` | 기본 명령 6개, 기본 스킬 8개 (설치할 때 `~/.pi/agent` 에 복사) |
 | `tests/` | 단위 테스트 (`node tests/test_guard.mjs`, `node tests/test_modes.mjs`, `node tests/test_memory.mjs`, `node tests/test_files.mjs`, `node tests/test_merge_config.mjs`, `node tests/test_wiki.mjs`) |
-| `CHANGELOG.md` | 판마다 바뀐 점과 바꾼 뒤 할 일 |
+| `CHANGELOG.md` | 버전마다 바뀐 점과 바꾼 뒤 할 일 |
 | `docs/` | [한 장 요약](docs/빠른시작.md), [API 연결](docs/API-연결.md), [수동 작업 절차](docs/수동-작업-절차.md), [설치 세부](docs/설치.md), [반입 검토 자료](docs/반입-검토-요청서.md), [runtime 파일 해시 목록](docs/runtime-SHA256SUMS.txt) |
 
 **의존성**
