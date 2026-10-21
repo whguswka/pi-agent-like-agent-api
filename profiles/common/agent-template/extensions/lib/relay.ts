@@ -1,11 +1,12 @@
 /**
- * 확장끼리 함께 쓰는 도우미 (undo.ts, memory.ts, modes.ts, files.ts): 지금 작업 폴더, 파일 읽기·쓰기·지우기.
+ * 확장끼리 함께 쓰는 도우미 (undo.ts, memory.ts, modes.ts, files.ts, kit.ts, wiki.ts): 지금 작업 폴더, 파일 읽기·쓰기·지우기,
+ * 요청 앞에 알림을 붙일 때 사용자가 친 그대로를 남기기 (transformInput, rawInput).
  * jupyter 모드(PC 의 pi 가 명령·파일 작업을 노트북에서)면 중계 서버를 거쳐 노트북 파일을 다룬다.
  * 지금 작업 폴더는 jupyter.ts 가 globalThis.__piWorkDir 로 알려 준다 (없으면 pi 를 시작한 폴더).
  * 이 폴더(lib)에는 index.ts 가 없으므로 pi 가 확장으로 불러오지 않는다.
  */
 
-import { promises as fsp } from "node:fs";
+import { promises as fsp, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, posix, resolve } from "node:path";
 import { cleanPath, isPcAbsolute, windowsDrivePath } from "./paths.ts";
@@ -172,4 +173,113 @@ export function shown(t: Target, wd: WorkDir = workDir()): string {
 		if (t.abs.toLowerCase().startsWith(h.toLowerCase() + "/")) return "~" + t.abs.slice(h.length);
 	}
 	return (t.remote ? "노트북 " : "") + t.abs;
+}
+
+// ── 글 파일 읽기 (위키 원본·페이지, 문서 폴더) ──────────────────────
+/** 글 파일의 인코딩: UTF-8 (앞의 BOM 은 뺌), BOM 이 있는 UTF-16, 그 밖은 한국어 Windows 의 ANSI(CP949).
+ *  메모장·엑셀이 ANSI·유니코드로 저장한 원본도 한글이 깨지지 않게. UTF-8 에 잘못된 바이트가 조금 섞인 것은 UTF-8 로 봄 */
+export type TextEnc = "utf8" | "utf16le" | "utf16be" | "cp949" | "unknown";
+export const ENC_LABEL: Record<TextEnc, string> = {
+	utf8: "UTF-8",
+	utf16le: "UTF-16",
+	utf16be: "UTF-16",
+	cp949: "CP949(ANSI)",
+	unknown: "인코딩 모름: 한글이 깨졌을 수 있으니 UTF-8 로 저장해 다시 넣으세요",
+};
+const UTF8_STRICT = new TextDecoder("utf-8", { fatal: true });
+const BAD = String.fromCharCode(0xfffd); // 바꿀 수 없는 바이트 자리에 들어가는 글자
+export function decodeText(buf: Buffer): { text: string; enc: TextEnc } {
+	if (buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return { text: buf.subarray(3).toString("utf8"), enc: "utf8" };
+	if (buf[0] === 0xff && buf[1] === 0xfe) return { text: buf.subarray(2).toString("utf16le"), enc: "utf16le" };
+	if (buf[0] === 0xfe && buf[1] === 0xff) {
+		const b = Buffer.from(buf.subarray(2, buf.length - (buf.length % 2)));
+		return { text: b.swap16().toString("utf16le"), enc: "utf16be" };
+	}
+	const loose = buf.toString("utf8");
+	if (!loose.includes(BAD)) return { text: loose, enc: "utf8" };
+	try {
+		return { text: UTF8_STRICT.decode(buf), enc: "utf8" }; // U+FFFD 가 글에 원래 있는 것
+	} catch {}
+	const bad = loose.split(BAD).length - 1;
+	const wide = (loose.match(/[^\x00-\x7F]/g) || []).length;
+	if (bad * 10 < wide) return { text: loose, enc: "utf8" };
+	try {
+		return { text: new TextDecoder("euc-kr").decode(buf), enc: "cp949" }; // WHATWG 의 euc-kr 은 CP949 (Node 의 ICU 가 있어야 함)
+	} catch {
+		return { text: loose, enc: "unknown" };
+	}
+}
+export const readText = (p: string) => decodeText(readFileSync(p)).text;
+
+// ── 입력 고치기와 사용자가 친 그대로 ──────────────────────────────
+// 여러 확장이 요청 앞에 알림을 붙인다 (input 이벤트의 transform: /remember·/kit env·/undo 알림, 계획 모드, @파일 내용).
+// pi 는 확장을 폴더에서 읽은 차례로 부르고 그 차례는 정해져 있지 않아, 나중에 불리는 확장은 고친 글을 받는다.
+// 고친 글 -> 사용자가 친 글을 남겨 두어 rawInput 으로 되찾는다 (/wiki save 의 질문, 작업 기록)
+const RAW: Map<string, string> = ((globalThis as any).__piRawInput ||= new Map());
+
+/** input 이벤트에서 돌려줄 transform. 고친 글이 사용자가 친 어떤 글에서 왔는지 남긴다 */
+export function transformInput(from: string, to: string) {
+	RAW.set(to, rawInput(from));
+	while (RAW.size > 8) RAW.delete(RAW.keys().next().value as string);
+	return { action: "transform" as const, text: to };
+}
+
+/** input 이벤트의 글 -> 사용자가 친 그대로 (다른 확장이 고치지 않았으면 그 글) */
+export const rawInput = (text: string): string => RAW.get(text) ?? text;
+
+// 확장이 사용자를 대신해 보내는 요청 (/plan <요청>, 계획대로 진행, /wiki ask, /handoff): 작업 기록(memory.ts)이 사용자의 요청으로 남기게 표시.
+// 표시하지 않은 확장의 요청(폴더째 반영, /watch 의 로그 등)은 기록하지 않는다
+const ASKS: Map<string, string> = ((globalThis as any).__piUserAsks ||= new Map());
+
+/** 보낼 글을 사용자의 요청으로 표시하고 그 글을 그대로 돌려준다. label: 기록에 남길 글 (없으면 보낸 글) */
+export function userAsk(text: string, label = text): string {
+	ASKS.set(text, label);
+	while (ASKS.size > 8) ASKS.delete(ASKS.keys().next().value as string);
+	return text;
+}
+
+/** input 이벤트의 글이 확장이 대신 보낸 사용자의 요청이면 기록에 남길 글 */
+export const userAskOf = (text: string): string | undefined => ASKS.get(rawInput(text));
+
+// ── 개인정보·비밀로 보이는 글 (위키의 작업 방식, 작업 기록) ──────────────
+// 중계 서버(relay.py)의 감추기와 같은 꼴: 이메일, 전화번호, 카드번호, 계좌번호 모양 번호
+// (숫자 묶음을 - _ 로 이은 것이나 이어 쓴 숫자로 합쳐 10~14자리. 너무 길면 끝의 _ 묶음을 떼어 봄), [이메일N]·[번호N]
+const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
+const PHONE_RE = /(?<!\d)0\d{1,2}[- .]?\d{3,4}[- .]?\d{4}(?!\d)/g;
+const CARD_RE = /(?<![\d.])(?:\d{4}[- ]){3}\d{1,7}(?![\d.])|(?<![\d.])\d{15,19}(?![\d.])/g;
+const TOKEN_RE = /\[(?:이메일|번호)\d+\]/g;
+const SECRET_RE = /(?:password|passwd|비밀번호|암호|토큰|token|secret|api[_ -]?key)\s*[:=]/i;
+const NB = "(?<![0-9A-Za-z.])(?<![0-9A-Fa-f]-)";
+const NA = "(?![0-9A-Za-z-]|\\.\\d)";
+const NUMBER_RE = new RegExp(`${NB}(?:\\d{2,8}[-_]){1,3}\\d{2,8}${NA}|${NB}\\d{10,14}${NA}`, "g");
+const digitCount = (s: string) => (s.match(/\d/g) || []).length;
+/** 계좌번호 모양인 부분: 10~14자리 (넘으면 끝의 _ 묶음을 떼어 봄) */
+function accountPart(m: string): string | null {
+	let s = m;
+	while (digitCount(s) > 14 && s.includes("_")) s = s.slice(0, s.lastIndexOf("_"));
+	const n = digitCount(s);
+	return n >= 10 && n <= 14 ? s : null;
+}
+const has = (re: RegExp, s: string) => {
+	re.lastIndex = 0;
+	return re.test(s);
+};
+
+/** 이메일·전화번호·카드·계좌번호 모양 번호·[이메일N]·비밀로 보이는 글이 들었는지 */
+export function secretish(s: string): boolean {
+	return has(EMAIL_RE, s) || has(TOKEN_RE, s) || has(PHONE_RE, s) || has(CARD_RE, s) || SECRET_RE.test(s) || [...s.matchAll(NUMBER_RE)].some((m) => accountPart(m[0]) !== null);
+}
+
+/** 기록에 남길 글: 이메일·전화번호·카드·계좌번호 모양 번호·[이메일N] 은 '…' 로 빼고, 비밀로 보이는 글이면 "" */
+export function scrubText(s: string): string {
+	if (SECRET_RE.test(s)) return "";
+	return s
+		.replace(EMAIL_RE, "…")
+		.replace(TOKEN_RE, "…")
+		.replace(CARD_RE, "…")
+		.replace(PHONE_RE, "…")
+		.replace(NUMBER_RE, (m) => {
+			const a = accountPart(m);
+			return a === null ? m : `…${m.slice(a.length)}`;
+		});
 }
