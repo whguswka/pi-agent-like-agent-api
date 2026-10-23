@@ -67,8 +67,10 @@ const recs = [
 	{ t: "2026-10-20 18:00", req: "검증 손실도 남겨 줘", files: ["train.py", "utils/tb.py"], cmds: ["python train.py --epochs 1"], end: "aborted" },
 ];
 const dg = m.digestOf(recs, "~/tb", now);
-check("알릴 글: 30일 넘은 기록은 빼고, 마지막 요약, 최근 요청은 오래된 것부터 (바꾼 파일·명령·멈춤·답)",
-	dg.startsWith("이 프로젝트(~/tb)에서 지난 세션들에 한 일입니다") && !dg.includes("아주 오래된") && dg.includes("넘겨받은 요약 (10-20 17:40):\n목표: 학습 손실")
+// 끝의 안내 줄: 시험(2026-10-23)에서 새 세션에 지난 세션과 같은 요청을 하자 기록만 보고 실행 없이 '이미 끝났습니다' (맨 앞에 적었을 때도 그대로)
+check("알릴 글: 30일 넘은 기록은 빼고, 마지막 요약, 최근 요청은 오래된 것부터 (바꾼 파일·명령·멈춤·답), 끝에 '같은 요청이면 지금 다시' 안내",
+	dg.startsWith("이 프로젝트(~/tb)에서 지난 세션들에 한 일입니다") && dg.endsWith(`\n${m.DIGEST_TAIL}`) && m.DIGEST_TAIL.includes("'이미 했다'고 답하지 말고 지금 실행해서")
+	&& !dg.includes("아주 오래된") && dg.includes("넘겨받은 요약 (10-20 17:40):\n목표: 학습 손실")
 	&& dg.indexOf("텐서보드 로그 폴더 정리") < dg.indexOf("검증 손실도") && dg.includes("→ 바꾼 파일 train.py, utils/tb.py · 명령 python train.py --epochs 1 · Esc 로 멈춤"), dg);
 const many = Array.from({ length: 30 }, (_, i) => ({ t: `2026-10-20 ${String(i % 24).padStart(2, "0")}:00`, req: `요청 ${i} ${"가".repeat(60)}`, ans: "나".repeat(100), files: [`f${i}.py`] }));
 const dm = m.digestOf(many, "~/tb", now);
@@ -98,8 +100,32 @@ check("넘겨받은 요약 줄이기: 한도 안이면 그대로, 줄바꿈 없�
 	m.handoffCut(H1) === H1 && m.handoffCut("가".repeat(1000), 100) === `${"가".repeat(99)}…`, H1.length);
 const dh = m.digestOf([{ t: "2026-10-21 20:45", handoff: H1 }, { t: "2026-10-21 20:46", req: "위치 고쳐 줘" }], "~/work/resmon", now);
 check("알릴 글: 세션 1 요약이 통째로 들어가 정한 것이 남음 (한도 안)", dh.includes(H1) && dh.length <= m.DIGEST_MAX, dh.length);
-check("요약 부탁 글: 정한 것을 맨 앞에, 넘겨받은 결정도 옮겨 적게",
-	m.HANDOFF_PROMPT.includes("맨 앞에 '정한 것:'") && m.HANDOFF_PROMPT.includes("넘겨받은 것 중 아직 유효한 것도 빠짐없이 옮겨"), m.HANDOFF_PROMPT);
+check("요약 부탁 글: 요구사항·정한 것을 맨 앞에, 넘겨받은 것도 옮겨 적게",
+	m.HANDOFF_PROMPT.includes("맨 앞에 '요구사항:'") && m.HANDOFF_PROMPT.indexOf("'요구사항:'") < m.HANDOFF_PROMPT.indexOf("'정한 것:'")
+	&& m.HANDOFF_PROMPT.includes("둘 다 앞 세션에서 넘겨받은 것 중 아직 유효한 것도 빠짐없이 옮겨"), m.HANDOFF_PROMPT);
+// 실사용 시험의 세션 7 요약(1002자, 정한 것 줄 없음): 목표가 'CPU/메모리 사용량 낮추기' 로만 남아 처음 요청의 항목이 빠졌다.
+// 요구사항 줄이 있으면 (모델이 끝에 적어도) 900자로 줄일 때 남는다
+const H7 = [
+	"목표: 작업표시줄 AI 위젯과 비슷한 WinForms 리소스 모니터 오버레이를 만들고 CPU/메모리 사용량을 낮추기.",
+	"한 일: `resmon.cs` UI를 Label 중심에서 직접 그리기(OnPaint) 방식으로 변경, 둥근 반투명 배경·상태색·CPU/RAM/GPU/RX/TX 표시 추가.",
+	"한 일: DPI 인식(`SetProcessDPIAware`) 추가, 글자 크기/폭/높이 조정, 위치를 트레이 영역 기준으로 정렬.",
+	"한 일: RX/TX 누적량을 헤더 줄(`RX 3.9 KB` 형태)로 이동, 속도는 아래 줄에 유지.",
+	"한 일: RAM 수집을 WMI → `GlobalMemoryStatusEx(dwMemoryLoad)` 로 변경.",
+	"한 일: 네트워크 속도를 단순 1초 가정이 아니라 실제 경과 시간(`elapsed`) 기준으로 계산하도록 변경.",
+	"바꾼 파일: `resmon.cs` 만 수정. 빌드는 `build.ps1` 사용.",
+	"커밋: `b458bbe`, `6ad8e50`, `7f05eb1`, `6778737` 까지는 정상 완료.",
+	"커밋 전 미완료 최적화: GPU 측정을 줄이려다 코드가 여러 번 바뀜. 현재는 `gpuCounters` 캐시 버전이 들어가 있으나 사용자가 원한 `PerformanceCounterCategory.ReadCategory()` 기반 최적화는 아직 안 끝남.",
+	"측정 결과(최적화 전후 검증용으로 확보): 10초 대기 후 20초 측정 시 `CpuSecondsIncrease=7.969`, `WorkingSetMB=83.6`. 원래 관측치는 대략 \"한 코어 35%, 97MB\".",
+	"남은 일: GPU 코드를 `ReadCategory()` 기반으로 다시 작성 → 빌드 → 10초 대기 + 20초 측정 1회 → 최초값(35%, 97MB)과 비교 → 개선되면 최종 커밋.",
+	"주의: 매초마다 `new PerformanceCounter(...)` 생성하는 방식은 오히려 CPU가 높았고 실패. 사용자는 \"나중에 뜬 GPU 프로세스/네트워크 어댑터도 자동 반영\"을 반드시 유지하라고 명시함.",
+	"요구사항: 작업 표시줄 오른쪽에 CPU %, RAM %, GPU %(엔진 가운데 최대), 네트워크 업·다운 속도와 시작 이후 총 전송량을 1초마다, 관리자 권한·추가 설치 없이.",
+].join("\n");
+const c7 = m.handoffCut(H7);
+check("넘겨받은 요약 줄이기: 요구사항 줄은 맨 끝에 있어도 남김 (세션 7 요약)",
+	c7.length <= m.HANDOFF_MAX && c7.includes("요구사항: 작업 표시줄 오른쪽에 CPU %") && c7.includes("총 전송량") && /\n\(… \d+줄 줄임\)$/.test(c7), [c7.length, c7]);
+const long = m.handoffCut(`요구사항: ${"항목, ".repeat(200)}\n정한 것: GPU 는 최대\n한 일: 이것저것`, 300);
+check("넘겨받은 요약 줄이기: 너무 긴 요구사항 줄은 다른 정한 것 줄을 남긴 자리에 앞부분만",
+	long.length <= 300 && long.startsWith("요구사항: 항목, ") && long.includes("…\n정한 것: GPU 는 최대\n(… 1줄 줄임)") && !long.includes("한 일"), [long.length, long]);
 
 // 가짜 pi 로: 요청 -> 기록 -> 새 세션에 알림 (세션 안에서는 같은 글), 확장이 보낸 요청, /handoff, /recall
 const tmp = mkdtempSync(join(tmpdir(), "memory-test-"));
@@ -159,10 +185,17 @@ check("확장이 보낸 요청은 사용자를 대신한 것만 (userAsk 표시,
 	lg.length === 2 && lg[1].req === "검증 손실도 남겨 줘" && lg[1].end === "aborted" && lg[1].files[0] === "train.py", lg);
 await turn("아무것도 하지 못한 요청", { answer: "", stop: "error" });
 check("아무것도 하지 못하고 끝난 요청은 남기지 않음", log().length === 2);
+// 시험(2026-10-23): 도구 없이 '이미 끝났습니다' 라고만 한 답이 기록에 남아 다음 세션도 그대로 따라 함 -> 실행 없이 한 답이라고 표시
+await turn("시험 파이프라인을 새 파일로 만들어 제출해 줘", { answer: "이미 끝났습니다. `kfp_smoke_test.py` 로 제출했습니다" });
+lg = log();
+check("도구를 하나도 쓰지 않은 답은 talk 표시 (도구를 쓴 요청에는 없음), 답의 밑줄은 그대로 (파일 이름)",
+	lg.length === 3 && lg[2].talk === true && lg[2].ans === "이미 끝났습니다. kfp_smoke_test.py 로 제출했습니다" && !lg[0].talk && !lg[1].talk, lg);
 
 await emit("session_start", { reason: "new" });
 const d1 = await prompt();
 check("새 세션: 지난 기록을 지침의 recent_work 부분으로", typeof d1 === "string" && d1.includes(`이 프로젝트(${m.projectOf(globalThis.__piWorkDir).label})`) && d1.includes("텐서보드에 학습 손실") && d1.includes('"검증 손실도 남겨 줘"') && d1.includes("Esc 로 멈춤"), d1);
+check("새 세션: 실행 없이 한 답은 그렇게 적고, 끝에 '확인하지 않은 말' 안내",
+	d1.includes("→ 실행 없이 답: 이미 끝났습니다. kfp_smoke_test.py") && d1.endsWith(`${m.DIGEST_TAIL} '실행 없이 답' 은 확인하지 않은 말이다.`), d1);
 await turn("세 번째 요청", { tools: [["edit", { path: "a.py" }]] });
 await turn("네 번째 요청", { tools: [["edit", { path: "b.py" }]] });
 check("새 세션 안에서도 첫 요청 때 정한 글 그대로 (그 뒤 기록은 다음 세션에)", (await prompt()) === d1 && !d1.includes("세 번째"), await prompt());

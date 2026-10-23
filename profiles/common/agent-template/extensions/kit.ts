@@ -264,6 +264,7 @@ function helpLines(): string[] {
 		` 스킬  /skill:이름 → ${skills.join(", ") || "(없음)"}`,
 		`       내 스킬: ${A}/skills/<이름>/SKILL.md (skill-creator 에게 "○○ 스킬 만들어줘")`,
 		`       내 hook: ${A}/extensions/my-<이름>.ts (hook-creator 에게 "○○할 때 △△하는 hook 만들어줘")`,
+		" 훅    /hooks 목록 · /hooks off mine 내 훅만 끄기 (위험 명령 확인은 그대로) · /hooks off docs 문서 규칙 끄기",
 		` 지침  ${A}/AGENTS.md (공통), 프로젝트 폴더의 AGENTS.md (/init 으로 초안) · /remember <내용> 한 줄 더하기`,
 		" 기억  /recall 지난 세션들의 작업 기록 (새 세션에 자동으로 알려 줌) · /recall save 다음 세션에 넘길 요약 · /recall off 끄기",
 		" 설명  /docs <모듈[.이름]> [찾을 말] 설치된 버전의 시그니처·설명 (pi 도 docs_lookup 으로 찾음) · 받은 문서는 ~/pi-docs 에",
@@ -330,6 +331,35 @@ async function doctorLines(): Promise<string[]> {
 // Python 패키지를 직접 불러와 버전·시그니처·설명·하위 이름을 보고, 문서 폴더(~/pi-docs: 받아 둔 문서 .md·.txt·.html 등)에서 맞는 줄을 더한다.
 // Python 은 작업 폴더의 .venv·venv, 켜 둔 가상 환경·conda, pi 가 찾은 Python, PATH 의 python3·python 차례로 실제로 돌아가는 것
 // (Windows 스토어 바로가기는 Python 이 없으면 안내만 하고 실패하므로 돌려 보고 고름). 찾을 이름은 인자로 넘김 (스크립트에 끼워 넣지 않음)
+// ── 끝났다고 하기 전의 확인 (지침에 늘 더하는 줄) ───────────────────────────────────────────
+// 2026-10 실사용 시험: 작업 표시줄에 가려 보이지 않는 창을 '항상 위 적용 완료' 라 하고 끝냄, 원인을 찾는다며 코드를 비운 채 세션이 끝남,
+// 처음 요청의 항목(총 전송량)이 몇 세션 뒤 빠짐. 작업 모드와 관계없이 같은 글 (모드를 바꿀 때마다 지침이 바뀌면 Copilot 이 새 대화를 엶)
+export const DONE_GUIDE =
+	"끝났다고 답하기 전에 사용자의 요구사항을 하나씩 다시 보고, 바꾼 것을 실제로 실행·빌드·테스트한 결과로 확인한다 " +
+	"(화면에 나오는 프로그램이면 실행해서 실제로 보이는지까지). 확인하지 못한 것은 확인하지 못했다고 적는다. " +
+	"원인을 찾는다며 기존 코드를 지우거나 임시 코드로 바꾼 채 끝내지 않는다. " +
+	"할 수 없다고 답하기 전에 이 대화에서 이미 써 본 방법(같은 명령·API)으로 되는지 해 본다.";
+// 2026-10 ML 시험 (Kubeflow 노트북에서 분석 모델 만들기):
+//  - 코드를 모두 python - <<EOF 로만 돌려, 'KFP 로 돌려 줘' 에 '파이프라인 파일이 없다' 며 멈춤. 그 뒤 파일을 '# placeholder' 로 먼저 씀
+//  - 프로젝트 지침이 가리킨 환경 안내 문서를 읽지 않거나, 읽고도 그 규칙('단계에서 DB 를 쓰려면 먼저 사용자에게')을 어김
+//  - 파이프라인 완료를 한도 1시간으로 출력 없이 기다리다(이미지를 못 받아 멈춘 단계) 45분이 지남
+//  - '지금 도구로는 실행을 종료할 수 없다' 고 했지만 앞에서 같은 API 로 종료했었음 (DONE_GUIDE 끝 문장)
+export const CODE_FILE_GUIDE =
+	"다시 돌릴 만한 분석·학습·파이프라인 코드는 heredoc(python - <<EOF)으로만 돌리지 말고 .py 파일로 저장해 실행한다 (프로젝트에, 지침이 정한 곳이 있으면 그곳에). " +
+	"새 파일은 자리 표시(placeholder) 없이 처음부터 실제 내용으로 쓴다.";
+export const READ_DOCS_GUIDE =
+	"프로젝트 지침(AGENTS.md)이 가리키는 문서가 지금 하는 일(데이터·DB·파이프라인 등)을 다루면 그 부분을 먼저 읽고, " +
+	"그 문서의 규칙(사용자에게 먼저 물을 것, 하지 말 것)을 지킨다.";
+export const WAIT_GUIDE =
+	"오래 걸리는 외부 작업(파이프라인 실행, 배포, 긴 학습)을 기다릴 때는 끝날 때까지 아무것도 찍지 않는 대기(wait_for_run_completion 등)를 쓰지 말고, " +
+	"한 명령 안에서 30초마다 상태를 찍으며 10분 안쪽으로 기다린다 (python 은 -u). 그래도 그대로면 막힌 원인을 살펴 사용자에게 알린다.";
+/** 지침에 늘 더하는 줄 (작업 모드와 관계없이 같은 글) */
+export const KIT_GUIDES = [DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE];
+/** 지침 목록(systemPromptOptions.promptGuidelines)에 KIT_GUIDES 를 한 번씩 더함 */
+export function addKitGuides(g: unknown) {
+	if (Array.isArray(g)) for (const line of KIT_GUIDES) if (!g.includes(line)) g.push(line);
+}
+
 export const DOCS_MAX = 5500; // 결과 글 길이 (wiki_read 와 같음. Copilot·사내AI 의 도구 결과 한도 안)
 export const DOCS_GUIDE = "라이브러리의 함수·클래스 사용법(인자, 반환값, 버전 차이)이 확실하지 않으면 추측하지 말고 docs_lookup 으로 지금 설치된 버전의 설명을 먼저 본다";
 export const docsDir = () => process.env.PI_DOCS_DIR || join(homedir(), "pi-docs");
@@ -797,6 +827,8 @@ export default function (pi: ExtensionAPI) {
 			show(ctx, "kit", helpLines());
 		},
 	});
+
+	pi.on("before_agent_start", async (event: any) => addKitGuides(event?.systemPromptOptions?.promptGuidelines));
 
 	// /kit env 로 지침에 적은 실행 환경은 pi 를 시작할 때 읽으므로, 지금 대화에는 다음 요청 앞에 붙여 바로 알린다
 	// (/reload 는 Copilot 새 대화를 열어 느리므로 쓰지 않음. /remember 와 같은 방식)
