@@ -129,6 +129,26 @@ check("형식이 틀리면 알리고 종료 코드 2", failedRc === 2 && out.inc
 writeJson(A("settings.json"), { defaultModel: "x" });
 out = run(null);
 check("고친 뒤 다시 실행하면 그때 새 항목 추가", readJson(A("settings.json")).newKey === 1, out);
+
+// 키트 기본 모델이 바뀜 (2026-10: GPT-6.1 Sol 은 회사 계정의 주간 사용량이 반나절 만에 끝나 GPT-5.6 Sol 깊이 생각하기로):
+//  직접 고르지 않은 값(지난 템플릿의 값, 예전 키트 기본값)만 새 기본값으로, 직접 고른 값은 그대로
+const tpl4 = path.join(tmp, "tpl4");
+const agent4 = path.join(tmp, "agent4");
+const run4 = () => execFileSync(process.execPath, [script, tpl4, agent4], { encoding: "utf8" });
+writeJson(path.join(tpl4, "settings.json"), { defaultProvider: "copilot", defaultModel: "gpt-6.1-sol" });
+writeJson(path.join(agent4, "settings.json"), { defaultProvider: "copilot", defaultModel: "gpt-6.1-sol" });
+run4();
+writeJson(path.join(tpl4, "settings.json"), { defaultProvider: "copilot", defaultModel: "gpt-5.6-sol-think" });
+out = run4();
+check("키트 기본 모델이 바뀌면 직접 고르지 않은 기본 모델은 새 기본으로 (알림)",
+	readJson(path.join(agent4, "settings.json")).defaultModel === "gpt-5.6-sol-think" && out.includes("defaultModel gpt-6.1-sol -> gpt-5.6-sol-think"), out);
+writeJson(path.join(agent4, "settings.json"), { defaultProvider: "copilot", defaultModel: "claude-opus-5.5" });
+out = run4();
+check("직접 고른 기본 모델은 그대로", readJson(path.join(agent4, "settings.json")).defaultModel === "claude-opus-5.5" && !out.includes("defaultModel"), out);
+fs.rmSync(path.join(agent4, ".pi-agent-kit-template.json"));
+writeJson(path.join(agent4, "settings.json"), { defaultModel: "gpt-6.0-sol" });
+out = run4();
+check("지난 설치 기록이 없어도 예전 키트 기본값(gpt-6.0-sol)이면 새 기본으로", readJson(path.join(agent4, "settings.json")).defaultModel === "gpt-5.6-sol-think", out);
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("RESULT:", fails ? `FAIL (${fails})` : "PASS");
 process.exit(fails ? 1 : 0);

@@ -7,6 +7,10 @@
  *
  *  - 계획: read 와 읽기 전용 명령(ls, cat, grep, git status·diff·log 등)만 실행한다. write·edit 와 그 밖의 명령은 막고
  *          LLM 에게 계획으로 적으라고 알린다. 요청마다 앞에 "[계획 모드] ..." 안내를 붙인다.
+ *          계획서(계획서 폴더 docs/plans 아래의 .md, 이름에 계획·plan 이 든 .md)만은 write·edit 로 쓸 수 있다
+ *          (2026-10: 계획서를 남겨 달라고 해도 '쓰기가 막혀 못 쓴다' 고 답함). 답에 단계가 없으면 그 계획서의 단계로 진행할지 묻는다.
+ *          진행을 고르면 기본 모델(settings.json 의 defaultModel, 설정 "plan_execute_model" 로 바꿈, "same" 이면 그대로)로 바꿔 진행한다
+ *          (고급 모델은 사용량이 적어 계획에만 쓰고 진행은 기본 모델로)
  *          번호 붙인 단계가 2개 이상인 답이 오면 "이 계획대로 진행할까요?" 를 묻고, 고른 모드(자동 또는 확인)로 바꿔
  *          진행을 요청한다. 고르지 않으면(Esc) 계획 모드 그대로 (고칠 점을 적어 보내면 됨)
  *  - 확인: 파일을 쓰거나 고치기 전, 읽기 전용이 아닌 명령을 실행하기 전에 바뀌는 내용을 보여 주고 묻는다
@@ -22,7 +26,8 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readTarget, shown, target, transformInput, userAsk } from "./lib/relay.ts";
+import { isPlanDoc, projectRel } from "./lib/paths.ts";
+import { readTarget, shown, target, transformInput, userAsk, workDir } from "./lib/relay.ts";
 import { base, parseShell, strip } from "./lib/shell.ts";
 
 export type Mode = "plan" | "ask" | "auto";
@@ -430,12 +435,15 @@ async function preview(tool: string, input: any): Promise<{ title: string; body:
 
 // ── 계획과 진행 목록 ──────────────────────────────────────────────
 
-const PLAN_NOTE =
-	"[계획 모드] 지금은 계획만 세웁니다. 파일을 바꾸는 도구는 쓰지 말고(write·edit 와 바꾸는 명령은 막혀 있음), " +
+// 2026-10 시험: 계획서는 쓸 수 있다고 끝에만 적었더니 '승인해 주시면 먼저 계획서를 작성하겠습니다' 로 계획서 쓰기를 단계에 넣음 -> 앞에 분명히
+export const planNote = (dir: string) =>
+	"[계획 모드] 지금은 계획만 세웁니다. 코드·설정 파일을 바꾸는 도구와 명령은 막혀 있습니다 (read 와 읽기 전용 명령만). " +
+	`단, 계획서는 지금 쓸 수 있습니다: 계획서를 남겨 달라는 요청이면 승인을 기다리지 말고 지금 write 로 ${dir}/<이름>.md ` +
+	"(또는 이름에 '계획'·plan 이 든 .md)에 쓰세요. 계획서 쓰기를 계획의 단계로 넣지는 마세요. " +
 	"필요하면 read 와 읽기 전용 명령(ls, grep, git diff 등)으로 살펴본 뒤 번호를 붙인 단계로 계획을 적어 주세요 " +
 	"(단계마다 할 일과 바꿀 파일). 정해야 할 점이 있으면 계획 끝에 질문으로 적어 주세요. 사용자가 승인하면 그때 진행합니다.";
-const proceedText = (n: number, mode: Mode) =>
-	`위 계획대로 진행해 주세요. 계획 모드는 끝났고 이제 파일을 바꾸고 명령을 실행할 수 있습니다` +
+const proceedText = (n: number, mode: Mode, doc = "") =>
+	`위 계획${doc ? `(계획서 ${doc})` : ""}대로 진행해 주세요. 계획 모드는 끝났고 이제 파일을 바꾸고 명령을 실행할 수 있습니다` +
 	`${mode === "ask" ? " (바꾸기 전에 사용자가 하나씩 확인합니다)" : ""}. ` +
 	`단계 하나를 마칠 때마다 답에 "[N단계 완료]" 라고 적어 주세요 (N 은 단계 번호, 모두 ${n}단계).`;
 const CHOICES: [string, Mode | null][] = [
@@ -444,15 +452,11 @@ const CHOICES: [string, Mode | null][] = [
 	["계획 더 다듬기 (계획 모드 유지)", null],
 ];
 
-/** 답에서 계획 단계 (1. 2. 3. 또는 1단계: 2단계: ... 처음부터 이어지는 번호만, 가장 바깥 목록) */
-export function planSteps(text: string): string[] {
-	const re = /^([ \t]*)(?:#{1,4}[ \t]*)?(?:\*\*)?(\d{1,2})(?:[.)]|[ \t]*단계[ \t]*[:.)]?)(?:\*\*)?[ \t]+(.+)$/gm;
-	const found = [...String(text || "").matchAll(re)].map((m) => ({ indent: m[1].replace(/\t/g, "    ").length, n: Number(m[2]), text: m[3] }));
-	if (!found.length) return [];
-	const top = Math.min(...found.map((f) => f.indent));
+type Item = { indent: number; n: number; text: string };
+/** 한 깊이의 번호 목록에서 1부터 이어지는 단계 */
+function stepRun(items: Item[]): string[] {
 	const steps: string[] = [];
-	for (const f of found) {
-		if (f.indent !== top) continue;
+	for (const f of items) {
 		if (f.n !== steps.length + 1) {
 			if (steps.length >= 2) break; // 뒤에 다시 1. 로 시작하는 목록(질문 등)은 계획이 아님
 			if (f.n === 1) steps.length = 0;
@@ -461,6 +465,25 @@ export function planSteps(text: string): string[] {
 		steps.push(cut(f.text.replace(/\*\*/g, "").replace(/[:：]\s*$/, "").trim(), 70));
 	}
 	return steps;
+}
+/** 답에서 계획 단계 (1. 2. 3. 또는 1단계: 2단계: ... 처음부터 이어지는 번호만, 가장 바깥 목록).
+ *  '1. 확인한 것: 2. 계획:' 처럼 번호 붙인 절 안에 계획이 있으면 그 절 안의 목록 (2026-10 시험: 2단계로 잘못 셈) */
+export function planSteps(text: string): string[] {
+	const re = /^([ \t]*)(?:#{1,4}[ \t]*)?(?:\*\*)?(\d{1,2})(?:[.)]|[ \t]*단계[ \t]*[:.)]?)(?:\*\*)?[ \t]+(.+)$/gm;
+	const found: Item[] = [...String(text || "").matchAll(re)].map((m) => ({ indent: m[1].replace(/\t/g, "    ").length, n: Number(m[2]), text: m[3] }));
+	if (!found.length) return [];
+	const top = Math.min(...found.map((f) => f.indent));
+	const outer = stepRun(found.filter((f) => f.indent === top));
+	for (let i = 0; i < found.length; i++) {
+		if (found[i].indent !== top || !/계획|단계|plan|할 일|진행 순서/i.test(found[i].text)) continue;
+		const inner: Item[] = [];
+		for (let j = i + 1; j < found.length && found[j].indent > top; j++) inner.push(found[j]);
+		if (!inner.length) continue;
+		const innerTop = Math.min(...inner.map((x) => x.indent));
+		const steps = stepRun(inner.filter((x) => x.indent === innerTop));
+		if (steps.length >= 2 && steps.length > outer.length) return steps;
+	}
+	return outer;
 }
 
 const userConfig = (): any => {
@@ -471,6 +494,29 @@ const userConfig = (): any => {
 		return {};
 	}
 };
+/** 계획을 승인하면 진행할 모델 {provider, id}: 내 설정 파일의 "plan_execute_model" (모델 id 나 provider/id. "same" 이면 바꾸지 않음),
+ *  없으면 pi 의 기본 모델 (settings.json 의 defaultProvider·defaultModel). 2026-10: 고급 모델(GPT-6.1 Sol·Opus 5.5 등)은 사용량이 적어
+ *  계획에만 쓰고, 진행은 기본 모델(GPT-5.6 Sol 깊이 생각하기)로. explicit: provider/id 로 적음 (그때만 다른 제공자로도 바꿈) */
+export function executeModel(cfg: any = userConfig(), settings: any = piSettings()): { provider: string; id: string; explicit: boolean } | null {
+	const v = String(cfg.plan_execute_model ?? "").trim();
+	if (v === "same") return null;
+	const explicit = v.includes("/");
+	const [provider, id] = explicit ? [v.slice(0, v.indexOf("/")), v.slice(v.indexOf("/") + 1)] : [String(settings.defaultProvider || ""), v || String(settings.defaultModel || "")];
+	return provider && id ? { provider, id, explicit } : null;
+}
+function piSettings(): any {
+	try {
+		const p = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "settings.json");
+		return JSON.parse(readFileSync(p, "utf8").replace(/^﻿/, "")) || {};
+	} catch {
+		return {};
+	}
+}
+/** 계획서 폴더 (작업 폴더 기준. 내 설정 파일의 "plan_dir", 기본 docs/plans. 절대 경로·.. 은 받지 않음) */
+const planDir = (): string => {
+	const t = String(userConfig().plan_dir || "").trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+	return t && !t.startsWith("/") && !/^[a-zA-Z]:/.test(t) && !t.split("/").includes("..") ? t : "docs/plans";
+};
 const textOf = (m: any) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c?.type === "text").map((c: any) => c.text).join("\n"));
 const READ_TOOLS = new Set(["read", "grep", "find", "ls", "wiki_search", "wiki_read", "docs_lookup"]);
 
@@ -478,15 +524,17 @@ export default function (pi: ExtensionAPI) {
 	let mode: Mode = (globalThis as any).__piMode; // 확장을 다시 불러와도(/kit share 등) 모드 유지
 	let before: Mode = "auto"; // /plan 으로 끌 때 돌아갈 모드
 	let lastText = ""; // 이번 요청의 마지막 답 (계획인지 볼 때)
+	let planDoc = ""; // 계획 모드에서 쓴 계획서 (도구가 받은 경로. 답에 단계가 없으면 이 파일의 단계로)
 	let asking = false;
 	let steps: { text: string; done: boolean }[] = [];
 
 	const setMode = (ctx: any, m: Mode) => {
+		if (m === "plan" && mode !== "plan") planDoc = ""; // 새 계획: 지난 계획서는 잊음
 		mode = m;
 		(globalThis as any).__piMode = m;
 		if (!ctx?.hasUI) return;
 		const fg = (c: string, s: string) => (ctx.ui.theme?.fg ? ctx.ui.theme.fg(c, s) : s);
-		ctx.ui.setStatus("mode", m === "plan" ? fg("warning", "계획 모드 · 읽기만 (/plan 끄기)") : m === "ask" ? fg("accent", "확인 모드 (/mode 바꾸기)") : undefined);
+		ctx.ui.setStatus("mode", m === "plan" ? fg("warning", "계획 모드 · 읽기와 계획서만 (/plan 끄기)") : m === "ask" ? fg("accent", "확인 모드 (/mode 바꾸기)") : undefined);
 	};
 	const showSteps = (ctx: any) => {
 		if (!ctx?.hasUI) return;
@@ -519,7 +567,7 @@ export default function (pi: ExtensionAPI) {
 		if (text.startsWith("/")) return;
 		if (event.source !== "extension" && steps.length && steps.every((s) => s.done)) clearSteps(ctx);
 		if (mode !== "plan" || !text.trim()) return;
-		return transformInput(text, `${PLAN_NOTE}\n\n${text}`);
+		return transformInput(text, `${planNote(planDir())}\n\n${text}`);
 	});
 
 	pi.on("tool_call", async (event: any, ctx: any) => {
@@ -531,7 +579,17 @@ export default function (pi: ExtensionAPI) {
 		if (mode === "plan") {
 			if (READ_TOOLS.has(tool) && !guardWhy) return;
 			if (tool === "bash" && !problem && !guardWhy) return;
-			const why = tool === "bash" ? `읽기 전용 명령만 실행합니다 (막은 부분: ${problem || guardWhy})` : tool === "write" || tool === "edit" ? "파일을 바꾸지 않았습니다" : `${tool} 도구는 쓰지 않습니다`;
+			const dir = planDir();
+			if ((tool === "write" || tool === "edit") && !guardWhy && isPlanDoc(projectRel(input.path, workDir()), dir)) {
+				planDoc = String(input.path);
+				return;
+			}
+			const why =
+				tool === "bash"
+					? `읽기 전용 명령만 실행합니다 (막은 부분: ${problem || guardWhy})`
+					: tool === "write" || tool === "edit"
+						? `파일을 바꾸지 않았습니다 (계획서는 ${dir}/ 아래의 .md 나 이름에 '계획'·plan 이 든 .md 로만 쓸 수 있음)`
+						: `${tool} 도구는 쓰지 않습니다`;
 			return { block: true, reason: `계획 모드라서 ${why}. 바꾸거나 실행해야 하는 일은 계획의 단계로 적어 주세요. 사용자가 계획을 승인하면 그때 진행합니다.` };
 		}
 		// 확인 모드
@@ -568,14 +626,47 @@ export default function (pi: ExtensionAPI) {
 		if (changed) showSteps(ctx);
 	});
 
-	// 계획이 오면 진행할지 묻는다 (기다리지 않고 따로: 다른 확장의 '끝남' 알림이 늦어지지 않게)
+	/** 승인한 계획을 진행할 모델로 바꾼다 (고급 모델로 계획했으면 기본 모델로). 같은 대화에서 모델만 바뀌므로 계획은 그대로 이어 봄.
+	 *  같은 제공자 안에서만 바꾼다 (사내AI 로 계획했는데 기본 모델이 Copilot 이면 그대로: 대화가 다른 중계 서버로 넘어감). provider/id 로 적었으면 그대로 */
+	async function toExecuteModel(ctx: any) {
+		const want = executeModel();
+		const cur = ctx.model;
+		if (!want || !cur || (cur.provider === want.provider && cur.id === want.id) || typeof (pi as any).setModel !== "function") return;
+		if (!want.explicit && cur.provider !== want.provider) return;
+		const m = ctx.modelRegistry?.find?.(want.provider, want.id);
+		if (!m) return ctx.ui.notify(`계획을 진행할 모델 ${want.provider}/${want.id} 을(를) 모델 목록에서 찾지 못해 지금 모델(${cur.id})로 진행합니다`, "warning");
+		try {
+			// setModel 은 인증이 없으면 오류 대신 false 를 돌려줌 (릴리스 전 검토: 그때도 '진행은 … 로' 라고 알렸음)
+			const ok = await (pi as any).setModel(m);
+			if (ok === false) return ctx.ui.notify(`진행할 모델(${want.id})로 바꾸지 못해 지금 모델(${cur.id})로 진행합니다 (그 모델의 로그인·인증을 확인하세요)`, "warning");
+			ctx.ui.notify(`계획은 ${cur.id} 로 세웠고, 진행은 ${want.id} 로 합니다 (바꾸지 않으려면 내 설정 파일에 "plan_execute_model": "same")`, "info");
+		} catch (e) {
+			ctx.ui.notify(`진행할 모델(${want.id})로 바꾸지 못해 지금 모델(${cur.id})로 진행합니다: ${(e as Error).message}`, "warning");
+		}
+	}
+
+	// 계획이 오면 진행할지 묻는다 (기다리지 않고 따로: 다른 확장의 '끝남' 알림이 늦어지지 않게.
+	//  계획서 읽기도 따로: jupyter 모드에서는 노트북을 거쳐 오래 걸릴 수 있고, 그동안 pi 는 새 입력을 미룸)
 	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
 		if (mode !== "plan" || asking || !ctx.hasUI) return;
-		const found = planSteps(lastText);
-		if (found.length < 2) return;
+		const fromAnswer = planSteps(lastText);
+		const doc0 = planDoc;
+		if (fromAnswer.length < 2 && !doc0) return;
 		asking = true;
 		setTimeout(async () => {
 			try {
+				let found = fromAnswer;
+				let doc = fromAnswer.length >= 2 ? doc0 : "";
+				if (found.length < 2) {
+					// 계획을 계획서로만 남기고 답에는 '계획서를 썼다' 만 적은 경우 (30초 넘게 걸리면 보지 않음)
+					try {
+						let timer: any;
+						const b = await Promise.race([readTarget(target(doc0)), new Promise<null>((ok) => (timer = setTimeout(() => ok(null), 30000)))]).finally(() => clearTimeout(timer));
+						const fromDoc = planSteps(b ? b.toString("utf8") : "");
+						if (fromDoc.length >= 2) [found, doc] = [fromDoc, doc0];
+					} catch {}
+				}
+				if (found.length < 2) return;
 				const pick = await ctx.ui.select(`이 계획대로 진행할까요? (${found.length}단계)`, CHOICES.map((c) => c[0]));
 				const next = CHOICES.find((c) => c[0] === pick)?.[1];
 				if (!next || mode !== "plan") {
@@ -585,7 +676,14 @@ export default function (pi: ExtensionAPI) {
 				setMode(ctx, next);
 				steps = found.map((text) => ({ text, done: false }));
 				showSteps(ctx);
-				pi.sendUserMessage(userAsk(proceedText(found.length, next), `(계획대로 진행, ${found.length}단계)`));
+				planDoc = "";
+				await toExecuteModel(ctx);
+				pi.sendUserMessage(userAsk(proceedText(found.length, next, doc), `(계획대로 진행, ${found.length}단계)`));
+			} catch (e) {
+				// 여기서 던지면 처리되지 않은 오류로 pi 가 꺼질 수 있음
+				try {
+					ctx.ui.notify(`계획 진행을 묻지 못했습니다: ${(e as Error).message}`, "warning");
+				} catch {}
 			} finally {
 				asking = false;
 			}

@@ -353,8 +353,21 @@ export const READ_DOCS_GUIDE =
 export const WAIT_GUIDE =
 	"오래 걸리는 외부 작업(파이프라인 실행, 배포, 긴 학습)을 기다릴 때는 끝날 때까지 아무것도 찍지 않는 대기(wait_for_run_completion 등)를 쓰지 말고, " +
 	"한 명령 안에서 30초마다 상태를 찍으며 10분 안쪽으로 기다린다 (python 은 -u). 그래도 그대로면 막힌 원인을 살펴 사용자에게 알린다.";
+// 2026-10-24 Claude Code 비교 시험 (모델 운영 과제 5개, pi 6/10 · Claude Code 10/10):
+//  - 원인 찾기 2번 모두 관리 테이블의 오류 메시지만 읽고 코드는 열지 않은 채 '… 로 보입니다' 로 끝냄
+//  - 상태 도구가 인자 없이는 개발 기록을 보여 줘 '운영 상태' 요청과 어긋남, 고친 뒤 다시 돌리지 않고 '실행 확인' 이라 씀
+//  - 운영 직접 수정을 거절만 하고 '원하시면 조사부터' 로 끝냄 (Claude Code 는 개발 트리에서 고치고 시험한 뒤 반영 승인을 물음)
+export const CAUSE_GUIDE =
+	"원인을 물으면 오류 메시지에서 멈추지 말고, 오류가 난 코드(함수 정의와 호출부)와 관련 기록을 직접 읽어 근거 위치(파일·줄)와 함께 답한다. " +
+	"'다음에 확인하면 된다' 로 미루지 않는다.";
+export const RERUN_GUIDE =
+	"만든 도구·스크립트는 사용자가 쓸 그대로(기본 인자로) 실행해 결과가 요청에 맞는지 보고, 고친 뒤에는 다시 실행해 확인한다. " +
+	"고치기 전에 돌린 결과로 확인했다고 쓰지 않는다.";
+export const REFUSE_GUIDE =
+	"지침·안전 때문에 요청대로 할 수 없으면 거절만 하고 끝내지 말고, 할 수 있는 안전한 일(원인 조사, 정해진 절차로 고치고 시험)은 해 두고 " +
+	"무엇을 승인받아야 하는지 묻는다.";
 /** 지침에 늘 더하는 줄 (작업 모드와 관계없이 같은 글) */
-export const KIT_GUIDES = [DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE];
+export const KIT_GUIDES = [DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE];
 /** 지침 목록(systemPromptOptions.promptGuidelines)에 KIT_GUIDES 를 한 번씩 더함 */
 export function addKitGuides(g: unknown) {
 	if (Array.isArray(g)) for (const line of KIT_GUIDES) if (!g.includes(line)) g.push(line);

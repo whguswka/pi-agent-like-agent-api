@@ -70,6 +70,20 @@ function mergeObj(u, t, p, changes, where) {
 	return u;
 }
 
+// 키트의 기본값이 바뀐 settings.json 항목: 사용자 값이 지난 템플릿의 값이거나 예전 키트 기본값이면(직접 고치지 않음) 새 기본값으로.
+//  defaultModel: 2026-10 GPT-6.1 Sol 은 회사 계정의 주간 사용량이 반나절 만에 끝나 기본을 GPT-5.6 Sol 깊이 생각하기로 (gpt-6.0-sol 은 2026-10-06.5 까지의 기본)
+const KIT_DEFAULTS = { defaultModel: ["gpt-6.0-sol", "gpt-6.1-sol"] };
+function updateKitDefaults(u, t, p, changes) {
+	for (const [k, old] of Object.entries(KIT_DEFAULTS)) {
+		if (!(k in t) || !(k in u) || u[k] === t[k]) continue;
+		const was = isObj(p) && k in p ? [p[k], ...old] : old;
+		if (!was.includes(u[k])) continue; // 직접 고른 값
+		// 예전 기본값을 일부러 골라 둔 경우는 구별하지 못하므로 되돌리는 법을 함께 적음 (pi: /model 에서 Ctrl+S 가 기본 모델로 저장)
+		changes.push(`${k} ${u[k]} -> ${t[k]}: 키트 기본값이 바뀜 (${u[k]} 을(를) 계속 쓰려면 pi 에서 /model 로 고른 뒤 Ctrl+S)`);
+		u[k] = t[k];
+	}
+}
+
 /** models.json: provider 는 위와 같고, models 목록은 id 기준으로 새 모델만 끝에 추가.
  *  이미 있는 모델은 새로 생긴 항목만 더함 (예: 그림 입력 input). 지난 템플릿의 같은 모델에 있던 항목을 사용자가 지웠으면 다시 넣지 않음 */
 function mergeModels(u, t, p, changes) {
@@ -209,7 +223,10 @@ for (const name of FILES) {
 		name === "models.json"
 			? mergeModels(u.value, t.value, prev[name], changes)
 			: mergeObj(u.value, t.value, prev[name], changes, "");
-	if (name === "settings.json") dropOldKitPaths(merged, changes);
+	if (name === "settings.json") {
+		dropOldKitPaths(merged, changes);
+		updateKitDefaults(merged, t.value, prev[name], changes);
+	}
 	if (!changes.length) continue;
 	fs.copyFileSync(file, `${file}.bak`);
 	fs.writeFileSync(file, `${JSON.stringify(merged, null, 2)}\n`);

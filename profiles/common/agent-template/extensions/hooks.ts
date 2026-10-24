@@ -14,17 +14,30 @@
  *  - 한 답의 도구 호출은 동시에 돌 수 있으므로 판단과 목록 고치기는 한 번에 하나씩
  * 설정 (내 설정 파일 bridge.json): "doc_rules": false (끔), "doc_index": "docs/INDEX.md", "doc_new_limit": 2
  *
- * /hooks: 키트 훅(위험 명령 확인, 문서 규칙)과 내 훅(extensions 폴더의 키트 밖 파일)을 보여 주고 켜고 끈다.
+ * 완료 점검 (2026-10 모델 운영 시험: 팀 표준 스킬을 읽고도 5단계 시험을 끝까지 마치지 않고, 끝나지 않은 실행 기록을 남긴 채 마침.
+ *  지침·스킬의 '끝내기 전에 확인' 은 지나칠 수 있어, 팀이 정한 점검 명령을 키트가 돌린다. Claude Code 의 Stop 훅과 같은 자리)
+ *  - 프로젝트의 .pi/checks.json: {"checks": [{"name": "모델 표준 점검", "when": ["models/**", "common/**"], "run": "python tools/check_standard.py --changed", "timeout": 180}]}
+ *  - 요청이 끝까지 쓴 답으로 끝났고, 그 요청이 시작된 뒤 고친 파일(명령·스크립트로 바꾼 것도: 고친 시각으로 찾음)이 when 에 맞을 때만
+ *  - 실패(종료 코드가 0 이 아님)하면 출력 끝부분과 함께 '고치고 다시 확인하라' 는 요청을 pi 에게 한 번 보내고, 그 뒤에 다시 돌려 결과를 알린다 (더 되풀이하지 않음).
+ *    그래도 실패한 점검은 뒤 요청(도구를 쓴 것)이 끝날 때 파일이 바뀌지 않았어도 다시 돌려, 통과하거나 결과가 달라지면 알리기만 한다
+ *    (2026-10 시험: pi 가 '12개 모델을 시험해도 되느냐' 고 묻고, 사용자가 허락한 다음 요청은 파일을 바꾸지 않아 점검하지 않았음)
+ *  - 명령은 프로젝트·명령마다 처음 한 번 실행해도 되는지 묻는다 (답은 doc-rules.json 의 checks). 계획 모드·화면이 없는 실행에서는 하지 않음
+ *  - 설정: "done_checks": false (끔, /hooks off checks 와 같음)
+ *
+ * /hooks: 키트 훅(위험 명령 확인, 문서 규칙, 완료 점검)과 내 훅(extensions 폴더의 키트 밖 파일)을 보여 주고 켜고 끈다.
  *   '/hooks off mine' 은 내 훅만 끈다 (훅을 모두 끄면서 guard.ts 까지 꺼져 git push 가 묻지 않고 실행된 일 때문).
  *   위험 명령 확인이 꺼져 있으면(guard.ts 가 없거나 "guard": false) 상태 줄에 늘 알린다
  */
 
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import { dirname, join, posix } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { cleanPath, isPcAbsolute, windowsDrivePath } from "./lib/paths.ts";
+import { isPlanDoc, isPlanName, projectRel, type WorkDir } from "./lib/paths.ts";
+import { nbRun, shq, userAsk } from "./lib/relay.ts";
 import { base, parseShell, strip } from "./lib/shell.ts";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +88,8 @@ export function docCfg(v: any = readJson(userConfigFile())): DocCfg {
 	const lim = Number(v.doc_new_limit);
 	return { on: v.doc_rules !== false, index: relSetting(v.doc_index) || "docs/INDEX.md", limit: Number.isInteger(lim) && lim >= 0 ? lim : 2 };
 }
+/** 계획서 폴더 (계획 모드에서 쓸 수 있는 곳, 작업 폴더 기준. 설정 "plan_dir", 기본 docs/plans) */
+export const planDirOf = (v: any = readJson(userConfigFile())) => relSetting(v.plan_dir) || "docs/plans";
 
 /** 지침에 더하는 문서 규칙 (늘 같은 글: 바뀌면 Copilot·사내AI 가 새 대화를 엶) */
 export const DOC_GUIDE =
@@ -99,7 +114,7 @@ export type DocKind = "history" | "plan" | "doc";
 export function docKind(rel: string): DocKind {
 	const n = nameOf(rel).replace(/\.(md|markdown)$/i, "").toLowerCase();
 	if (/(이력|히스토리|history|작업[\s_-]*(기록|내역)|변경[\s_-]*(내역|이력)|진행[\s_-]*(기록|상황)|work-?log|dev-?log)/.test(n)) return "history";
-	if (/(계획|플랜|todo|할[\s_-]*일)/.test(n) || /(^|[^a-z])plans?([^a-z]|$)/.test(n)) return "plan";
+	if (isPlanName(n)) return "plan";
 	return "doc";
 }
 /** 개수·이력·계획 규칙을 보지 않는 문서: 목록 문서, README 같은 정해진 이름 (이력 파일 자신은 tool_call 에서 따로) */
@@ -182,23 +197,8 @@ export function addLink(text: string, line: string, target: string): string | nu
 	return lines.join(nl);
 }
 
-export type WorkDir = { remote: boolean; cwd: string; home?: string };
-/** 도구에 준 경로 -> 작업 폴더 기준 상대 경로 (/ 로). 작업 폴더 밖이면 null (그쪽은 위험 명령 확인이 봄).
- *  jupyter 모드는 노트북 경로 (~ 는 노트북 홈, C:/... 는 PC 파일이라 null) */
-export function projectRel(p: unknown, wd: WorkDir): string | null {
-	let s = cleanPath(p).trim().replace(/\\/g, "/");
-	if (!s) return null;
-	if (wd.remote) {
-		if (isPcAbsolute(s)) return null;
-		if (s === "~" || s.startsWith("~/")) s = (wd.home || "/home/jovyan") + s.slice(1);
-		const r = posix.relative(wd.cwd, posix.resolve(wd.cwd, s));
-		return r && !r.startsWith("..") && !posix.isAbsolute(r) ? r : null;
-	}
-	s = windowsDrivePath(s);
-	if (s === "~" || s.startsWith("~/")) s = homedir().replace(/\\/g, "/") + s.slice(1);
-	const r = relative(wd.cwd, resolve(wd.cwd, s)).replace(/\\/g, "/");
-	return r && !r.startsWith("..") && !isAbsolute(r) ? r : null;
-}
+// 작업 폴더 기준 상대 경로 (작업 폴더 밖이면 null: 그쪽은 위험 명령 확인이 봄). 계획 모드(modes.ts)와 함께 쓰므로 lib 에 둠
+export { projectRel, type WorkDir } from "./lib/paths.ts";
 
 /** 이 도구 호출이 만들 수 있는 Markdown 파일: write 의 path, bash 의 > 파일·>> 파일·tee 파일 (content 는 write 만) */
 export function docTargets(toolName: string, input: any): { path: string; content?: string }[] {
@@ -262,6 +262,124 @@ export function fsFor(wd: WorkDir): Fs | null {
 			writeFileSync(p, t);
 		},
 	};
+}
+
+// ---------------------------------------------------------------------------
+// 완료 점검 (프로젝트의 .pi/checks.json, 시험할 수 있게 순수 함수로)
+// ---------------------------------------------------------------------------
+
+export const CHECKS_FILE = ".pi/checks.json";
+export type Check = { name: string; when: string[]; run: string; timeout: number };
+/** 점검 목록: {"checks": [{"name", "when": ["models/**", ...], "run": "명령", "timeout": 초}]} (배열만 적어도 됨). 형식이 틀린 항목은 뺌 */
+export function parseChecks(text: string | null): Check[] {
+	if (!text) return [];
+	let v: any;
+	try {
+		v = JSON.parse(text.replace(/^﻿/, ""));
+	} catch {
+		return [];
+	}
+	const list = Array.isArray(v) ? v : Array.isArray(v?.checks) ? v.checks : [];
+	const out: Check[] = [];
+	for (const c of list) {
+		const run = typeof c?.run === "string" ? c.run.trim() : "";
+		const when = (Array.isArray(c?.when) ? c.when : typeof c?.when === "string" ? [c.when] : []).filter((g: unknown) => typeof g === "string" && g.trim());
+		if (!run || !when.length) continue;
+		const t = Number(c.timeout);
+		out.push({ name: typeof c.name === "string" && c.name.trim() ? c.name.trim() : run.slice(0, 60), when, run, timeout: Number.isFinite(t) && t > 0 ? Math.min(Math.max(t, 5), 600) : 120 });
+	}
+	return out;
+}
+
+const reEsc = (s: string) => s.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+/** 작업 폴더 기준 경로에 맞춰 볼 glob: ** 는 여러 폴더, * 는 / 없는 글자, ? 는 한 글자. 와일드카드가 없으면 그 파일·폴더 아래 전부 */
+export function globRe(glob: string): RegExp {
+	let g = glob.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+	if (g.endsWith("/")) g += "**";
+	if (!/[*?]/.test(g)) return new RegExp(`^${reEsc(g)}(?:/.*)?$`);
+	let re = "";
+	for (let i = 0; i < g.length; i++) {
+		const c = g[i];
+		if (c === "*" && g[i + 1] === "*") {
+			if (g[i + 2] === "/") {
+				re += "(?:.*/)?";
+				i += 2;
+			} else {
+				re += ".*";
+				i += 1;
+			}
+		} else if (c === "*") re += "[^/]*";
+		else if (c === "?") re += "[^/]";
+		else re += reEsc(c);
+	}
+	return new RegExp(`^${re}$`);
+}
+export const matchesAny = (rel: string, globs: string[]) => globs.some((g) => globRe(g).test(rel));
+/** 바뀐 파일을 찾을 폴더: glob 의 앞쪽 와일드카드 없는 폴더들 (하나라도 처음부터 와일드카드면 작업 폴더 전체 ".") */
+export function globRoots(globs: string[]): string[] {
+	const roots = new Set<string>();
+	for (const glob of globs) {
+		const parts = glob.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").split("/");
+		const k = parts.findIndex((p) => /[*?]/.test(p));
+		const lit = (k < 0 ? parts : parts.slice(0, k)).join("/");
+		roots.add(lit && !lit.split("/").includes("..") ? lit : ".");
+	}
+	if (roots.has(".")) return ["."];
+	const list = [...roots].sort();
+	return list.filter((r) => !list.some((o) => o !== r && r.startsWith(`${o}/`)));
+}
+const SKIP_DIRS = new Set([".git", "node_modules", "__pycache__", ".venv", ".ipynb_checkpoints"]);
+/** 노트북에서 '요청이 시작된 뒤(sec 초 전부터, 2초 여유) 고친 파일' 을 찾는 명령 (시각은 노트북 시계로: PC 와 시계가 달라도 됨) */
+export function findChangedCmd(roots: string[], sec: number): string {
+	const prune = [...SKIP_DIRS].map((n) => `-name ${n}`).join(" -o ");
+	return `t=$(( $(date +%s) - ${Math.ceil(sec) + 2} )); find ${roots.map(shq).join(" ")} \\( ${prune} \\) -prune -o -type f -newermt "@$t" -print 2>/dev/null | head -500`;
+}
+/** PC 의 작업 폴더에서 since(ms) 뒤에 고친 파일 (폴더를 많이 돌지 않게 limit 개까지 봄) */
+export function localChanged(cwd: string, roots: string[], since: number, limit = 20000): string[] {
+	const out: string[] = [];
+	let seen = 0;
+	const walk = (rel: string) => {
+		if (++seen > limit) return;
+		let st: ReturnType<typeof statSync>;
+		try {
+			st = statSync(join(cwd, rel));
+		} catch {
+			return;
+		}
+		if (st.isDirectory()) {
+			let names: string[] = [];
+			try {
+				names = readdirSync(join(cwd, rel));
+			} catch {
+				return;
+			}
+			for (const n of names) if (!SKIP_DIRS.has(n)) walk(rel === "." ? n : `${rel}/${n}`);
+		} else if (st.mtimeMs >= since - 1000) out.push(rel);
+	};
+	for (const r of roots) walk(r);
+	return out;
+}
+/** 점검 명령의 출력 끝부분 (pi 에게·알림에) */
+export function tail(out: string, max = 2500): string {
+	const t = out.replace(/\r/g, "").trim();
+	return t.length > max ? `…${t.slice(t.length - max)}` : t;
+}
+export type CheckResult = { check: Check; code: number | null; out: string };
+export const CHECK_ASK = "(완료 점검 실패: 고치고 다시 확인)";
+/** 점검 명령을 돌려도 되는지 묻는 고르기 창의 답 (예·아니요만 프로젝트에 남김) */
+export const CONSENT = { yes: "예, 이 프로젝트에서 요청이 끝날 때마다 실행", no: "아니요, 이 프로젝트에서는 실행하지 않음", skip: "이번만 건너뛰기 (다음에 다시 묻기)" };
+/** 점검이 실패했을 때 pi 에게 한 번 보내는 요청 */
+export function followUpText(failed: CheckResult[]): string {
+	return [
+		`[완료 점검] 팀이 정한 완료 점검(${CHECKS_FILE})이 실패했습니다.`,
+		...failed.map((r) => `\n## ${r.check.name} (${r.check.run} → ${r.code === null ? "시간 초과·실행 못 함" : `종료 코드 ${r.code}`})\n${tail(r.out) || "(출력 없음)"}`),
+		"",
+		"이번 요청에서 한 일에 관계된 것은 고치고, 같은 점검 명령으로 다시 확인한 뒤 결과를 답하세요.",
+		// 2026-10-24 비교 시험: 점검이 돌려준 것을 고친 뒤 도구를 다시 돌리지 않고, 고치기 전 실행 결과로 '실행 확인' 이라고 답함
+		"고친 파일(만든 도구·스크립트 등)은 고친 뒤 다시 실행해 결과를 보세요. 고치기 전에 돌린 결과로 확인했다고 쓰지 마세요.",
+		"사용자 승인이 필요한 것(운영 반영, 등록, 이번 요청에서 만들지 않은 데이터 지우기 등)은 하지 말고 답에 적어 물으세요. " +
+			"이번 요청에서 만든 임시 파일·기록을 정리하는 것은 고칠 일에 들어갑니다. 이번 요청과 관계없는 항목은 고치지 말고 알리기만 하세요.",
+	].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -479,8 +597,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		if (event.toolName !== "write" && event.toolName !== "bash") return;
 		const cfg = docCfg();
-		if (!cfg.on || (globalThis as any).__piMode === "plan") return;
-		const targets = docTargets(event.toolName, event.input);
+		if (!cfg.on) return;
+		const plan = (globalThis as any).__piMode === "plan";
+		if (plan && event.toolName !== "write") return; // 계획 모드는 계획서 쓰기(write)만 열려 있음 (modes.ts)
+		let targets = docTargets(event.toolName, event.input);
+		if (plan) targets = targets.filter((t) => isPlanDoc(projectRel(t.path, workDir(ctx)), planDirOf()));
 		if (!targets.length) return;
 		return serial(async () => {
 			const wd = workDir(ctx);
@@ -582,6 +703,250 @@ export default function (pi: ExtensionAPI) {
 		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: notes.join("\n") }] };
 	});
 
+	// ── 완료 점검 ──────────────────────────────────────────────────────────────
+	// 요청이 제대로 끝나면(마지막이 끝까지 쓴 답) 그 요청이 시작된 뒤 고친 파일을 찾아, 점검의 when 에 맞으면 점검 명령을 돌린다.
+	// 실패하면 pi 에게 한 번 돌려주고(round 1), 그 요청이 끝나면 한 번 더 돌려 결과를 사용자에게 알린다 (더 되풀이하지 않음).
+	// 다른 확장의 '끝남' 처리가 늦어지지 않게 따로 돌리고, 그동안 사용자가 새 요청을 보냈으면 pi 에게 보내지 않고 알리기만
+	// pending: 고친 뒤에도 실패한 점검의 명령 (뒤 요청이 끝날 때 다시 돌려 알리기만), lastOut: 그 마지막 출력 (같은 결과는 다시 알리지 않음)
+	// gen: 요청이 시작될 때마다 1 씩 (점검하는 동안 다른 요청이 시작·끝났는지), queued: 점검 중에 끝난 요청 (지금 점검이 끝나면 이어서)
+	const C: {
+		t0: number; used: boolean; end: string; round: number; failed: Check[]; busy: boolean; pending: string[]; lastOut: Record<string, string>;
+		gen: number; queued: { round: number; t0: number; gen: number; ctx: any } | null;
+	} = {
+		gen: 0,
+		queued: null,
+		t0: 0,
+		used: false,
+		end: "",
+		round: 0,
+		failed: [],
+		busy: false,
+		pending: [],
+		lastOut: {},
+	};
+	pi.on("session_start", async (event: any) => {
+		if (event?.reason === "reload") return;
+		C.pending = [];
+		C.lastOut = {};
+	});
+	pi.on("agent_start", async () => {
+		C.gen++;
+		if (!C.t0) C.t0 = Date.now();
+	});
+	pi.on("tool_call", async (event: any) => {
+		if (["write", "edit", "bash"].includes(event.toolName)) C.used = true;
+	});
+	pi.on("agent_end", async (event: any) => {
+		const msgs: any[] = event.messages || [];
+		const last = msgs[msgs.length - 1];
+		C.end = last?.role === "assistant" ? String(last.stopReason || "") : "unfinished";
+	});
+	const checksOn = () => readJson(userConfigFile()).done_checks !== false;
+	/** pi 의 bash 도구와 같은 셸 (릴리스 전 검토: Windows 에서 cmd·PowerShell 로 pi.cmd 를 켜면 PATH 의 bash 가 WSL 의 것일 수 있음) */
+	async function checkShell(): Promise<{ shell: string; args: string[]; stdin: boolean }> {
+		try {
+			const m: any = await import("@earendil-works/pi-coding-agent");
+			const c = typeof m.getShellConfig === "function" ? m.getShellConfig() : null;
+			if (c?.shell) return { shell: c.shell, args: Array.isArray(c.args) ? c.args : ["-c"], stdin: c.commandTransport === "stdin" };
+		} catch {}
+		return { shell: "bash", args: ["-c"], stdin: false };
+	}
+	/** 점검 명령 실행: 노트북(jupyter 모드)이나 PC 의 작업 폴더에서. code null 은 시간 초과·실행 못 함 */
+	async function runCheck(c: Check, wd: WorkDir): Promise<CheckResult> {
+		if (wd.remote) {
+			try {
+				const r = await nbRun(`timeout ${c.timeout} bash -c ${shq(c.run)} 2>&1`, wd.cwd);
+				return { check: c, code: r.code === 124 ? null : r.code, out: r.code === 124 ? `${r.out}\n(${c.timeout}초가 지나 멈춤)` : r.out };
+			} catch (e) {
+				return { check: c, code: null, out: `(노트북에서 실행하지 못함: ${(e as Error).message})` };
+			}
+		}
+		const sh = await checkShell();
+		return new Promise((ok) => {
+			let out = "";
+			let done = false;
+			const finish = (code: number | null, extra = "") => {
+				if (done) return;
+				done = true;
+				clearTimeout(timer);
+				ok({ check: c, code, out: out + extra });
+			};
+			let ch: ReturnType<typeof spawn>;
+			try {
+				ch = spawn(sh.shell, sh.stdin ? sh.args : [...sh.args, c.run], { cwd: wd.cwd, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+				if (sh.stdin) ch.stdin?.end(c.run);
+			} catch (e) {
+				return ok({ check: c, code: null, out: `(실행하지 못함: ${(e as Error).message})` });
+			}
+			const timer = setTimeout(() => {
+				// Windows 에서 kill 은 bash 만 끝내고 그 아래 python 등은 남으므로 프로세스 나무째 끝낸다
+				if (process.platform === "win32" && ch.pid) {
+					try {
+						spawn("taskkill", ["/pid", String(ch.pid), "/T", "/F"], { windowsHide: true });
+					} catch {}
+				} else ch.kill();
+				finish(null, `\n(${c.timeout}초가 지나 멈춤)`);
+			}, c.timeout * 1000);
+			ch.stdout?.on("data", (d) => (out += d));
+			ch.stderr?.on("data", (d) => (out += d));
+			ch.on("error", (e) => finish(null, `\n(실행하지 못함: ${e.message})`));
+			ch.on("close", (code) => finish(code));
+		});
+	}
+	/** 이 프로젝트에서 이 점검 명령을 돌려도 되는지 (프로젝트·명령마다 한 번 묻고 doc-rules.json 의 checks 에 남김) */
+	async function allowed(c: Check, wd: WorkDir, files: string[], ctx: any): Promise<boolean> {
+		const key = `${wd.remote ? "nb:" : ""}${wd.cwd}`;
+		const id = createHash("sha256").update(c.run).digest("hex").slice(0, 16);
+		const st = readJson(stateFile());
+		const all = st.checks && typeof st.checks === "object" ? st.checks : {};
+		const known = all[key] && typeof all[key] === "object" ? all[key] : {};
+		if (known[id] === "yes" || known[id] === "no") return known[id] === "yes";
+		const shownFiles = files.slice(0, 5).join(", ") + (files.length > 5 ? ` 외 ${files.length - 5}개` : "");
+		// 고르기 창: 예·아니요는 이 프로젝트에 남기고, 이번만 건너뛰기·Esc 는 남기지 않음 (릴리스 전 검토: 확인 창은 Esc 도 '아니요' 로 영구 저장됐음)
+		const pick = await ctx.ui.select(
+			`완료 점검: 이 프로젝트의 ${CHECKS_FILE} 에 요청이 끝날 때 돌릴 점검이 있습니다.\n\n  ${c.name}\n  명령: ${c.run}\n  (${wd.remote ? "노트북" : "PC"} ${wd.cwd} 에서)\n\n` +
+				`이번 요청에서 바뀐 파일: ${shownFiles}\n실패하면 결과를 pi 에게 한 번 돌려줍니다. (명령이 바뀌면 다시 묻습니다. 끄기: /hooks off checks)\n\n이 명령을 이 프로젝트에서 요청이 끝날 때마다 실행할까요?`,
+			[CONSENT.yes, CONSENT.no, CONSENT.skip],
+		);
+		const yes = pick === CONSENT.yes;
+		if (pick !== CONSENT.yes && pick !== CONSENT.no) return false;
+		try {
+			writeFileSync(stateFile(), `${JSON.stringify({ ...st, checks: { ...all, [key]: { ...known, [id]: yes ? "yes" : "no" } } }, null, 2)}\n`);
+		} catch {}
+		return yes;
+	}
+	/** 이 작업 폴더에서 '아니요' 로 남긴 점검 동의를 지움 (/hooks on checks) */
+	function clearCheckNo(wd: WorkDir): number {
+		const key = `${wd.remote ? "nb:" : ""}${wd.cwd}`;
+		const st = readJson(stateFile());
+		const known = st.checks?.[key];
+		if (!known || typeof known !== "object") return 0;
+		const keep = Object.fromEntries(Object.entries(known).filter(([, v]) => v !== "no"));
+		const n = Object.keys(known).length - Object.keys(keep).length;
+		if (n) {
+			try {
+				writeFileSync(stateFile(), `${JSON.stringify({ ...st, checks: { ...st.checks, [key]: keep } }, null, 2)}\n`);
+			} catch {}
+		}
+		return n;
+	}
+	async function readChecks(wd: WorkDir): Promise<Check[]> {
+		if (wd.remote) {
+			const r = (globalThis as any).__piRemoteFs;
+			if (!r) return [];
+			try {
+				return parseChecks(await r.read(posix.join(wd.cwd, CHECKS_FILE)));
+			} catch {
+				return [];
+			}
+		}
+		try {
+			return parseChecks(readFileSync(join(wd.cwd, CHECKS_FILE), "utf8"));
+		} catch {
+			return [];
+		}
+	}
+	async function doneCheck(ctx: any, round: number, t0: number, gen = C.gen) {
+		const wd = workDir(ctx);
+		const status = (s?: string) => {
+			try {
+				ctx.ui.setStatus("checks", s && fg(ctx, "accent", s));
+			} catch {}
+		};
+		let due: Check[] = [];
+		let left: Check[] = []; // 앞 요청에서 실패한 채 남은 점검: 이 요청에서 파일이 바뀌지 않았어도 다시 돌려 알리기만 (pi 에게 보내지 않음)
+		if (round === 1) due = C.failed;
+		else {
+			const checks = await readChecks(wd);
+			if (!checks.length) return;
+			const roots = globRoots(checks.flatMap((c) => c.when));
+			let changed: string[] = [];
+			const sec = (Date.now() - t0) / 1000;
+			try {
+				changed = wd.remote
+					? (await nbRun(findChangedCmd(roots, sec), wd.cwd)).out.split(/\r?\n/).map((l) => l.trim().replace(/^\.\//, "")).filter(Boolean)
+					: localChanged(wd.cwd, roots, t0);
+			} catch {
+				return; // 노트북에 닿지 않음: 이번에는 보지 않음
+			}
+			for (const c of checks) {
+				const files = changed.filter((f) => matchesAny(f, c.when));
+				if (files.length && (await allowed(c, wd, files, ctx))) due.push(c);
+			}
+			left = checks.filter((c) => C.pending.includes(c.run) && !due.includes(c));
+		}
+		if (!due.length && !left.length) return;
+		const results: CheckResult[] = [];
+		for (const c of [...due, ...left]) {
+			status(`완료 점검 중: ${c.name}`);
+			results.push(await runCheck(c, wd));
+		}
+		status(undefined);
+		const names = (rs: CheckResult[]) => rs.map((r) => r.check.name).join(", ");
+		const lines = (r: CheckResult) => tail(r.out, 600).split("\n").slice(-6).join("\n");
+		const stillFails = (rs: CheckResult[], why = "") =>
+			ctx.ui.notify(`완료 점검이 아직 실패합니다: ${names(rs)}${why}\n${rs.map(lines).join("\n")}\n(pi 에게 다시 보내지 않습니다. 끄기: /hooks off checks)`, "warning");
+		C.pending = C.pending.filter((run) => !results.some((r) => r.check.run === run && r.code === 0));
+		const keep = (rs: CheckResult[]) => {
+			for (const r of rs) {
+				if (!C.pending.includes(r.check.run)) C.pending.push(r.check.run);
+				C.lastOut[r.check.run] = r.out;
+			}
+		};
+		// 남은 점검: 통과하면 알리고, 아직 실패면 결과가 달라졌을 때만 알림
+		const lr = results.filter((r) => left.includes(r.check));
+		if (lr.some((r) => r.code === 0)) ctx.ui.notify(`완료 점검 통과: ${names(lr.filter((r) => r.code === 0))} (앞 요청에서 실패했던 점검)`, "info");
+		const lf = lr.filter((r) => r.code !== 0);
+		const changedOut = lf.filter((r) => C.lastOut[r.check.run] !== r.out);
+		keep(lf);
+		if (changedOut.length) stillFails(changedOut, " (앞 요청에서 실패했던 점검)");
+		const main = results.filter((r) => due.includes(r.check));
+		const failed = main.filter((r) => r.code !== 0);
+		if (!main.length) return;
+		if (!failed.length) return ctx.ui.notify(`완료 점검 통과: ${names(main)}${round === 1 ? " (고친 뒤 다시 확인)" : ""}`, "info");
+		if (round === 1) {
+			keep(failed);
+			return stillFails(failed);
+		}
+		if ((typeof ctx.isIdle === "function" && !ctx.isIdle()) || C.t0 || C.gen !== gen) {
+			// 점검하는 동안 사용자가 새 요청을 보냄 (그 요청이 벌써 끝났어도: 지금 보내면 지난 요청에 대한 부탁이 됨)
+			keep(failed);
+			return ctx.ui.notify(`완료 점검 실패: ${names(failed)} (새 요청 중이라 pi 에게 보내지 않았습니다)\n${failed.map(lines).join("\n")}`, "warning");
+		}
+		C.round = 1;
+		C.failed = failed.map((r) => r.check);
+		ctx.ui.notify(`완료 점검 실패: ${names(failed)} → pi 에게 고치고 다시 확인하게 합니다 (한 번만)`, "warning");
+		pi.sendUserMessage(userAsk(followUpText(failed), CHECK_ASK));
+	}
+	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
+		const { t0, used, end } = C;
+		const round = C.round;
+		C.t0 = 0;
+		C.used = false;
+		C.end = "";
+		C.round = 0;
+		// 끝까지 쓴 답으로 끝난 요청만 (Esc·오류·거부로 멈춘 요청은 사용자가 정함). 계획 모드·화면이 없는 실행은 하지 않음
+		if (end !== "stop" || !ctx?.hasUI || (globalThis as any).__piMode === "plan" || !checksOn()) return;
+		if (round === 0 && (!used || !t0)) return;
+		// 앞 요청의 점검이 아직 돌면 버리지 않고 그 뒤에 (릴리스 전 검토: 점검 중에 끝난 요청의 점검이 사라졌음)
+		if (C.busy) return void (C.queued = { round, t0, gen: C.gen, ctx });
+		startCheck(ctx, round, t0, C.gen);
+	});
+	function startCheck(ctx: any, round: number, t0: number, gen: number) {
+		C.busy = true;
+		setTimeout(async () => {
+			try {
+				await doneCheck(ctx, round, t0, gen);
+			} catch {
+			} finally {
+				C.busy = false;
+				const q = C.queued;
+				C.queued = null;
+				if (q) startCheck(q.ctx, q.round, q.t0, q.gen);
+			}
+		}, 0);
+	}
+
 	// ── /hooks, 위험 명령 확인 경고 ───────────────────────────────────────────
 	const fg = (ctx: any, c: string, s: string) => (ctx?.ui?.theme?.fg ? ctx.ui.theme.fg(c, s) : s);
 	function showGuard(ctx: any) {
@@ -603,17 +968,18 @@ export default function (pi: ExtensionAPI) {
 			"키트 훅 (켜기·끄기: /hooks on|off <이름>)",
 			`  guard  ${g.on ? "켜짐" : `꺼짐 (${g.why})`}  위험 명령 확인: git push·폴더 지우기·kubectl delete 등을 실행 전에 묻기. 끄면 GitLab 반영도 묻지 않음`,
 			`  docs   ${d.on ? "켜짐" : "꺼짐"}  문서 규칙: 새 문서는 ${d.index} 에 링크, 한 요청에 ${d.limit}개를 넘으면 묻기, 이력은 HISTORY.md 하나에`,
+			`  checks ${checksOn() ? "켜짐" : "꺼짐"}  완료 점검: 프로젝트의 ${CHECKS_FILE} 명령을 요청이 끝날 때 돌려, 실패하면 pi 에게 한 번 돌려줌`,
 			`내 훅 (${extDir().replace(/\\/g, "/")}): ${mine.length ? mine.map((h) => `${h.name} ${h.on ? "켜짐" : "꺼짐"}`).join(", ") : "없음"}`,
 			"  /hooks off mine: 내 훅만 모두 끄기 (키트 훅은 그대로)  ·  /hooks on mine: 다시 켜기",
 		].join("\n");
 	};
 	pi.registerCommand("hooks", {
-		description: "훅 목록과 켜고 끄기: /hooks, /hooks off|on <guard|docs|내 훅 이름|mine> (mine: 내 훅만 모두, 위험 명령 확인은 그대로)",
+		description: "훅 목록과 켜고 끄기: /hooks, /hooks off|on <guard|docs|checks|내 훅 이름|mine> (mine: 내 훅만 모두, 위험 명령 확인은 그대로)",
 		handler: async (args: string, ctx: any) => {
 			const [verb, ...rest] = (args || "").trim().split(/\s+/).filter(Boolean);
 			const name = rest.join(" ");
 			if (!verb) return ctx.ui.notify(listText(), "info");
-			if ((verb !== "on" && verb !== "off") || !name) return ctx.ui.notify("사용법: /hooks, /hooks off <guard|docs|이름|mine>, /hooks on <…>", "warning");
+			if ((verb !== "on" && verb !== "off") || !name) return ctx.ui.notify("사용법: /hooks, /hooks off <guard|docs|checks|이름|mine>, /hooks on <…>", "warning");
 			const on = verb === "on";
 			if (name === "guard") {
 				if (!on) {
@@ -637,6 +1003,11 @@ export default function (pi: ExtensionAPI) {
 			if (name === "docs") {
 				saveSetting("doc_rules", on ? undefined : false);
 				return ctx.ui.notify(`문서 규칙을 ${on ? "켰습니다" : "껐습니다"} (다음 요청부터)`, "info");
+			}
+			if (name === "checks") {
+				saveSetting("done_checks", on ? undefined : false);
+				const n = on ? clearCheckNo(workDir(ctx)) : 0;
+				return ctx.ui.notify(`완료 점검을 ${on ? "켰습니다" : "껐습니다"} (다음 요청부터)${n ? `. 이 프로젝트에서 '아니요' 로 답한 점검 ${n}개는 다음에 다시 묻습니다` : ""}`, "info");
 			}
 			const mine = myHooks();
 			const pick = name === "mine" ? mine : mine.filter((h) => [h.name, h.name.replace(/\.(ts|js)$/, "")].includes(name));

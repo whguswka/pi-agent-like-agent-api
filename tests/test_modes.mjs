@@ -72,6 +72,9 @@ s = m.planSteps("**1. 준비**: 폴더 확인\n**2. 실행**");
 check("굵은 글씨 형식", eq(s, ["준비: 폴더 확인", "실행"]), s);
 s = m.planSteps("1. a\n   1. 세부\n   2. 세부\n2. b\n\n질문:\n1. 어느 쪽?\n2. 언제?");
 check("안쪽 목록·뒤의 질문 목록은 단계가 아님", eq(s, ["a", "b"]), s);
+// 2026-10 시험(깊이 생각하기): 답이 '1. 확인된 내용: 2. 계획:' 절로 되어 있고 실제 단계는 '2. 계획:' 안에 있음 -> 2단계로 셈
+s = m.planSteps("1. 확인된 내용:\n   - put_df 는 fmt 를 이름으로만 받음\n2. 계획:\n   1. storage.py 확인\n      - 시그니처\n   2. us_spike 고치기\n   3. 시험\n\n승인해 주세요.");
+check("번호 붙인 절 안의 계획: '계획' 절 안의 목록이 단계", eq(s, ["storage.py 확인", "us_spike 고치기", "시험"]), s);
 check("번호가 없으면 계획 아님", m.planSteps("설명만 있는 답입니다.").length === 0);
 check("단계 하나는 계획 아님 (2개 이상부터)", m.planSteps("1. 하나만").length === 1);
 
@@ -89,7 +92,12 @@ const sent = [];
 const notes = [];
 const widgets = [];
 let idle = true;
-m.default({ on: (e, f) => (on[e] ||= []).push(f), registerCommand: (n, def) => (cmds[n] = def), sendUserMessage: (text, opts) => sent.push({ text, opts }) });
+let setModelResult = true; // pi.setModel 은 인증이 없으면 false
+const modelSets = [];
+m.default({
+	on: (e, f) => (on[e] ||= []).push(f), registerCommand: (n, def) => (cmds[n] = def), sendUserMessage: (text, opts) => sent.push({ text, opts, at: modelSets.length }),
+	setModel: async (mm) => (modelSets.push(mm), setModelResult),
+});
 const ctx = {
 	hasUI: true,
 	isIdle: () => idle,
@@ -128,6 +136,95 @@ check("진행을 고르면 자동 모드로 바꾸고 진행 요청", globalThis
 await on.message_end[0]({ message: { role: "assistant", content: "[1단계 완료]" } }, ctx);
 w = widgets.at(-1);
 check("단계 완료 체크", w.v.length === 1 && w.v[0].includes("[x] 1. 단계1") && w.v[0].includes("1/11"), w);
+
+// 계획서: 계획 모드에서도 계획서(docs/plans 아래 .md, 이름에 계획·plan 이 든 .md)는 쓸 수 있음
+// (2026-10: 계획서를 남겨 달라고 해도 '쓰기가 막혀 못 쓴다' 고 답함). 답에 단계가 없으면 계획서의 단계로 진행할지 물음
+const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
+const P = await jiti.import("../profiles/common/agent-template/extensions/lib/paths.ts");
+check("계획서인지: 계획서 폴더 아래 .md, 이름에 계획·plan·todo 가 든 .md (코드·다른 문서는 아님)",
+	P.isPlanDoc("docs/plans/정리.md") && P.isPlanDoc("작업계획.md") && P.isPlanDoc("docs/release-plan.md") && P.isPlanDoc("TODO.md")
+	&& !P.isPlanDoc("docs/plans/a.py") && !P.isPlanDoc("README.md") && !P.isPlanDoc("docs/planner-notes.md") && !P.isPlanDoc(null) && P.isPlanDoc("plans/a.md", "plans"));
+const W = mkdtempSync(join(tmpdir(), "modes-plan-"));
+mkdirSync(join(W, "docs", "plans"), { recursive: true });
+globalThis.__piWorkDir = { remote: false, cwd: W };
+await cmds.plan.handler("", ctx);
+check("계획 모드 안내: 계획서는 지금 쓰라고 (승인을 기다리지 말고, 단계로 넣지 말고) 쓸 수 있는 곳과 함께", globalThis.__piMode === "plan" && m.planNote("docs/plans").includes("지금 write 로 docs/plans/<이름>.md") && m.planNote("x").includes("승인을 기다리지 말고") && m.planNote("x").includes("단계로 넣지는 마세요"));
+const reasonOf = async (toolName, input) => (await on.tool_call[0]({ toolName, input }, ctx))?.reason || "";
+check("계획 모드: 계획서는 쓰고 고칠 수 있음",
+	!(await blocked("write", { path: "docs/plans/정리.md", content: "1. a" })) && !(await blocked("edit", { path: "작업계획.md", edits: [] }))
+	&& !(await blocked("write", { path: join(W, "docs/plans/abs.md"), content: "" })));
+check("계획 모드: 계획서가 아닌 파일·작업 폴더 밖은 막고, 막을 때 계획서를 쓸 수 있는 곳을 알림",
+	(await blocked("write", { path: "src/a.py", content: "" })) && (await blocked("edit", { path: "README.md", edits: [] })) && (await blocked("write", { path: "../plan.md", content: "" }))
+	&& (await reasonOf("write", { path: "src/a.py", content: "" })).includes("docs/plans/ 아래의 .md"));
+writeFileSync(join(W, "docs/plans/정리.md"), "# a.py 정리 계획\n\n1. 함수 나누기\n2. 시험 더하기\n3. 문서 고치기\n");
+await on.agent_start[0]({}, ctx);
+await on.tool_call[0]({ toolName: "write", input: { path: "docs/plans/정리.md", content: "..." } }, ctx);
+await on.message_end[0]({ message: { role: "assistant", content: "계획서를 docs/plans/정리.md 에 썼습니다. 확인해 주세요." } }, ctx);
+const nSent = sent.length;
+await on.agent_settled[0]({}, ctx);
+await tick();
+check("답에 단계가 없으면 계획서의 단계로 진행할지 묻고, 진행 요청에 계획서를 적음",
+	sent.length === nSent + 1 && sent.at(-1).text.includes("계획서 docs/plans/정리.md") && sent.at(-1).text.includes("모두 3단계") && globalThis.__piMode === "auto", sent.at(-1));
+// 승인한 계획은 기본 모델로 진행 (2026-10: 고급 모델은 사용량이 적어 계획에만 쓰고 진행은 GPT-5.6 Sol 깊이 생각하기로)
+const ST = { defaultProvider: "copilot", defaultModel: "gpt-5.6-sol-think" };
+check("진행할 모델: 설정이 없으면 pi 의 기본 모델, provider/id·id 만, 'same' 이면 바꾸지 않음",
+	JSON.stringify(m.executeModel({}, ST)) === JSON.stringify({ provider: "copilot", id: "gpt-5.6-sol-think", explicit: false })
+	&& JSON.stringify(m.executeModel({ plan_execute_model: "copilot/claude-sonnet-5.5" }, ST)) === JSON.stringify({ provider: "copilot", id: "claude-sonnet-5.5", explicit: true })
+	&& JSON.stringify(m.executeModel({ plan_execute_model: "gpt-5.6-sol-fast" }, ST)) === JSON.stringify({ provider: "copilot", id: "gpt-5.6-sol-fast", explicit: false })
+	&& m.executeModel({ plan_execute_model: "same" }, ST) === null && m.executeModel({}, {}) === null);
+const AG = mkdtempSync(join(tmpdir(), "modes-agent-"));
+writeFileSync(join(AG, "settings.json"), JSON.stringify(ST));
+writeFileSync(join(AG, "bridge.json"), "{}");
+const envBefore = [process.env.PI_CODING_AGENT_DIR, process.env.PI_COPILOT_USER_CONFIG];
+process.env.PI_CODING_AGENT_DIR = AG;
+process.env.PI_COPILOT_USER_CONFIG = join(AG, "bridge.json");
+ctx.model = { provider: "copilot", id: "claude-opus-5.5" };
+ctx.modelRegistry = { find: (p, id) => ({ provider: p, id }) };
+const approve = async () => {
+	await cmds.plan.handler("", ctx);
+	await on.agent_start[0]({}, ctx);
+	await on.message_end[0]({ message: { role: "assistant", content: "1. 나누기\n2. 시험" } }, ctx);
+	await on.agent_settled[0]({}, ctx);
+	await tick();
+};
+let nSet = modelSets.length;
+await approve();
+check("고급 모델로 세운 계획을 승인하면 기본 모델로 바꾼 뒤 진행 요청 (알림)",
+	modelSets.length === nSet + 1 && modelSets.at(-1).id === "gpt-5.6-sol-think" && sent.at(-1).at === modelSets.length && notes.at(-1).includes("진행은 gpt-5.6-sol-think"), [modelSets.slice(nSet), notes.at(-1)]);
+ctx.model = { provider: "copilot", id: "gpt-5.6-sol-think" };
+nSet = modelSets.length;
+await approve();
+check("이미 기본 모델이면 바꾸지 않음", modelSets.length === nSet);
+writeFileSync(join(AG, "bridge.json"), JSON.stringify({ plan_execute_model: "same" }));
+ctx.model = { provider: "copilot", id: "claude-opus-5.5" };
+nSet = modelSets.length;
+await approve();
+check('"plan_execute_model": "same" 이면 고급 모델 그대로 진행', modelSets.length === nSet);
+// 릴리스 전 검토: 다른 제공자로 넘어가지 않게, setModel 이 false 면 바꿨다고 알리지 않게
+writeFileSync(join(AG, "bridge.json"), "{}");
+ctx.model = { provider: "inhouse", id: "inhouse-sonnet" };
+nSet = modelSets.length;
+await approve();
+check("사내AI 로 세운 계획: 기본 모델이 Copilot 이어도 바꾸지 않음 (대화가 다른 중계 서버로 넘어감)", modelSets.length === nSet, modelSets.slice(nSet));
+writeFileSync(join(AG, "bridge.json"), JSON.stringify({ plan_execute_model: "copilot/gpt-5.6-sol-think" }));
+nSet = modelSets.length;
+await approve();
+check("plan_execute_model 을 provider/id 로 적었으면 다른 제공자로도 바꿈", modelSets.length === nSet + 1 && modelSets.at(-1).provider === "copilot", modelSets.slice(nSet));
+writeFileSync(join(AG, "bridge.json"), "{}");
+ctx.model = { provider: "copilot", id: "claude-opus-5.5" };
+setModelResult = false;
+const nNotesSet = notes.length;
+await approve();
+setModelResult = true;
+check("setModel 이 false 면 '바꾸지 못해 지금 모델로' 를 알리고 '진행은 … 로' 는 알리지 않음",
+	notes.slice(nNotesSet).some((x) => x.includes("바꾸지 못해")) && !notes.slice(nNotesSet).some((x) => x.includes("진행은 gpt-5.6-sol-think")), notes.slice(nNotesSet));
+[process.env.PI_CODING_AGENT_DIR, process.env.PI_COPILOT_USER_CONFIG] = envBefore;
+if (envBefore[0] === undefined) delete process.env.PI_CODING_AGENT_DIR;
+if (envBefore[1] === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
+rmSync(AG, { recursive: true, force: true });
+rmSync(W, { recursive: true, force: true });
 
 console.log(fails ? `\n실패 ${fails}개` : "\n모두 통과");
 process.exit(fails ? 1 : 0);

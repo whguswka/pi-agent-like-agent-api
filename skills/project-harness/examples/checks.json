@@ -1,0 +1,10 @@
+{
+  "checks": [
+    {
+      "name": "모델 표준 점검",
+      "when": ["models/**", "common/**", "tools/**"],
+      "run": "python tools/check_standard.py --changed",
+      "timeout": 180
+    }
+  ]
+}

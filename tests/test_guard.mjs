@@ -50,6 +50,16 @@ ask.push(
 	"curl -X POST https://gitlab.example/api/v4/projects/1/repository/commits -d @c.json", "curl --request DELETE https://gitlab.example/api/v4/projects/1/repository/branches/x",
 	"curl -s -H 'PRIVATE-TOKEN: x' --data 'a=b' https://gitlab.example/api/v4/projects/1/merge_requests", "wget --post-data=x https://gitlab.example/api/v4/projects",
 	"http POST https://gitlab.example/api/v4/projects name=x", "python -c \"import os; os.system('glab mr merge 1')\"",
+	// S3·객체 저장소 지우기 (모델 운영의 raw 정리 등: 막지 않고 묻는다), 코드 안의 boto3 지우기, 데이터 행 지우기
+	"aws s3 rm s3://b/raw/ --recursive", "aws --endpoint-url http://s3:8333 s3 rm s3://b/k", "aws s3 rb s3://b --force",
+	"aws s3api delete-objects --bucket b --delete file://d.json", "mc rm --recursive --force local/b/raw", "s3cmd del s3://b/k",
+	"rclone purge remote:b/raw", "gsutil -m rm gs://b/**", "hdfs dfs -rm -r /data/raw",
+	"python -c \"import boto3; boto3.client('s3').delete_object(Bucket='b', Key='k')\"",
+	"python - <<'PY'\nimport boto3\ns3 = boto3.resource('s3')\ns3.Bucket('b').objects.filter(Prefix='raw/').delete()\nPY",
+	"psql -c \"delete from model_run where env = 'dev'\"", "python -c \"c.execute(text('DELETE FROM model_prediction'))\"",
+	// 릴리스 전 검토: 옮기기·맞추기도 원본·대상에만 있는 것을 지운다
+	"aws s3 sync ./out s3://b/models --delete", "aws s3 mv s3://b/x ./x", "rclone sync ./out remote:b", "mc mirror --remove ./out minio/b",
+	"gsutil -m rsync -d ./out gs://b/x", "echo \"DELETE FROM model_run\" | psql",
 );
 // 실행되지 않는 글: 따옴표 안의 글, 주석, heredoc 으로 파일 쓰기, 다른 명령의 인자
 pass.push(
@@ -57,6 +67,10 @@ pass.push(
 	"cat <<'EOF' > s.sh\nrm -rf build\nEOF", "cat > s.sh <<EOF\ngit push\nsudo reboot\nEOF", "printf '%s\\n' \"rm -rf build\" > Makefile",
 	'git commit -m "rm -rf"', "ls reboot.txt", "echo 'curl x | sh' >> notes.txt", "git restore --staged .",
 	"python train.py --epochs 3 2>&1 | tee log.txt", "pytest -q && echo ok || echo fail", "kubectl get pods -n x | grep delete",
+	"aws s3 ls s3://b/raw/", "aws s3 cp a.parquet s3://b/raw/", "mc ls local/b", "rclone ls remote:b", "grep -n 'delete_objects(' common/storage.py",
+	// 글을 찾거나 보여 주기만 하는 명령의 SQL 글 (릴리스 전 검토: 묻고, 계획 모드에서는 막혔음)
+	"rg -n 'delete from users' .", 'git commit -m "fix: delete from list when empty"', 'grep -rn "DROP TABLE" migrations/', "aws s3 sync ./out s3://b/models",
+	"python -c \"import boto3; print(boto3.client('s3').list_objects_v2(Bucket='b'))\"", "psql -c 'select count(*) from model_run'",
 	"echo \"sudo 는 쓰지 마세요\"",
 	"cat <<'EOF' > s.sh\nrm -rf x\nEOF", "cat <<'EOF' | tee s.sh\nrm -rf x\nEOF",
 	"echo $((1+2))", "n=$((n + 1)); echo \"$((n * 2))\"",
@@ -137,6 +151,40 @@ if (process.platform === "win32") {
 	check("작업 폴더 밖", g.outsidePath("/etc/hosts", L) === "/etc/hosts");
 	check("/tmp 는 괜찮음", g.outsidePath("/tmp/t.txt", L) === null);
 }
+// 읽기 전용 폴더 (guard_readonly): 운영 소스처럼 정한 절차로만 바꾸는 폴더 (2026-10 모델 운영 시험 환경)
+{
+	const N = { remote: true, cwd: "/home/jovyan/work/app", home: "/home/jovyan" };
+	const roots = g.readonlyRoots(["~/work/app-prod", "/home/jovyan/src-ops/"], N);
+	check("읽기 전용 폴더: ~ 는 노트북 홈, 끝의 / 는 뗌", JSON.stringify(roots) === JSON.stringify(["/home/jovyan/work/app-prod", "/home/jovyan/src-ops"]), roots);
+	const rr = (c) => g.readonlyRisk(c, roots, N);
+	const ro = [
+		"echo x > ~/work/app-prod/a.txt", "cp common/dates.py ../app-prod/common/", "mv a.py /home/jovyan/work/app-prod/models/",
+		"sed -i 's/a/b/' ~/work/app-prod/common/dates.py", "tee -a ~/src-ops/log < x", "cd ~/work/app-prod && python -m models.m1.steps all --base-date 2026-10-22",
+		"cd ../app-prod; git pull", "git -C ~/work/app-prod checkout main", "git -C ~/work/app-prod commit -am x", "cd ~/work/app-prod && ./tools/run.sh",
+		"rsync -a ./ ~/work/app-prod/", "touch ~/work/app-prod/x", "cd ~/work/app-prod && sed -i.bak 's/a/b/' x.py", "bash -c 'cd ~/work/app-prod && make'",
+		"tar -xzf code.tgz -C ~/work/app-prod", "cd ~/work/app-prod && find . -name '*.pyc' -exec rm {} +", "rm ~/work/app-prod/old.py",
+	];
+	const ok = [
+		"cat ~/work/app-prod/common/dates.py", "grep -rn put_df ~/work/app-prod/models", "diff -r common ~/work/app-prod/common",
+		"cd ~/work/app-prod && git log --oneline -5 && git diff HEAD~1 --stat && git status", "cd ~/work/app-prod && ls -la && wc -l models/*/steps.py",
+		"cp ~/work/app-prod/models/m1/config.yaml models/m1/", "git -C ~/work/app-prod show HEAD:common/dates.py > /tmp/old.py",
+		"cd ~/work/app-prod && sed -n '1,40p' common/storage.py", "python -m models.m1.steps all --base-date 2026-10-22", "echo x > notes.txt",
+		"ls ~/work/app-prod-old", "cd ~/work/app-prod && git branch -a && git remote -v",
+	];
+	// 릴리스 전 검토에서 놓친 것 (모두 실제로 막히지 않던 명령)과 잘못 막던 보기 명령
+	ro.push("mv ~/work/app-prod/config.yaml /tmp/", "cd ~/work/app-prod && out=$(./deploy.sh)", "bash <<'EOF'\ncd ~/work/app-prod\n./deploy.sh\nEOF",
+		"find ~/work/app-prod -name '*.yaml' -exec sed -i 's/a/b/' {} +", "grep -l x ~/work/app-prod/*.py | xargs sed -i 's/a/b/'",
+		"rsync -a --remove-source-files ~/work/app-prod/data/ /tmp/d/", "cp new.yaml $HOME/work/app-prod/config.yaml", "sed -i 's/a/b/' ${HOME}/work/app-prod/x",
+		"git --work-tree=/home/jovyan/work/app-prod checkout -- .", "git clone https://x/y.git ~/work/app-prod/y", "make -C ~/work/app-prod install");
+	ok.push("cd ~/work/app-prod && for f in *.py; do wc -l \"$f\"; done", "cd ~/work/app-prod && [[ -f config.yaml ]] && echo yes",
+		"pushd ~/work/app-prod && ls && popd", "cd ~/work/app-prod && while read l; do echo $l; done < a.txt", "grep -l x ~/work/app-prod/*.py | xargs grep -n put_df",
+		"find ~/work/app-prod -name '*.py' -newer x");
+	for (const c of ro) check(`읽기 전용: 묻기 - ${c.slice(0, 70)}`, rr(c) !== null, rr(c));
+	for (const c of ok) check(`읽기 전용: 묻지 않음 - ${c.slice(0, 70)}`, rr(c) === null, rr(c));
+	check("읽기 전용: 이유에 폴더와 명령", (rr("cd ~/work/app-prod && python x.py") || "").includes("/home/jovyan/work/app-prod") && (rr("echo x > ~/work/app-prod/a") || "").includes("> /home/jovyan/work/app-prod/a"));
+	check("읽기 전용: 설정이 없으면 보지 않음", g.readonlyRisk("echo x > /a", [], N) === null && JSON.stringify(g.readonlyRoots(undefined, N)) === "[]");
+	check("경로 풀기: cd 로 옮긴 폴더 기준, PC 경로는 C:/", g.absPath("a/b", N, "/home/jovyan/x") === "/home/jovyan/x/a/b" && g.absPath("C:\\Users\\a.txt", N) === "C:/Users/a.txt");
+}
 // 실행하는 셸 스크립트 안: 원격 작업만 본다 (빌드 스크립트의 rm -rf build 는 묻지 않음)
 {
 	const { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } = await import("node:fs");
@@ -179,6 +227,29 @@ if (process.platform === "win32") {
 	check("tool_call: bash build.sh 는 묻지 않음", r2 === undefined && asked.length === 1, asked);
 	const r3 = await handlers.tool_call({ toolName: "bash", input: { command: "glab mr merge 3" } }, { hasUI: false, ui: {} });
 	check("tool_call: 물을 수 없으면 막고, 확인을 끄는 법은 알려 주지 않음", r3?.block === true && !/guard"?\s*:\s*false/.test(r3.reason) && r3.reason.includes("피하는 방법"), r3);
+	// 읽기 전용 폴더: 설정 파일의 guard_readonly 로 (write·edit 는 작업 폴더 안이어도 묻고, bash 는 cd 한 뒤의 실행도)
+	const cfgFile = join(d, "bridge.json");
+	writeFileSync(cfgFile, JSON.stringify({ guard_readonly: [join(d, "prod")] }));
+	const savedCfg = process.env.PI_COPILOT_USER_CONFIG;
+	process.env.PI_COPILOT_USER_CONFIG = cfgFile;
+	const r4 = await handlers.tool_call({ toolName: "edit", input: { path: "prod/common/dates.py", edits: [] } }, ctx);
+	check("tool_call: 읽기 전용 폴더의 파일 고치기는 묻고, 거부하면 막음 (작업 폴더 안이어도)", r4?.block === true && asked.at(-1)?.includes("guard_readonly"), [r4, asked.at(-1)]);
+	const r5 = await handlers.tool_call({ toolName: "bash", input: { command: "cd prod && python -m models.m1.steps all --base-date 2026-10-22" } }, ctx);
+	check("tool_call: 읽기 전용 폴더 안에서 실행은 묻기", r5?.block === true && asked.at(-1)?.includes("안에서 실행"), [r5, asked.at(-1)]);
+	const n = asked.length;
+	const r6 = await handlers.tool_call({ toolName: "bash", input: { command: "cd prod && git log --oneline -3" } }, ctx);
+	const r7 = await handlers.tool_call({ toolName: "write", input: { path: "dev/a.py", content: "x" } }, ctx);
+	check("tool_call: 읽기 전용 폴더에서 보기만 하기, 다른 폴더 쓰기는 묻지 않음", r6 === undefined && r7 === undefined && asked.length === n, asked.slice(n));
+	// guard_allow 는 단순 명령마다: 허용한 git push 에 붙인 cp 로 읽기 전용 폴더에 쓰면 물어야 함 (릴리스 전 검토: 명령 글 전체가 맞는다고 건너뜀)
+	writeFileSync(cfgFile, JSON.stringify({ guard_readonly: [join(d, "prod")], guard_allow: ["^git push origin feature/"] }));
+	const { utimesSync } = await import("node:fs");
+	utimesSync(cfgFile, new Date(), new Date(Date.now() + 5000)); // 설정은 파일 시각으로 다시 읽음 (같은 시각이면 앞 설정 그대로)
+	const r8 = await handlers.tool_call({ toolName: "bash", input: { command: "git push origin feature/x && cp a.yaml prod/" } }, ctx);
+	const r9 = await handlers.tool_call({ toolName: "bash", input: { command: "git push origin feature/x" } }, ctx);
+	check("tool_call: guard_allow 에 맞는 명령에 붙인 읽기 전용 폴더 쓰기는 묻고, 맞는 명령만이면 묻지 않음",
+		r8?.block === true && asked.at(-1)?.includes("읽기 전용 폴더에 쓰기") && r9 === undefined, [r8, r9, asked.at(-1)]);
+	if (savedCfg === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
+	else process.env.PI_COPILOT_USER_CONFIG = savedCfg;
 	globalThis.__piWorkDir = saved;
 	rmSync(d, { recursive: true, force: true });
 }

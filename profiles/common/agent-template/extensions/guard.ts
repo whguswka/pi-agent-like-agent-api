@@ -5,8 +5,11 @@
  *  - bash: 폴더 지우기(rm -r 등), git push·reset --hard·clean·branch -D, 권한 일괄 변경, 디스크·시스템 명령,
  *          쿠버네티스 리소스 삭제(kubectl delete), 받은 스크립트 바로 실행(curl | sh), 패키지 제거, sudo, 데이터베이스 삭제,
  *          원격 저장소 바꾸기(glab·gh 의 mr merge 등, GitLab API 로 보내는 POST·PUT·DELETE),
- *          실행하는 셸 스크립트(bash x.sh, ./x.sh) 안의 git push·kubectl delete·glab 같은 원격 작업
+ *          실행하는 셸 스크립트(bash x.sh, ./x.sh) 안의 git push·kubectl delete·glab 같은 원격 작업,
+ *          S3·객체 저장소 지우기(aws s3 rm, mc rm, rclone delete 등, 파이썬 코드의 delete_objects), 데이터 행 지우기(DELETE FROM)
  *  - write/edit: 작업 폴더 밖의 파일 (임시 폴더는 제외). jupyter 모드에서는 노트북의 작업 폴더 기준
+ *  - 읽기 전용 폴더(guard_readonly, 운영 소스 등): 그 안의 파일 쓰기·고치기, 그 안으로 복사·이동·리다이렉트,
+ *    그 폴더의 git 저장소 바꾸기, 그 폴더 안에서 보기만 하는 명령이 아닌 것(스크립트 실행 등)
  *  - 사용자가 직접 치는 !명령은 묻지 않는다 (이 확인은 LLM 이 요청한 도구 실행에만 걸림)
  *  - 거부하면 실행하지 않고 작업을 멈춘다. 물을 수 없는 실행 방식(pi -p)이면 막고 LLM 에게 이유를 알린다
  *  - 계획·확인 모드(modes.ts 의 /plan, /mode)에서는 직접 묻지 않고 이유만 넘긴다: 계획 모드는 막고, 확인 모드는 한 번에 묻는다
@@ -16,6 +19,7 @@
  *   "guard_patterns": ["정규식", ...]        더 물어볼 명령
  *   "guard_allow": ["정규식", ...]           묻지 않을 명령 (&&·;·| 로 이은 명령은 하나씩 맞춰 봄. 예: "^git push origin feature/")
  *   "guard_outside_writes": false           작업 폴더 밖 파일 쓰기는 묻지 않음
+ *   "guard_readonly": ["~/work/app-prod"]   읽기 전용 폴더 (~ 는 명령을 실행하는 곳의 홈: jupyter 모드면 노트북 홈)
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -47,6 +51,14 @@ const RULES: Rule[] = [
 		label: "원격 저장소 바꾸기 (glab·gh, GitLab API)",
 		re: /\b(?:glab|gh)\s+(?:mr|pr|issue|release|repo|label|variable|secret|workflow|run|ci)\s+(?!(?:list|ls|view|show|diff|status|checkout|co|clone|browse|search|trace|lint|help|checks|watch|get|download)\b)[a-z]|\b(?:glab|gh)\s+api\b[^;\n]*(?:-X\s*|--method[\s=])(?:POST|PUT|PATCH|DELETE)\b|\b(?:curl|wget)\b(?=[^;\n]*\/api\/v4\/)(?=[^;\n]*(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|--request[\s=](?:POST|PUT|PATCH|DELETE)\b|--method[\s=](?:POST|PUT|PATCH|DELETE)\b|\s(?:-d|--data(?:-raw|-binary|-urlencode)?|-F|--form|--json|--post-data|--post-file)[\s=]))/i,
 	},
+	// 모델 운영의 remove_data 처럼 지우는 일이 정상인 경우도 있어 막지 않고 묻는다 (2026-10 모델 운영 시험 환경)
+	{
+		label: "S3·객체 저장소 지우기",
+		re: /\baws\b[^;&|\n]*\bs3\s+(?:rm|rb|mv)\b|\baws\b[^;&|\n]*\bs3\s+sync\b[^;&|\n]*--delete\b|\baws\b[^;&|\n]*\bs3api\s+delete-(?:object|objects|bucket)\b|\bmc\s+(?:rm|rb|mv)\b|\bmc\s+mirror\b[^;&|\n]*--remove\b|\bs3cmd\b[^;&|\n]*\b(?:del|rm|rb|delete|mv)\b|\brclone\s+(?:delete|deletefile|purge|rmdir|rmdirs|sync|move|moveto)\b|\bgsutil\s+(?:-m\s+)?(?:rm|mv)\b|\bgsutil\s+(?:-m\s+)?rsync\b[^;&|\n]*\s-[a-zA-Z]*d|\bhdfs\s+dfs\s+-rm/,
+	},
+	// 파이썬 코드(python -c, heredoc)의 boto3 지우기
+	{ label: "S3 객체 지우기 (코드)", re: /\.delete_objects?\s*\(|\.delete_bucket\s*\(|\.objects\.(?:all|filter)\([^)]*\)\.delete\s*\(/ },
+	{ label: "데이터 행 지우기 (DELETE FROM)", re: /\bdelete\s+from\s+["\w.]+/i },
 ];
 
 const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -85,8 +97,9 @@ function regexps(list: unknown): RegExp[] {
 // 분석 중 오류가 나면 전체 글을 RULES 로 본다 (놓치는 것보다 한 번 더 묻는 쪽).
 // ---------------------------------------------------------------------------------------------------------------
 
-/** 데이터베이스 삭제·rmtree 는 SQL·코드 문자열 안에 있으므로 따옴표와 관계없이 전체 글에서 본다 */
-const CONTENT_RULES = RULES.filter((r) => /데이터베이스|rmtree/.test(r.label));
+/** 데이터베이스 삭제·행 지우기·rmtree 는 SQL·코드 문자열 안에 있으므로 따옴표와 관계없이 전체 글에서 본다 */
+const CONTENT_RULES = RULES.filter((r) => /데이터베이스|DELETE FROM|rmtree/.test(r.label));
+const S3_LABEL = "S3·객체 저장소 지우기";
 const LABEL = {
 	rm: RULES[0].label,
 	find: RULES[1].label,
@@ -132,6 +145,27 @@ function apiWrite(name: string, args: string[]): boolean {
 	if (m) return WRITE_METHOD.test(m);
 	if (name === "http" || name === "https") return WRITE_METHOD.test((args.find((a) => !a.startsWith("-")) || "").toUpperCase()); // httpie: http POST 주소
 	return args.some((a) => /^(-d|--data(-raw|-binary|-urlencode)?|-F|--form|--json|-T|--upload-file|--post-data|--post-file)(=|$)/.test(a) || /^-d./.test(a));
+}
+
+/** S3·객체 저장소를 지우는 명령 (aws s3 rm·rb, aws s3api delete-*, mc rm·rb, s3cmd del·rm·rb, rclone delete·purge, gsutil rm, hdfs dfs -rm).
+ *  aws 는 서비스 앞의 전역 옵션(--endpoint-url 값 등)을 건너뛰고 본다 */
+function objectDelete(name: string, args: string[]): boolean {
+	const pos = args.filter((a) => !a.startsWith("-"));
+	// 옮기기(mv·move)는 원본을 지우고, 맞추기(sync --delete, rclone sync, mc mirror --remove, gsutil rsync -d)는 대상에만 있는 것을 지운다
+	if (name === "aws") {
+		const i = args.findIndex((a) => a === "s3" || a === "s3api");
+		const sub = i >= 0 ? args[i + 1] || "" : "";
+		return i >= 0 && (args[i] === "s3" ? /^(rm|rb|mv)$/.test(sub) || (sub === "sync" && args.includes("--delete")) : /^delete-(object|objects|bucket)$/.test(sub));
+	}
+	if (name === "mc") return /^(rm|rb|mv)$/.test(pos[0] || "") || (pos[0] === "mirror" && args.some((a) => /^--remove$/.test(a)));
+	if (name === "s3cmd") return /^(del|rm|rb|delete|mv)$/.test(pos[0] || "") || (pos[0] === "sync" && args.includes("--delete-removed"));
+	if (name === "rclone") return /^(delete|deletefile|purge|rmdir|rmdirs|sync|move|moveto)$/.test(pos[0] || "");
+	if (name === "gsutil") {
+		const s = args.filter((a) => !/^-[mq]$/.test(a));
+		return /^(rm|mv)$/.test(s[0] || "") || (s[0] === "rsync" && s.some((a) => /^-[a-zA-Z]*d/.test(a)));
+	}
+	if (name === "hdfs") return pos[0] === "dfs" && args.some((a) => /^-rm(r|dir)?$/.test(a));
+	return false;
 }
 
 /** PowerShell 을 실행하는 명령: 인자(-Command, ps1 -c)와 heredoc 본문(ps1 <<'EOF', powershell -Command - <<EOF)을 글자 패턴으로 본다.
@@ -187,6 +221,7 @@ function checkSimple(words: string[], depth: number, allow: RegExp[]): string | 
 	else if (name === "npm" && flag(/^(uninstall|un|rm|remove|r)$/) && flag(/^(-g|--global)$/)) why = LABEL.pkg;
 	else if ((name === "glab" || name === "gh") && repoWrite(args)) why = LABEL.remote;
 	else if (["curl", "wget", "http", "https"].includes(name) && apiWrite(name, args)) why = LABEL.remote;
+	else if (objectDelete(name, args)) why = S3_LABEL;
 	if (why) return why;
 	// 안에서 실행되는 글
 	if (SHELLS.has(name)) {
@@ -272,21 +307,52 @@ function analyze(src: string, depth = 0, allow: RegExp[] = []): string | null {
 
 /** 확인이 필요한 bash 명령이면 그 이유, 아니면 null.
  *  guard_allow 는 단순 명령마다 맞춰 본다: "git push origin feature/x && rm -rf ~/p" 에서 git push 만 빼고 rm 은 묻는다 */
+/** 글을 찾거나 보여 주기만 하는 명령뿐인지: 이때는 SQL·코드 문자열 규칙(DELETE FROM 등)을 보지 않는다.
+ *  릴리스 전 검토: "rg -n 'delete from users' .", git commit -m "fix: delete from list" 도 묻고 계획 모드에서는 막혔음.
+ *  psql·python 등 실행하는 것이 하나라도 있으면(파이프 포함) 그대로 본다 */
+const TEXT_CMDS = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "echo", "printf", "cat", "head", "tail", "less", "more", "wc",
+	"sort", "uniq", "cut", "tr", "jq", "yq", "find", "ls"]);
+export function textOnly(command: string): boolean {
+	try {
+		const p = parseShell(command);
+		const all = p.pipelines.flat();
+		if (!all.length || p.nested.length || p.heredocs.length) return false;
+		return all.every((s) => {
+			const { rest } = strip(s.words);
+			if (!rest.length) return true;
+			const name = base(rest[0]);
+			if (name === "git") return /^(commit|log|show|grep|diff|blame|status)$/.test(rest.find((a, i) => i > 0 && !a.startsWith("-")) || "");
+			if (name === "find") return !rest.some((a) => /^-(delete|exec|execdir|ok|okdir)$/.test(a));
+			return TEXT_CMDS.has(name);
+		});
+	} catch {
+		return false;
+	}
+}
+
+/** 명령의 단순 명령이 모두 guard_allow 에 맞는지 (안에서 실행되는 글·heredoc 이 있으면 아니라고 봄) */
+export function allAllowed(command: string, allow: RegExp[]): boolean {
+	if (!allow.length) return false;
+	try {
+		const p = parseShell(command);
+		const all = p.pipelines.flat();
+		return !!all.length && !p.nested.length && !p.heredocs.length && all.every((s) => allowed(s.words, allow));
+	} catch {
+		return false;
+	}
+}
+
 export function checkCommand(command: string, cfg: any = {}): string | null {
 	const allow = regexps(cfg.guard_allow);
 	let why: string | null;
 	try {
-		if (allow.length) {
-			// 모든 명령이 guard_allow 에 맞으면(안에서 실행되는 글·heredoc 없이) 아래의 글자 패턴(guard_patterns 등)도 보지 않음
-			const p = parseShell(command);
-			const all = p.pipelines.flat();
-			if (all.length && !p.nested.length && !p.heredocs.length && all.every((s) => allowed(s.words, allow))) return null;
-		}
+		// 모든 명령이 guard_allow 에 맞으면(안에서 실행되는 글·heredoc 없이) 아래의 글자 패턴(guard_patterns 등)도 보지 않음
+		if (allAllowed(command, allow)) return null;
 		why = analyze(command, 0, allow);
 	} catch {
 		why = legacy(command); // 분석 실패: 전체 글을 글자 패턴으로
 	}
-	if (!why) for (const r of CONTENT_RULES) if (r.re.test(command)) return r.label;
+	if (!why && !textOnly(command)) for (const r of CONTENT_RULES) if (r.re.test(command)) return r.label;
 	if (why) return why;
 	if (regexps(cfg.guard_patterns).some((re) => re.test(command))) return "직접 지정한 명령 (guard_patterns)";
 	return null;
@@ -327,6 +393,208 @@ export function outsidePath(path: string, wd: WorkDir): string | null {
 const workDir = (): WorkDir => (globalThis as any).__piWorkDir || { remote: false, cwd: process.cwd() };
 
 // ---------------------------------------------------------------------------------------------------------------
+// 읽기 전용 폴더 (guard_readonly): 운영 소스처럼 사람이 정한 절차로만 바꾸는 폴더. 지침에만 적으면 모델이 지나치므로 실행 전에 묻는다.
+// 묻는 것: 그 안의 파일 쓰기·고치기(write·edit), 그 안으로 리다이렉트·복사·이동·sed -i 등, 그 폴더의 git 저장소를 바꾸는 명령,
+// 그 폴더 안에서(cd 로 들어가서) 보기만 하는 명령이 아닌 것 (스크립트·프로그램은 그 폴더나 운영 데이터를 바꿀 수 있음)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** 도구가 받은 경로 -> 명령을 실행하는 곳의 절대 경로 (jupyter 모드는 노트북 경로, PC 는 C:/... 형식). cwd 는 상대 경로의 기준 */
+export function absPath(path: string, wd: WorkDir, cwd = wd.cwd): string {
+	let s = cleanPath(path).trim().replace(/\\/g, "/").replace(/^(\$HOME|\$\{HOME\})(?=\/|$)/, "~");
+	if (wd.remote && !isPcAbsolute(s)) {
+		if (s === "~" || s.startsWith("~/")) s = (wd.home || "/home/jovyan") + s.slice(1);
+		return posix.resolve(cwd, s);
+	}
+	if (wd.remote) return slash(win32.resolve(s));
+	s = windowsDrivePath(s);
+	if (s === "~" || s.startsWith("~/")) s = slash(homedir()) + s.slice(1);
+	return slash(resolve(cwd, s));
+}
+
+/** guard_readonly 의 폴더들 (실행하는 곳의 절대 경로) */
+export function readonlyRoots(list: unknown, wd: WorkDir): string[] {
+	if (!Array.isArray(list)) return [];
+	return list.filter((p) => typeof p === "string" && p.trim()).map((p) => absPath(p, wd, wd.remote ? wd.home || "/home/jovyan" : slash(homedir())));
+}
+
+/** 읽기 전용 폴더 안에서 실행해도 되는 보기만 하는 명령 (find -exec·sed -i·awk -i inplace·env 명령 은 아래에서 뺌) */
+const LOOK = new Set(["ls", "ll", "la", "dir", "cat", "bat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "ag",
+	"find", "fd", "wc", "diff", "cmp", "stat", "file", "tree", "du", "df", "pwd", "echo", "printf", "which", "type", "sort", "uniq",
+	"cut", "tr", "awk", "gawk", "sed", "jq", "yq", "md5sum", "sha1sum", "sha256sum", "basename", "dirname", "realpath", "readlink",
+	"date", "test", "[", "true", "false", "column", "nl", "xxd", "od", "strings", "zcat", "zgrep", "env", "printenv", "id", "whoami",
+	"hostname", "uname",
+	// 셸의 반복·분기 틀 (그 안의 명령은 따로 본다: do·then 뒤는 strip 이 넘김). 릴리스 전 검토: 'for f in *.py; do wc -l "$f"; done' 이 막혔음
+	"for", "select", "case", "esac", "done", "fi", "read", "[[", "]]", "popd", "dirs"]);
+const GIT_LOOK = new Set(["status", "log", "show", "diff", "blame", "rev-parse", "ls-files", "ls-tree", "describe", "shortlog", "grep",
+	"cat-file", "whatchanged", "show-ref", "for-each-ref", "rev-list", "count-objects", "help", "version"]);
+
+function lookOnly(name: string, args: string[]): boolean {
+	if (!LOOK.has(name)) return false;
+	if (name === "find") return !args.some((a) => /^-(delete|exec|execdir|ok|okdir|fprint\w*|fls)$/.test(a));
+	if (name === "sed") return !args.some((a) => /^--in-place/.test(a) || /^-[^-]*i/.test(a));
+	if (name === "awk" || name === "gawk") return !args.some((a, i) => a === "-iinplace" || (a === "-i" && args[i + 1] === "inplace"));
+	if (name === "env") return args.every((a) => a.startsWith("-") || /^[A-Za-z_]\w*=/.test(a)); // env 명령 -> 그 명령을 실행
+	return true;
+}
+
+/** git 하위 명령이 저장소(작업 트리·브랜치·설정)를 바꾸지 않는지 */
+function gitLook(sub: string | undefined, a: string[]): boolean {
+	if (!sub) return true;
+	if (GIT_LOOK.has(sub)) return true;
+	if (sub === "reflog") return !a.some((x) => /^(expire|delete)$/.test(x));
+	if (sub === "stash") return a[0] === "list" || a[0] === "show";
+	if (sub === "config") return a.some((x) => /^(--get|--get-all|--get-regexp|--list|-l)$/.test(x));
+	if (["branch", "tag", "remote"].includes(sub))
+		return a.every((x) => x.startsWith("-") && !/^-(d|D|m|M|c|C|f|u)$|^--(delete|move|copy|force|set-upstream|unset-upstream|edit)/.test(x));
+	return false;
+}
+
+/** 명령이 경로에 쓰는 대상 (리다이렉트는 따로). cp·mv 의 대상, tee·touch·mkdir·rm 의 파일, sed -i 의 파일 등 */
+function writeTargets(name: string, args: string[]): string[] {
+	const pos = args.filter((a) => !a.startsWith("-"));
+	const opt = (re: RegExp): string | null => {
+		const i = args.findIndex((a) => re.test(a));
+		if (i < 0) return null;
+		const m = args[i].match(/=(.+)$/);
+		return m ? m[1] : args[i + 1] ?? null;
+	};
+	switch (name) {
+		case "cp": case "mv": case "rsync": case "install": case "ln": case "scp": {
+			const t = opt(/^(-t|--target-directory)(=|$)/);
+			// mv 와 rsync --remove-source-files 는 원본 자리도 바꾼다 (읽기 전용 폴더 밖으로 옮기기)
+			if (name === "mv" || (name === "rsync" && args.includes("--remove-source-files"))) return t ? [...pos, t] : pos;
+			return t ? [t] : pos.length > 1 ? [pos[pos.length - 1]] : [];
+		}
+		case "tee": case "touch": case "mkdir": case "rm": case "rmdir": case "unlink": case "truncate": case "shred":
+			return pos;
+		case "chmod": case "chown": case "chgrp":
+			return pos.slice(1);
+		case "sed": case "perl":
+			return args.some((a) => /^--in-place/.test(a) || /^-[^-]*i/.test(a)) ? pos.slice(1) : [];
+		case "tar": {
+			const c = opt(/^(-C|--directory)(=|$)/);
+			return c && args.some((a) => /^(-?[a-zA-Z]*x[a-zA-Z]*|--extract|--get)$/.test(a)) ? [c] : [];
+		}
+		case "unzip": {
+			const d = opt(/^-d$/);
+			return d ? [d] : [];
+		}
+		case "dd":
+			return args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3));
+		case "curl": {
+			const o = opt(/^(-o|--output)(=|$)/);
+			return o ? [o] : [];
+		}
+		case "wget": {
+			const o = opt(/^(-O|--output-document)(=|$)/);
+			return o ? [o] : [];
+		}
+	}
+	return [];
+}
+
+/** bash 명령이 읽기 전용 폴더를 바꿀 수 있으면 그 이유, 아니면 null. cd 로 옮겨 간 폴더를 기준으로 상대 경로를 푼다 */
+export function readonlyRisk(command: string, roots: string[], wd: WorkDir, depth = 0): string | null {
+	if (!roots.length) return null;
+	const ro = (p: string) => roots.find((r) => inside(p, r)) || null;
+	let parsed: ReturnType<typeof parseShell>;
+	try {
+		parsed = parseShell(command);
+	} catch {
+		return null;
+	}
+	let cwd = wd.cwd;
+	for (const pl of parsed.pipelines)
+		for (const cmd of pl) {
+			for (const r of cmd.redirects) {
+				const a = absPath(r, wd, cwd);
+				if (ro(a)) return `읽기 전용 폴더에 쓰기 (> ${a})`;
+			}
+			const { rest } = strip(cmd.words);
+			if (!rest.length) continue;
+			const name = base(rest[0]);
+			const args = rest.slice(1);
+			if (name === "cd" || name === "pushd") {
+				const t = args.find((a) => !a.startsWith("-"));
+				cwd = t ? absPath(t, wd, cwd) : wd.remote ? wd.home || "/home/jovyan" : slash(homedir());
+				continue;
+			}
+			for (const t of writeTargets(name, args)) {
+				const a = absPath(t, wd, cwd);
+				if (ro(a)) return `읽기 전용 폴더에 쓰기 (${name} ${a})`;
+			}
+			// find 시작 폴더가 읽기 전용이고 -exec·-delete 로 바꾸는 것 ('find ~/work/app-prod -name x -exec sed -i … {} +')
+			if (name === "find" && args.some((a) => /^-(delete|exec|execdir|ok|okdir)$/.test(a))) {
+				const starts = args.slice(0, Math.max(0, args.findIndex((a) => /^[-(!]/.test(a)))) || [];
+				const hit = (starts.length ? starts : ["."]).map((s) => absPath(s, wd, cwd)).find((a) => ro(a));
+				if (hit) return `읽기 전용 폴더에서 find 로 바꾸기 (${hit})`;
+			}
+			// xargs 로 넘긴 파일을 바꾸는 명령: 앞 명령이 읽기 전용 폴더의 파일을 고르면 ('grep -l x ~/work/app-prod/*.py | xargs sed -i …')
+			if (cmd.words.some((w) => base(w) === "xargs") && XARGS_WRITERS.has(name) && (name !== "sed" && name !== "perl" || args.some((a) => /^--in-place|^-[^-]*i/.test(a)))) {
+				const hit = pl.flatMap((s) => s.words.slice(1)).filter((w) => /[/~]/.test(w)).map((w) => absPath(w, wd, cwd)).find((a) => ro(a));
+				if (hit) return `읽기 전용 폴더의 파일을 xargs 로 바꾸기 (${name}: ${hit})`;
+			}
+			if (name === "git") {
+				let k = 0;
+				let dir = cwd;
+				while (k < args.length && args[k].startsWith("-")) {
+					const m = args[k].match(/^--(git-dir|work-tree)=(.+)$/);
+					if (args[k] === "-C" && args[k + 1]) {
+						dir = absPath(args[k + 1], wd, dir);
+						k += 2;
+					} else if (m) {
+						if (ro(absPath(m[2], wd, dir))) dir = absPath(m[2], wd, dir);
+						k++;
+					} else if (/^--(git-dir|work-tree)$/.test(args[k]) && args[k + 1]) {
+						if (ro(absPath(args[k + 1], wd, dir))) dir = absPath(args[k + 1], wd, dir);
+						k += 2;
+					} else k += /^-c$|^--namespace$/.test(args[k]) ? 2 : 1;
+				}
+				if (ro(dir) && !gitLook(args[k], args.slice(k + 1))) return `읽기 전용 폴더의 git 저장소 바꾸기 (git ${args[k] || ""}: ${dir})`;
+				// git clone·init·worktree add 로 읽기 전용 폴더 안에 만들기
+				if (/^(clone|init|worktree)$/.test(args[k] || "")) {
+					const pos = args.slice(k + 1).filter((a) => !a.startsWith("-"));
+					const target = args[k] === "worktree" ? (pos[0] === "add" ? pos[1] : undefined) : args[k] === "clone" ? pos[1] : pos[0];
+					if (target && ro(absPath(target, wd, dir))) return `읽기 전용 폴더에 git ${args[k]} (${absPath(target, wd, dir)})`;
+				}
+				continue;
+			}
+			// make -C <폴더> 는 그 폴더에서 실행
+			if (name === "make") {
+				const i = args.findIndex((a) => a === "-C" || a.startsWith("--directory"));
+				const d = i < 0 ? null : args[i].includes("=") ? args[i].split("=")[1] : args[i + 1];
+				const hit = d ? ro(absPath(d, wd, cwd)) : null;
+				if (hit) return `읽기 전용 폴더(${hit}) 안에서 실행 (make -C)`;
+			}
+			if (SHELLS.has(name) && depth < 3) {
+				const c = args.findIndex((a) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(a));
+				if (c >= 0 && c + 1 < args.length) {
+					const r = readonlyRisk(args[c + 1], roots, { ...wd, cwd }, depth + 1);
+					if (r) return r;
+					continue;
+				}
+			}
+			const here = ro(cwd);
+			if (here && !lookOnly(name, args)) return `읽기 전용 폴더(${here}) 안에서 실행 (${name})`;
+		}
+	// $(...)·`...` 안의 명령과 셸로 넘기는 heredoc 본문도 같은 규칙으로 (cd 로 옮겨 간 곳 기준). 파이썬 코드 안의 쓰기는 보지 않음 (README 6장)
+	if (depth < 3) {
+		for (const n of parsed.nested) {
+			const r = readonlyRisk(n, roots, { ...wd, cwd }, depth + 1);
+			if (r) return r;
+		}
+		for (const h of parsed.heredocs)
+			if (SHELLS.has(base(strip(h.words).rest[0] || ""))) {
+				const r = readonlyRisk(h.body, roots, { ...wd, cwd }, depth + 1);
+				if (r) return r;
+			}
+	}
+	return null;
+}
+const XARGS_WRITERS = new Set(["rm", "rmdir", "unlink", "mv", "cp", "tee", "touch", "truncate", "shred", "chmod", "chown", "chgrp", "ln",
+	"install", "rsync", "sed", "perl", "dd"]);
+
+// ---------------------------------------------------------------------------------------------------------------
 // 실행하는 셸 스크립트 안: 명령 글에는 bash deploy.sh 만 보이므로 그 파일을 읽어, 되돌릴 수 없는 원격 작업만 본다
 // (git push, kubectl delete·helm uninstall, glab·gh·GitLab API 로 바꾸기). 폴더 지우기 같은 것은 보지 않는다:
 // build/ 를 비우는 빌드 스크립트를 돌릴 때마다 묻게 되면 결국 끄게 된다. 읽을 수 없거나 256KB 넘는 파일은 보지 않음
@@ -352,7 +620,7 @@ export function scriptFiles(command: string): string[] {
 	return out;
 }
 
-const REMOTE_LABELS = new Set([LABEL.push, LABEL.kube, LABEL.remote]);
+const REMOTE_LABELS = new Set([LABEL.push, LABEL.kube, LABEL.remote, S3_LABEL]);
 /** 스크립트 글에서 되돌릴 수 없는 원격 작업 (명령 자리의 낱말로. 주석·따옴표 안은 보지 않음). 없으면 null */
 export function remoteRisk(src: string, depth = 0): string | null {
 	try {
@@ -417,21 +685,35 @@ export default function (pi: ExtensionAPI) {
 		const cfg = settings();
 		if (cfg.guard === false) return;
 		const input = event.input || {};
+		const wd = workDir();
+		const roots = readonlyRoots(cfg.guard_readonly, wd);
 		let what = "";
 		let why: string | null = null;
 		if (event.toolName === "bash") {
 			what = String(input.command || "");
 			why = checkCommand(what, cfg);
-			if (!why && !regexps(cfg.guard_allow).some((re) => re.test(what))) {
-				try {
-					why = await scriptRisk(what, workDir(), readScript(workDir()));
-				} catch {}
+			// guard_allow 는 단순 명령마다: 명령 글 전체가 맞는다고 건너뛰면 'git push origin feature/x && cp a ~/work/app-prod/' 의 cp 를 놓침 (릴리스 전 검토)
+			if (!why && !allAllowed(what, regexps(cfg.guard_allow))) {
+				why = readonlyRisk(what, roots, wd);
+				if (!why) {
+					try {
+						why = await scriptRisk(what, wd, readScript(wd));
+					} catch {}
+				}
 			}
-		} else if ((event.toolName === "write" || event.toolName === "edit") && cfg.guard_outside_writes !== false) {
-			const abs = outsidePath(input.path, workDir());
-			if (abs) {
-				what = `${event.toolName === "write" ? "파일 쓰기" : "파일 고치기"}: ${abs}`;
-				why = `작업 폴더(${workDir().cwd}) 밖의 파일`;
+		} else if ((event.toolName === "write" || event.toolName === "edit") && typeof input.path === "string") {
+			const verb = event.toolName === "write" ? "파일 쓰기" : "파일 고치기";
+			const abs = absPath(input.path, wd);
+			const root = roots.find((r) => inside(abs, r));
+			if (root) {
+				what = `${verb}: ${abs}`;
+				why = `읽기 전용 폴더(${root})의 파일 (guard_readonly)`;
+			} else if (cfg.guard_outside_writes !== false) {
+				const out = outsidePath(input.path, wd);
+				if (out) {
+					what = `${verb}: ${out}`;
+					why = `작업 폴더(${wd.cwd}) 밖의 파일`;
+				}
 			}
 		}
 		if (!why) return;

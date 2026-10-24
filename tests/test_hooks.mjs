@@ -39,7 +39,7 @@ check("문서: Markdown 만, 숨김 폴더·node_modules 는 뺌",
 	h.isDoc("docs/a.md") && h.isDoc("x.MARKDOWN") && !h.isDoc("a.txt") && !h.isDoc(".github/x.md") && !h.isDoc("node_modules/p/README.md"));
 for (const [rel, kind] of [["docs/작업이력_1022.md", "history"], ["HISTORY.md", "history"], ["진행-상황.md", "history"], ["worklog.md", "history"], ["devlog-3.md", "history"],
 	["계획_v2.md", "plan"], ["plan.md", "plan"], ["release-plan.md", "plan"], ["todo.md", "plan"], ["할일.md", "plan"],
-	["explanation.md", "doc"], ["planner-notes.md", "doc"], ["log-analysis.md", "doc"], ["설계.md", "doc"], ["README.md", "doc"]])
+	["explanation.md", "doc"], ["planner-notes.md", "doc"], ["autodoc.md", "doc"], ["mastodon-api.md", "doc"], ["my_todo.md", "plan"], ["TODOs.md", "plan"], ["log-analysis.md", "doc"], ["설계.md", "doc"], ["README.md", "doc"]])
 	check(`문서 종류: ${rel} -> ${kind}`, h.docKind(rel) === kind, h.docKind(rel));
 check("규칙 밖: 목록 문서·README·지침·메모·스킬·CHANGELOG (HISTORY.md 는 tool_call 에서 따로)",
 	["docs/INDEX.md", "README.md", "sub/readme.md", "AGENTS.md", "NOTES.md", "x/SKILL.md", "CHANGELOG.md"].every((r) => h.ruleFree(r, "docs/INDEX.md")) && !h.ruleFree("HISTORY.md", "docs/INDEX.md") && !h.ruleFree("docs/a.md", "docs/INDEX.md"));
@@ -114,6 +114,12 @@ function fakeCtx(answers = [], opts = {}) {
 			confirm: async (title) => {
 				log.push(title);
 				return answers.length ? answers.shift() : true;
+			},
+			// 고르기 창 (완료 점검 동의): true = 첫 답(예), false = 둘째(아니요), "skip" = 셋째(이번만 건너뛰기), "esc" = 닫기
+			select: async (title, options) => {
+				log.push(title.startsWith("완료 점검") ? "완료 점검" : title);
+				const a = answers.length ? answers.shift() : true;
+				return a === true ? options[0] : a === false ? options[1] : a === "skip" ? options[2] : a === "esc" ? undefined : a;
 			},
 			notify: (m) => log.push(`알림:${m}`),
 			setStatus: (k, v) => (status[k] = v),
@@ -304,6 +310,189 @@ await F.emit("before_agent_start", g2, ctx);
 await F.emit("before_agent_start", g2, ctx);
 check("지침: 문서 규칙 한 줄 (두 번 넣지 않음, 늘 같은 글)", JSON.stringify(g2.systemPromptOptions.promptGuidelines) === JSON.stringify(["기존", h.DOC_GUIDE]) && h.DOC_GUIDE.length <= 300);
 check("대화창 [문서] 항목", F.entries.some((e) => e.lines.some((l) => l.includes("→ docs/INDEX.md 에 링크"))) && F.entries.some((e) => e.lines.some((l) => l.includes("대신 docs/HISTORY.md"))), F.entries.slice(0, 3));
+
+// 계획 모드에서 쓰는 계획서(modes.ts 가 계획서만 쓰기를 엶)도 목록에 링크. 계획서가 아닌 문서는 계획 모드가 막으므로 보지 않음
+globalThis.__piMode = "plan";
+await request();
+ctx = fakeCtx([]);
+r = await writeDoc(ctx, "docs/plans/계획모드-정리.md", "# 정리 계획\n1. a\n2. b\n");
+const nIdx = read(INDEX);
+const r2 = await tool(ctx, "write", { path: "notes/memo-plan-mode.md", content: "# 메모" });
+globalThis.__piMode = "auto";
+check("계획 모드: 계획서는 목록에 링크, 계획서가 아닌 문서는 보지 않음 (계획 모드가 막음)",
+	nIdx.includes("](plans/%EA%B3%84%ED%9A%8D%EB%AA%A8%EB%93%9C-%EC%A0%95%EB%A6%AC.md)") || nIdx.includes("](plans/계획모드-정리.md)"), [r, nIdx.slice(-300)]);
+check("계획 모드: 계획서가 아닌 문서는 규칙·링크 없음", !r2.note && !read(INDEX).includes("memo-plan-mode"), r2);
+
+// ── 완료 점검 (.pi/checks.json) ─────────────────────────────────────────────
+// 2026-10 모델 운영 시험: 표준 스킬을 읽고도 5단계 시험을 끝내지 않고 끝나지 않은 실행 기록을 남긴 채 마침
+const pc = h.parseChecks;
+check("점검 목록: 객체·배열 형식, when 은 글 하나도, 이름이 없으면 명령, timeout 은 5~600 (기본 120)",
+	JSON.stringify(pc('﻿{"checks":[{"name":"표준","when":["models/**"],"run":"python t.py","timeout":9999}]}')) === JSON.stringify([{ name: "표준", when: ["models/**"], run: "python t.py", timeout: 600 }])
+	&& JSON.stringify(pc('[{"when":"src/","run":"make check"}]')) === JSON.stringify([{ name: "make check", when: ["src/"], run: "make check", timeout: 120 }]), pc('[{"when":"src/","run":"make check"}]'));
+check("점검 목록: run·when 이 없는 항목, 틀린 JSON, 빈 글은 뺌",
+	pc('{"checks":[{"when":["a"]},{"run":"x"},{"run":" ","when":["a"]},{"run":"y","when":[]}]}').length === 0 && pc("{틀림").length === 0 && pc(null).length === 0 && pc('{"x":1}').length === 0);
+const m = h.matchesAny;
+check("glob: ** 는 여러 폴더, * 는 한 폴더 안, 와일드카드가 없으면 그 파일·폴더 아래",
+	m("models/kr/steps.py", ["models/**"]) && !m("modelsx/a.py", ["models/**"]) && m("common/dates.py", ["common/*.py"]) && !m("common/sub/x.py", ["common/*.py"])
+	&& m("a.py", ["**/*.py"]) && m("x/y/z.py", ["**/*.py"]) && !m("x/y/z.txt", ["**/*.py"]) && m("docs/a.md", ["docs"]) && m("docs", ["docs"]) && !m("docsx", ["docs"])
+	&& m("tools/x.py", ["tools/"]) && m("./models/a", ["models/**"].map((g) => g)) === false && m("models/a?b", ["models/a?b"]) && m("models/k/a.py", ["models/*/a.py"]));
+check("바뀐 파일을 찾을 폴더: glob 앞쪽의 폴더 (처음부터 와일드카드면 작업 폴더 전체, 안쪽 폴더는 합침)",
+	JSON.stringify(h.globRoots(["models/**", "common/*.py"])) === JSON.stringify(["common", "models"]) && JSON.stringify(h.globRoots(["**/*.py", "models/**"])) === JSON.stringify(["."])
+	&& JSON.stringify(h.globRoots(["models/**", "models/kr/*.py", "setup.cfg"])) === JSON.stringify(["models", "setup.cfg"]) && JSON.stringify(h.globRoots(["../x/**"])) === JSON.stringify(["."]));
+const fc = h.findChangedCmd(["common", "models"], 60);
+check("노트북에서 찾는 명령: 노트북 시계로 '요청이 시작된 뒤' (2초 여유), .git·__pycache__ 는 건너뜀",
+	fc.includes("find 'common' 'models'") && fc.includes('-newermt "@$t"') && fc.includes("$(date +%s) - 62") && fc.includes("-name .git -o") && fc.includes("-name __pycache__"), fc);
+const CW = join(tmp, "chk");
+mkdirSync(join(CW, "src", "node_modules"), { recursive: true });
+mkdirSync(join(CW, "other"), { recursive: true });
+for (const f of ["src/old.py", "src/new.py", "src/node_modules/x.js", "other/new.txt"]) writeFileSync(join(CW, f), "x");
+const { utimesSync } = await import("node:fs");
+const old = new Date(Date.now() - 3600 * 1000);
+utimesSync(join(CW, "src/old.py"), old, old);
+check("PC 에서 찾기: 그 뒤에 고친 파일만 (node_modules 는 건너뜀)", JSON.stringify(h.localChanged(CW, ["src"], Date.now() - 60000)) === JSON.stringify(["src/new.py"]), h.localChanged(CW, ["src"], Date.now() - 60000));
+const fu = h.followUpText([{ check: { name: "표준", when: ["a"], run: "python t.py", timeout: 9 }, code: 1, out: `${"앞".repeat(3000)}\nFAIL kr_brk20\n  - 끝나지 않은 실행` }]);
+check("pi 에게 보내는 요청: 점검 이름·명령·종료 코드, 출력 끝부분, 관계된 것만 고치고 승인이 필요한 것은 묻기",
+	fu.startsWith("[완료 점검]") && fu.includes("## 표준 (python t.py → 종료 코드 1)") && fu.includes("FAIL kr_brk20") && fu.includes("…") && fu.length < 3200
+	&& fu.includes("같은 점검 명령으로 다시 확인") && fu.includes("사용자 승인이 필요한 것") && fu.includes("관계없는 항목은 고치지 말고")
+	&& fu.includes("고친 뒤 다시 실행해 결과를 보세요") && fu.includes("고치기 전에 돌린 결과로 확인했다고 쓰지 마세요")
+	&& fu.includes("이번 요청에서 만든 임시 파일·기록을 정리하는 것은 고칠 일"), fu.slice(-400));
+
+// 가짜 pi 로: 요청 끝 -> (처음이면 묻고) 점검 -> 실패면 pi 에게 한 번 -> 그 요청이 끝나면 다시 점검해 알림
+const sent = [];
+F.pi.sendUserMessage = (t) => sent.push(t);
+globalThis.__piWorkDir = { remote: false, cwd: CW };
+mkdirSync(join(CW, ".pi"), { recursive: true });
+writeFileSync(join(CW, ".pi", "checks.json"), JSON.stringify({ checks: [{ name: "점검A", when: ["src/**"], run: 'echo "flag=$(cat flag.txt)"; test "$(cat flag.txt)" = ok', timeout: 30 }] }));
+const waitFor = async (cond, ms = 15000) => {
+	const end = Date.now() + ms;
+	while (!cond() && Date.now() < end) await new Promise((ok) => setTimeout(ok, 50));
+	return cond();
+};
+const idleWait = () => new Promise((ok) => setTimeout(ok, 300));
+/** 요청 하나: 시작 -> 도구(쓰기) -> 끝(stopReason) -> 다 끝남. 점검이 따로 돌므로 그 결과(알림·보낸 요청)를 기다림 (none: 아무 일도 없어야 할 때는 잠깐만) */
+async function doneReq(ctx, { write, flag, stop = "stop", tool = "write", none = false, bash = false } = {}) {
+	await F.emit("agent_start", {}, ctx);
+	if (bash) await F.emit("tool_call", { toolName: "bash", toolCallId: `c${++n}`, input: { command: "python run.py" } }, ctx); // 파일은 바꾸지 않는 명령
+	if (write) {
+		await F.emit("tool_call", { toolName: tool, toolCallId: `c${++n}`, input: { path: write, content: "x" } }, ctx);
+		mkdirSync(dirname(join(CW, write)), { recursive: true });
+		writeFileSync(join(CW, write), `x${n}`);
+	}
+	if (flag !== undefined) writeFileSync(join(CW, "flag.txt"), flag);
+	await F.emit("agent_end", { messages: [{ role: "user" }, { role: "assistant", stopReason: stop }] }, ctx);
+	const before = ctx.log.length + sent.length;
+	await F.emit("agent_settled", {}, ctx);
+	await waitFor(() => ctx.log.length + sent.length > before, none ? 1200 : 15000);
+	await idleWait();
+}
+ctx = fakeCtx([true]);
+await doneReq(ctx, { write: "src/a.py", flag: "bad" });
+const st1 = JSON.parse(read(join(AGENT, "doc-rules.json"))).checks;
+check("처음: 프로젝트·명령마다 한 번 묻고(바뀐 파일 보여 줌), 예면 남김",
+	ctx.log[0] === "완료 점검" && Object.keys(st1).length === 1 && Object.values(Object.values(st1)[0])[0] === "yes", [ctx.log, st1]);
+check("실패: pi 에게 한 번 보냄 (점검 이름·출력), 사용자에게도 알림",
+	sent.length === 1 && sent[0].includes("[완료 점검]") && sent[0].includes("점검A") && sent[0].includes("flag=bad") && ctx.log.some((x) => x.startsWith("알림:완료 점검 실패: 점검A → pi 에게")), [sent, ctx.log]);
+ctx = fakeCtx([]);
+await doneReq(ctx, { flag: "ok" }); // pi 가 고친 요청 (파일을 바꾸지 않아도 다시 점검)
+check("보낸 요청이 끝나면 다시 점검: 통과를 알리고 더 보내지 않음 (다시 묻지 않음)",
+	ctx.log.includes("알림:완료 점검 통과: 점검A (고친 뒤 다시 확인)") && !ctx.log.includes("완료 점검") && sent.length === 1, [ctx.log, sent.length]);
+await new Promise((ok) => setTimeout(ok, 1200)); // 앞 요청이 쓴 파일이 이 요청의 시작(1초 여유)보다 앞서게
+ctx = fakeCtx([]);
+await doneReq(ctx, { write: "other/x.txt", flag: "bad", none: true });
+check("when 에 맞는 파일을 바꾸지 않은 요청: 점검하지 않음", ctx.log.length === 0 && sent.length === 1, ctx.log);
+ctx = fakeCtx([]);
+await doneReq(ctx, { write: "src/b.py", flag: "bad" });
+check("다시 실패하면 pi 에게 한 번", sent.length === 2, sent.length);
+ctx = fakeCtx([]);
+await doneReq(ctx, { flag: "bad" });
+check("고친 뒤에도 실패: 사용자에게만 알리고 더 되풀이하지 않음",
+	ctx.log.some((x) => x.startsWith("알림:완료 점검이 아직 실패합니다: 점검A") && x.includes("flag=bad") && x.includes("/hooks off checks")) && sent.length === 2, [ctx.log, sent.length]);
+// 고친 뒤에도 실패한 점검: 뒤 요청에서 파일이 바뀌지 않았어도 다시 돌려 알리기만 (같은 결과는 알리지 않음, pi 에게 보내지 않음)
+ctx = fakeCtx([]);
+await doneReq(ctx, { flag: "bad", bash: true, none: true });
+check("남은 점검: 결과가 같으면 다시 알리지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+ctx = fakeCtx([]);
+await doneReq(ctx, { flag: "ok", bash: true });
+check("남은 점검: 사용자의 다음 요청(파일은 그대로)으로 해결되면 통과를 알림",
+	ctx.log.includes("알림:완료 점검 통과: 점검A (앞 요청에서 실패했던 점검)") && sent.length === 2, [ctx.log, sent.length]);
+ctx = fakeCtx([]);
+await doneReq(ctx, { flag: "bad", bash: true, none: true });
+check("통과한 뒤에는 남은 점검이 없어 파일을 바꾸지 않은 요청은 점검하지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+ctx = fakeCtx([]);
+await doneReq(ctx, { write: "src/c.py", flag: "bad", stop: "aborted", none: true });
+check("Esc·오류·거부로 멈춘 요청은 점검하지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+globalThis.__piMode = "plan";
+ctx = fakeCtx([]);
+await doneReq(ctx, { write: "src/d.py", flag: "bad", none: true });
+globalThis.__piMode = "auto";
+check("계획 모드에서는 하지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+ctx = fakeCtx([], { hasUI: false });
+await doneReq(ctx, { write: "src/e.py", flag: "bad", none: true });
+check("화면이 없는 실행(pi -p)에서는 하지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+writeFileSync(join(AGENT, "bridge.json"), JSON.stringify({ done_checks: false }));
+ctx = fakeCtx([]);
+await doneReq(ctx, { write: "src/f.py", flag: "bad", none: true });
+check('"done_checks": false 면 하지 않음', ctx.log.length === 0 && sent.length === 2, ctx.log);
+writeFileSync(join(AGENT, "bridge.json"), "{}");
+ctx = fakeCtx([]);
+await doneReq(ctx, { write: "src/g.py", flag: "ok", tool: "bash" });
+check("bash 로 바꾼 파일도 (고친 시각으로 찾음), 통과면 알림만", ctx.log.includes("알림:완료 점검 통과: 점검A") && sent.length === 2, ctx.log);
+// 명령이 바뀌면 다시 묻고, 아니요면 돌리지 않고 남김 (다음에는 묻지도 돌리지도 않음)
+writeFileSync(join(CW, ".pi", "checks.json"), JSON.stringify([{ name: "점검B", when: "src/", run: "exit 3" }]));
+ctx = fakeCtx([false]);
+await doneReq(ctx, { write: "src/h.py" });
+const st2 = Object.values(JSON.parse(read(join(AGENT, "doc-rules.json"))).checks)[0];
+check("명령이 바뀌면 다시 묻고, 아니요면 돌리지 않음", ctx.log.length === 1 && ctx.log[0] === "완료 점검" && sent.length === 2 && Object.values(st2).includes("no"), [ctx.log, st2]);
+ctx = fakeCtx([]);
+await F.emit("agent_start", {}, ctx);
+await F.emit("tool_call", { toolName: "write", toolCallId: `c${++n}`, input: { path: "src/i.py" } }, ctx);
+writeFileSync(join(CW, "src/i.py"), "x");
+await F.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+await F.emit("agent_settled", {}, ctx);
+await new Promise((ok) => setTimeout(ok, 1500));
+check("아니요라고 답한 명령은 다시 묻지도 돌리지도 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+// /hooks on checks: 이 프로젝트에서 '아니요' 로 남긴 동의를 지워 다시 묻게 (릴리스 전 검토: Esc 한 번에 영원히 꺼졌음)
+ctx = fakeCtx([]);
+await F.commands.hooks.handler("on checks", ctx);
+check("/hooks on checks: 이 프로젝트의 '아니요' 를 지우고 알림", ctx.log.some((x) => x.includes("다음에 다시 묻습니다")) && !Object.values(Object.values(JSON.parse(read(join(AGENT, "doc-rules.json"))).checks)[0]).includes("no"), ctx.log);
+for (const [ans, what] of [["esc", "닫기(Esc)"], ["skip", "이번만 건너뛰기"]]) {
+	ctx = fakeCtx([ans]);
+	await doneReq(ctx, { write: `src/k-${ans}.py`, none: true });
+	const { createHash } = await import("node:crypto");
+	const kept = Object.values(JSON.parse(read(join(AGENT, "doc-rules.json"))).checks)[0];
+	const idB = createHash("sha256").update("exit 3").digest("hex").slice(0, 16);
+	check(`동의 창을 ${what}: 돌리지 않고 남기지도 않음 (다음에 다시 물음)`, ctx.log[0] === "완료 점검" && sent.length === 2 && !(idB in kept), [ctx.log, kept]);
+}
+// 점검이 도는 동안 다른 요청이 시작하고 끝나면: 앞 요청의 결과는 pi 에게 보내지 않고, 그 요청의 점검은 버리지 않고 이어서 (릴리스 전 검토)
+writeFileSync(join(CW, ".pi", "checks.json"), JSON.stringify({ checks: [{ name: "느린점검", when: ["src/**"], run: "sleep 2; echo FAIL; exit 1", timeout: 30 }] }));
+{
+	let idle = true;
+	ctx = fakeCtx([true, true]);
+	ctx.isIdle = () => idle;
+	const before = sent.length;
+	const req = async (file) => {
+		idle = false;
+		await F.emit("agent_start", {}, ctx);
+		await F.emit("tool_call", { toolName: "write", toolCallId: `c${++n}`, input: { path: file } }, ctx);
+		writeFileSync(join(CW, file), `x${n}`);
+		await F.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+		idle = true;
+		await F.emit("agent_settled", {}, ctx);
+	};
+	await req("src/r1.py");
+	await new Promise((ok) => setTimeout(ok, 400)); // 첫 점검이 도는 중
+	await req("src/r2.py");
+	await waitFor(() => sent.length > before, 15000);
+	await new Promise((ok) => setTimeout(ok, 500));
+	check("점검 중에 다른 요청이 끝남: 앞 요청 결과는 알리기만, 뒤 요청의 점검을 이어서 해 pi 에게 한 번만",
+		sent.length === before + 1 && ctx.log.some((x) => x.includes("새 요청 중이라 pi 에게 보내지 않았습니다")), [sent.length - before, ctx.log]);
+}
+rmSync(join(CW, ".pi", "checks.json"));
+ctx = fakeCtx([]);
+const sentNow = sent.length;
+await doneReq(ctx, { write: "src/j.py", none: true });
+check(".pi/checks.json 이 없으면 아무것도 하지 않음", ctx.log.length === 0 && sent.length === sentNow, ctx.log);
+globalThis.__piWorkDir = local;
 
 // ── /hooks, 위험 명령 확인 경고 ───────────────────────────────────────────────
 for (const f of ["guard.ts", "kit.ts", "hooks.ts", "my-plan.ts", "foo.js", "old.ts.off"]) writeFileSync(join(EXT, f), "");

@@ -5,7 +5,7 @@ import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
 
 // typebox 는 pi 처럼 runtime 의 것으로 (kit.ts 의 docs_lookup 도구)
 const jiti = createJiti(import.meta.url, { alias: { typebox: fileURLToPath(new URL("../runtime/node_modules/typebox/build/index.mjs", import.meta.url)) } });
-const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, KIT_GUIDES, addKitGuides } = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
+const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE, KIT_GUIDES, addKitGuides } = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
 let fails = 0;
 const check = (name, cond, detail = "") => {
 	console.log((cond ? "OK   " : "FAIL ") + name + (cond ? "" : "  -> " + JSON.stringify(detail)));
@@ -34,8 +34,12 @@ check("빈 파일이면 그 부분만", putEnv("", "notebook", "이 노트북", 
 const g = ["기존 줄"];
 addKitGuides(g);
 addKitGuides(g);
-check("지침에 늘 더하는 줄: 한 번씩만 더함 (기존 줄은 그대로, 끝내기 전 확인·코드 파일·문서 먼저·기다리기 차례)",
-	JSON.stringify(g) === JSON.stringify(["기존 줄", DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE]) && KIT_GUIDES.length === 4, g);
+check("지침에 늘 더하는 줄: 한 번씩만 더함 (기존 줄은 그대로, 끝내기 전 확인·코드 파일·문서 먼저·기다리기·원인 근거·다시 실행·거절할 때 차례)",
+	JSON.stringify(g) === JSON.stringify(["기존 줄", DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE]) && KIT_GUIDES.length === 7, g);
+check("비교 시험에서 더한 줄: 원인은 코드·기록을 읽어 파일·줄과 함께, 도구는 기본 인자로 실행·고친 뒤 다시, 거절할 때 안전한 일은 해 두고 승인 묻기 (각 220자 안)",
+	CAUSE_GUIDE.includes("함수 정의와 호출부") && CAUSE_GUIDE.includes("파일·줄") && RERUN_GUIDE.includes("기본 인자") && RERUN_GUIDE.includes("고친 뒤에는 다시 실행")
+	&& REFUSE_GUIDE.includes("거절만 하고 끝내지 말고") && REFUSE_GUIDE.includes("승인") && [CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE].every((s) => s.length <= 220),
+	[CAUSE_GUIDE.length, RERUN_GUIDE.length, REFUSE_GUIDE.length]);
 check("끝내기 전 확인: 요구사항을 다시 보고 실행·테스트로 확인, 못 한 것은 적기, 코드를 비운 채 끝내지 않기, 못 한다고 하기 전에 해 보기 (300자 안)",
 	DONE_GUIDE.length <= 300 && ["요구사항", "실행", "확인하지 못한 것", "임시 코드", "이미 써 본 방법"].every((w) => DONE_GUIDE.includes(w)), DONE_GUIDE.length);
 check("작업 습관 줄: 코드는 파일로·자리 표시 없이, 지침이 가리킨 문서 먼저, 기다릴 때는 한도와 상태 출력 (각 200자 안)",
