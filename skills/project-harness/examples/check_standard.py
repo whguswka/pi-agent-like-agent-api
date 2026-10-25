@@ -142,10 +142,33 @@ def check_runs(m, since, need_ok, need_trained=False):
 STATUS_RE = re.compile(r"\b(SUCCEEDED|FAILED|RUNNING|SKIPPED)\b")
 
 
+NEXT_COL_RE = re.compile(r"^(next\w*|다음\w*|예정\w*)$", re.I)
+BLANK = {"-", "", "none", "nan", "nat", "null", "?"}
+
+
+def blank_next(out, models):
+    """출력 표에서 다음·예정 날짜 칸(NEXT…, 다음…, 예정…)이 빈 모델. 표 머리줄을 찾지 못하면 보지 않는다 (빈 목록)"""
+    split = lambda line: [c.strip() for c in (line.strip().strip("|").split("|") if "|" in line else line.split())]
+    rows = [line for line in out.splitlines() if line.strip()]
+    for i, line in enumerate(rows):
+        cols = [k for k, c in enumerate(split(line)) if NEXT_COL_RE.match(c)]
+        if not cols:
+            continue
+        k = cols[0]
+        bad = []
+        for row in rows[i + 1:]:
+            v = split(row)
+            if v and v[0] in models and (len(v) <= k or v[k].lower() in BLANK):
+                bad.append(v[0])
+        return bad
+    return []
+
+
 def check_tool_run(t, src):
     """새·바뀐 도구를 사용자가 쓸 그대로(인자 없이) 한 번 실행해 본다 (2026-10-24 비교 시험: '운영 상태' 도구가 인자 없이는
     개발 기록만 보여 줬는데, 모델은 실행해서 빈 결과를 보고도 '정상' 이라 함).
     이 저장소의 tools/ 는 읽기만 하는 관리 도구라 인자 없이 돌려도 된다. 쓰거나 지우는 도구가 있는 저장소라면 이름으로 거르거나 이 점검을 뺀다.
+    다음 날짜 칸이 빈 모델도 본다 (2026-10-25 시험: 마지막 학습일이 빈 모델 3개의 다음 학습일을 '-' 로 둠).
     출력 점검은 개발 기록이 비어 있을 때만 확실하다 (개발 기록이 있으면 개발을 기본으로 보는 도구도 통과): 그래서 '운영을 보는 곳이 없음' 도 함께 본다"""
     why = []
     reads_runs = "model_run" in src
@@ -165,6 +188,11 @@ def check_tool_run(t, src):
         if n:
             why.append(f"운영 기록(env='prod')이 {n}건 있는데 인자 없이 실행한 출력에 실행 결과(SUCCEEDED·FAILED 등)가 하나도 없음: "
                        f"운영 상태 도구는 기본으로 env='prod' 를 보게 고치고 python {t} 로 다시 확인")
+    models = {d.name for d in (ROOT / "models").iterdir() if d.is_dir()}
+    bad = blank_next(r.stdout, models)
+    if bad:
+        why.append(f"인자 없이 실행한 출력에서 다음 날짜 칸이 빈 모델 {len(bad)}개 ({', '.join(bad[:5])}): 지난 학습 기록이 없어도 "
+                   f"학습 주기(config 의 train_cycle_months)와 dates.is_train_day 로 오늘부터 다음 학습일을 셈 → python {t} 로 다시 확인")
     return why
 
 
