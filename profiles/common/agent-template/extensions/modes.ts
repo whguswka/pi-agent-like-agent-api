@@ -518,7 +518,7 @@ const planDir = (): string => {
 	return t && !t.startsWith("/") && !/^[a-zA-Z]:/.test(t) && !t.split("/").includes("..") ? t : "docs/plans";
 };
 const textOf = (m: any) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c?.type === "text").map((c: any) => c.text).join("\n"));
-const READ_TOOLS = new Set(["read", "grep", "find", "ls", "wiki_search", "wiki_read", "docs_lookup"]);
+const READ_TOOLS = new Set(["read", "grep", "find", "ls", "wiki_search", "wiki_read", "docs_lookup", "ask_user"]);
 
 export default function (pi: ExtensionAPI) {
 	let mode: Mode = (globalThis as any).__piMode; // 확장을 다시 불러와도(/kit share 등) 모드 유지

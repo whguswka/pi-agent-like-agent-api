@@ -24,7 +24,13 @@
  *  - 명령은 프로젝트·명령마다 처음 한 번 실행해도 되는지 묻는다 (답은 doc-rules.json 의 checks). 계획 모드·화면이 없는 실행에서는 하지 않음
  *  - 설정: "done_checks": false (끔, /hooks off checks 와 같음)
  *
- * /hooks: 키트 훅(위험 명령 확인, 문서 규칙, 완료 점검)과 내 훅(extensions 폴더의 키트 밖 파일)을 보여 주고 켜고 끈다.
+ * 문법 확인 (2026-10-27, oh-my-pi 가 고친 파일의 진단을 도구 결과에 붙이는 것을 참고해 새로 씀)
+ *  - write·edit 로 고친 .py·.json·.ipynb·.yaml·.yml 이 깨졌으면 그 도구 결과에 줄 번호와 함께 알린다 (통과하면 아무것도 붙이지 않음)
+ *  - .py 는 지금 실행 위치(jupyter 모드면 노트북)의 Python 으로 (작업 폴더의 .venv 먼저: 그 버전의 문법), .yaml 은 PyYAML 이 있을 때만,
+ *    JSON 은 주석·끝 쉼표만 있는 것(tsconfig.json·VS Code 설정)과 {{ }} 틀은 깨진 것으로 보지 않음
+ *  - 설정: "syntax_check": false (끔, /hooks off syntax 와 같음)
+ *
+ * /hooks: 키트 훅(위험 명령 확인, 문서 규칙, 완료 점검, 팀 규칙, 문법 확인)과 내 훅(extensions 폴더의 키트 밖 파일)을 보여 주고 켜고 끈다.
  *   '/hooks off mine' 은 내 훅만 끈다 (훅을 모두 끄면서 guard.ts 까지 꺼져 git push 가 묻지 않고 실행된 일 때문).
  *   위험 명령 확인이 꺼져 있으면(guard.ts 가 없거나 "guard": false) 상태 줄에 늘 알린다
  */
@@ -36,16 +42,18 @@ import { homedir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { isPlanDoc, isPlanName, projectRel, type WorkDir } from "./lib/paths.ts";
-import { nbRun, shq, userAsk } from "./lib/relay.ts";
-import { base, parseShell, strip } from "./lib/shell.ts";
+import { cleanPath, isPlanDoc, isPlanName, projectRel, type WorkDir } from "./lib/paths.ts";
+import { localPython, NB_FIND_PY, runProc } from "./lib/python.ts";
+import { nbRun, readTarget, shown, shq, type Target, target, userAsk } from "./lib/relay.ts";
+import { rulesOn, writtenText } from "./lib/rules.ts";
+import { base, parseShell, strip, writtenPaths } from "./lib/shell.ts";
 
 // ---------------------------------------------------------------------------
 // 설정
 // ---------------------------------------------------------------------------
 
 /** 키트가 설치하는 확장 (install.sh·update.sh 의 KIT_EXT 와 같게. tests/test_hooks.mjs 가 확인). 이 밖의 파일이 '내 훅' */
-export const KIT_EXT = ["copilot-session.ts", "jupyter.ts", "guard.ts", "notify.ts", "kit.ts", "undo.ts", "modes.ts", "memory.ts", "files.ts", "wiki.ts", "hooks.ts"];
+export const KIT_EXT = ["copilot-session.ts", "jupyter.ts", "guard.ts", "notify.ts", "kit.ts", "undo.ts", "modes.ts", "memory.ts", "files.ts", "wiki.ts", "hooks.ts", "rules.ts"];
 
 const agentDir = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const userConfigFile = () => process.env.PI_COPILOT_USER_CONFIG || join(agentDir(), "bridge.json");
@@ -166,14 +174,8 @@ export function stepDb(text: unknown): boolean {
 export const STEP_DB_NOTE =
 	"(이 코드는 파이프라인 단계 안에서 DB 에 접속합니다. 단계 파드에는 노트북의 DB 접속 정보(환경 변수)가 없어 Secret 설정이 따로 필요합니다. " +
 	"제출하기 전에 사용자에게 알리고 어떻게 할지 정하세요. 비밀번호는 코드·파이프라인 인자에 넣지 마세요)";
-/** write·edit·bash 로 새로 들어가는 글 (edit 는 바꿀 글만) */
-export function writtenText(toolName: string, input: any): string {
-	if (toolName === "write") return typeof input?.content === "string" ? input.content : "";
-	if (toolName === "bash") return typeof input?.command === "string" ? input.command : "";
-	if (toolName !== "edit") return "";
-	const edits: any[] = Array.isArray(input?.edits) ? input.edits : input?.newText !== undefined ? [{ newText: input.newText }] : [];
-	return edits.map((e) => String(e?.newText ?? "")).join("\n");
-}
+/** write·edit·bash 로 새로 들어가는 글: lib/rules.ts 로 옮김 (팀 규칙도 씀) */
+export { writtenText };
 /** 목록 문서에서 본 링크 대상 (빈칸은 %20) */
 export const linkTarget = (index: string, rel: string) => posix.relative(posix.dirname(index), rel).replace(/ /g, "%20");
 
@@ -204,16 +206,7 @@ export { projectRel, type WorkDir } from "./lib/paths.ts";
 export function docTargets(toolName: string, input: any): { path: string; content?: string }[] {
 	const out: { path: string; content?: string }[] = [];
 	if (toolName === "write" && typeof input?.path === "string") out.push({ path: input.path, content: input.content });
-	else if (toolName === "bash" && typeof input?.command === "string") {
-		try {
-			for (const pl of parseShell(input.command).pipelines)
-				for (const cmd of pl) {
-					for (const r of cmd.redirects) out.push({ path: r });
-					const { rest } = strip(cmd.words);
-					if (rest.length && base(rest[0]) === "tee") for (const a of rest.slice(1)) if (!a.startsWith("-")) out.push({ path: a });
-				}
-		} catch {}
-	}
+	else if (toolName === "bash" && typeof input?.command === "string") for (const p of writtenPaths(input.command)) out.push({ path: p });
 	return out.filter((t, i) => /\.(md|markdown)$/i.test(t.path) && out.findIndex((u) => u.path === t.path) === i);
 }
 
@@ -380,6 +373,135 @@ export function followUpText(failed: CheckResult[]): string {
 		"사용자 승인이 필요한 것(운영 반영, 등록, 이번 요청에서 만들지 않은 데이터 지우기 등)은 하지 말고 답에 적어 물으세요. " +
 			"이번 요청에서 만든 임시 파일·기록을 정리하는 것은 고칠 일에 들어갑니다. 이번 요청과 관계없는 항목은 고치지 말고 알리기만 하세요.",
 	].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// 문법 확인 (시험할 수 있게 순수 함수로. 실행은 확장 안에서)
+// ---------------------------------------------------------------------------
+
+export type SyntaxKind = "py" | "json" | "yaml";
+/** 문법을 확인할 파일 종류 (경로에 {{ }} 가 든 틀 폴더는 뺌: cookiecutter 등) */
+export function syntaxKind(path: string): SyntaxKind | null {
+	if (path.includes("{{")) return null;
+	const ext = (path.toLowerCase().match(/\.([a-z]+)$/) || [])[1];
+	if (ext === "py") return "py";
+	if (ext === "json" || ext === "ipynb") return "json";
+	if (ext === "yaml" || ext === "yml") return "yaml";
+	return null;
+}
+export type SyntaxProblem = { line?: number; col?: number; msg: string; text?: string; by?: string };
+/** 이보다 큰 JSON 은 문법을 보지 않음 (바이트·글자) */
+export const SYNTAX_JSON_MAX = 2_000_000;
+
+/** 주석(//, /* … *\/)과 끝 쉼표를 뺀 JSON (tsconfig.json·VS Code 설정 같은 JSONC 를 깨진 것으로 보지 않으려고) */
+export function stripJsonc(s: string): string {
+	let out = "";
+	for (let i = 0; i < s.length; i++) {
+		const c = s[i];
+		if (c === '"') {
+			let j = i + 1;
+			while (j < s.length && s[j] !== '"') j += s[j] === "\\" ? 2 : 1;
+			out += s.slice(i, j + 1);
+			i = j;
+		} else if (c === "/" && s[i + 1] === "/") {
+			while (i < s.length && s[i] !== "\n") i++;
+			out += "\n";
+		} else if (c === "/" && s[i + 1] === "*") {
+			const k = s.indexOf("*/", i + 2);
+			i = k < 0 ? s.length : k + 1;
+		} else out += c;
+	}
+	return out.replace(/,(\s*[}\]])/g, "$1");
+}
+/** JSON 문법: 깨졌으면 문제, 아니면 null. 빈 파일, 주석·끝 쉼표만 있는 JSONC, {{ }} 틀은 깨진 것으로 보지 않음 */
+export function jsonProblem(text: string): SyntaxProblem | null {
+	const t = text.replace(/^﻿/, "");
+	if (!t.trim()) return null;
+	try {
+		JSON.parse(t);
+		return null;
+	} catch (e) {
+		if (t.includes("{{")) return null;
+		try {
+			JSON.parse(stripJsonc(t));
+			return null;
+		} catch {}
+		const msg = String((e as Error)?.message ?? e);
+		const lc = msg.match(/line (\d+) column (\d+)/);
+		const pos = msg.match(/position (\d+)/);
+		let line: number | undefined;
+		let col: number | undefined;
+		if (lc) [line, col] = [Number(lc[1]), Number(lc[2])];
+		else if (pos) {
+			const before = t.slice(0, Number(pos[1]));
+			line = before.split("\n").length;
+			col = before.length - before.lastIndexOf("\n");
+		}
+		return { line, col, msg: msg.replace(/\s*\(line \d+ column \d+\)/, "").replace(/ in JSON at position \d+/, "").slice(0, 160) };
+	}
+}
+/** .py·.yaml 문법 확인 (Python 에 '<파일> <py|yaml>' 인자, '@@SYNTAX {…}' 한 줄을 찍음). yaml 은 PyYAML 이 있을 때만, {{ }} 틀은 건너뜀.
+ *  yaml 은 구조만 읽음 (!Ref 같은 사용자 태그를 오류로 보지 않게) */
+export const SYNTAX_PY = `import json, sys
+def done(**k):
+    print("@@SYNTAX " + json.dumps(k, ensure_ascii=False))
+    sys.exit(0)
+path, kind = sys.argv[1], sys.argv[2]
+try:
+    src = open(path, "rb").read()
+except Exception:
+    done(skip=1)
+if kind == "py":
+    by = sys.version.split()[0]
+    try:
+        compile(src, path, "exec", 1024, True)
+    except SyntaxError as e:
+        done(line=e.lineno, col=e.offset, msg=str(e.msg)[:200], text=(e.text or "").strip()[:160], by=by)
+    except (ValueError, TypeError) as e:
+        done(msg=str(e)[:200], by=by)
+elif kind == "yaml":
+    if b"{{" in src:
+        done(skip=1)
+    try:
+        import yaml
+    except Exception:
+        done(skip=1)
+    try:
+        for _ in yaml.parse(src.decode("utf-8", "replace")):
+            pass
+    except yaml.YAMLError as e:
+        m = getattr(e, "problem_mark", None)
+        done(line=m.line + 1 if m else None, col=m.column + 1 if m else None, msg=str(getattr(e, "problem", None) or e)[:200])
+done(ok=1)
+`;
+/** 노트북에서 돌리는 문법 확인 명령 (Python 은 NB_FIND_PY 로 찾음. 없으면 건너뜀) */
+export function notebookSyntaxCmd(abs: string, kind: SyntaxKind): string {
+	return [
+		NB_FIND_PY,
+		`[ -n "$PY" ] || { echo '@@SYNTAX {"skip": 1}'; exit 0; }`,
+		`PYTHONIOENCODING=utf-8 PYTHONDONTWRITEBYTECODE=1 timeout 30 "$PY" - ${shq(abs)} ${kind} <<'PISYNTAXEOF' 2>/dev/null`,
+		SYNTAX_PY.trimEnd(),
+		"PISYNTAXEOF",
+	].join("\n");
+}
+/** 확인 결과 줄 -> 문제 (통과·건너뜀·못 읽음은 null) */
+export function parseSyntaxOut(out: string): SyntaxProblem | null {
+	const m = out.match(/^@@SYNTAX (\{.*\})\s*$/m);
+	if (!m) return null;
+	try {
+		const v = JSON.parse(m[1]);
+		if (v.ok || v.skip || typeof v.msg !== "string") return null;
+		const num = (x: unknown) => (typeof x === "number" && x > 0 ? x : undefined);
+		return { line: num(v.line), col: num(v.col), msg: v.msg, text: v.text || undefined, by: v.by || undefined };
+	} catch {
+		return null;
+	}
+}
+/** 도구 결과에 붙일 글 */
+export function syntaxNote(file: string, kind: SyntaxKind, p: SyntaxProblem): string {
+	const where = p.line ? ` ${p.line}번째 줄${p.col ? ` ${p.col}번째 글자` : ""}` : "";
+	const what = kind === "py" ? `Python 문법 오류${p.by ? ` (Python ${p.by} 기준)` : ""}` : kind === "json" ? "JSON 형식 오류" : "YAML 형식 오류";
+	return `(문법 확인: ${file}${where} — ${what}: ${p.msg}${p.text ? ` · ${p.text}` : ""}. 이대로는 ${kind === "py" ? "실행되지" : "읽히지"} 않으니 고치세요)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +825,55 @@ export default function (pi: ExtensionAPI) {
 		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: notes.join("\n") }] };
 	});
 
+	// ── 문법 확인 ──────────────────────────────────────────────────────────────
+	// write·edit 로 고친 .py·.json·.ipynb·.yaml 이 깨졌을 때만 결과에 알림. 확인하지 못하면(Python 없음, 노트북 연결 문제) 조용히 넘어감
+	const syntaxOn = () => readJson(userConfigFile()).syntax_check !== false;
+	/** 파일 크기 (모르면 null: 노트북 홈 밖·숨김 경로는 노트북이 알려 주지 않음) */
+	async function fileSize(t: Target): Promise<number | null> {
+		try {
+			if (!t.remote) return statSync(t.abs).size;
+			const st = await (globalThis as any).__piRemoteFs?.stat(t.abs);
+			return typeof st?.size === "number" ? st.size : null;
+		} catch {
+			return null;
+		}
+	}
+	async function syntaxProblem(kind: SyntaxKind, t: Target, written: unknown, wd: WorkDir): Promise<SyntaxProblem | null> {
+		if (kind === "json") {
+			if (typeof written === "string") return written.length > SYNTAX_JSON_MAX ? null : jsonProblem(written);
+			// 고친 파일은 다시 읽어 봄. 그림이 든 큰 .ipynb 등은 보지 않음 (jupyter 모드에서는 고칠 때 받은 파일을 한 번 더 받게 되므로)
+			const size = await fileSize(t);
+			if (size !== null && size > SYNTAX_JSON_MAX) return null;
+			const text = (await readTarget(t))?.toString("utf8");
+			return text == null || text.length > SYNTAX_JSON_MAX ? null : jsonProblem(text);
+		}
+		if (t.remote) return parseSyntaxOut((await nbRun(notebookSyntaxCmd(t.abs, kind), wd.cwd)).out);
+		const py = await localPython(wd.remote ? homedir() : wd.cwd);
+		if (!py) return null;
+		return parseSyntaxOut((await runProc(py[0], [...py.slice(1), "-c", SYNTAX_PY, t.abs, kind], 30000)).out);
+	}
+	pi.on("tool_result", async (event: any, ctx: any) => {
+		const tn = event.toolName;
+		if ((tn !== "write" && tn !== "edit" && tn !== "bash") || !syntaxOn()) return;
+		// bash 는 쓴 파일(리다이렉트·tee: 'cat > a.py <<EOF … EOF && python a.py')을, 뒤 명령이 실패했어도 본다. write·edit 는 성공했을 때만
+		if (event.isError && tn !== "bash") return;
+		const paths: unknown[] = tn === "bash" ? (typeof event.input?.command === "string" ? writtenPaths(event.input.command).slice(0, 5) : []) : [event.input?.path];
+		const wd = workDir(ctx);
+		const notes: string[] = [];
+		for (const p of paths) {
+			if (typeof p !== "string" || !cleanPath(p).trim()) continue;
+			const kind = syntaxKind(cleanPath(p));
+			if (!kind) continue;
+			const t = target(p, wd);
+			try {
+				const prob = await syntaxProblem(kind, t, tn === "write" ? event.input?.content : undefined, wd);
+				if (prob) notes.push(syntaxNote(shown(t, wd), kind, prob));
+			} catch {}
+		}
+		if (!notes.length) return;
+		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: notes.join("\n") }] };
+	});
+
 	// ── 완료 점검 ──────────────────────────────────────────────────────────────
 	// 요청이 제대로 끝나면(마지막이 끝까지 쓴 답) 그 요청이 시작된 뒤 고친 파일을 찾아, 점검의 when 에 맞으면 점검 명령을 돌린다.
 	// 실패하면 pi 에게 한 번 돌려주고(round 1), 그 요청이 끝나면 한 번 더 돌려 결과를 사용자에게 알린다 (더 되풀이하지 않음).
@@ -969,17 +1140,19 @@ export default function (pi: ExtensionAPI) {
 			`  guard  ${g.on ? "켜짐" : `꺼짐 (${g.why})`}  위험 명령 확인: git push·폴더 지우기·kubectl delete 등을 실행 전에 묻기. 끄면 GitLab 반영도 묻지 않음`,
 			`  docs   ${d.on ? "켜짐" : "꺼짐"}  문서 규칙: 새 문서는 ${d.index} 에 링크, 한 요청에 ${d.limit}개를 넘으면 묻기, 이력은 HISTORY.md 하나에`,
 			`  checks ${checksOn() ? "켜짐" : "꺼짐"}  완료 점검: 프로젝트의 ${CHECKS_FILE} 명령을 요청이 끝날 때 돌려, 실패하면 pi 에게 한 번 돌려줌`,
+			`  rules  ${rulesOn() ? "켜짐" : "꺼짐"}  팀 규칙: .github/copilot-instructions.md·.cursor/rules·.pi/rules 등을 지침과 해당 파일·명령의 도구 결과에 (/rules 로 보기)`,
+			`  syntax ${syntaxOn() ? "켜짐" : "꺼짐"}  문법 확인: write·edit 로 고친 .py·.json·.ipynb·.yaml 이 깨졌으면 그 결과에 알림`,
 			`내 훅 (${extDir().replace(/\\/g, "/")}): ${mine.length ? mine.map((h) => `${h.name} ${h.on ? "켜짐" : "꺼짐"}`).join(", ") : "없음"}`,
 			"  /hooks off mine: 내 훅만 모두 끄기 (키트 훅은 그대로)  ·  /hooks on mine: 다시 켜기",
 		].join("\n");
 	};
 	pi.registerCommand("hooks", {
-		description: "훅 목록과 켜고 끄기: /hooks, /hooks off|on <guard|docs|checks|내 훅 이름|mine> (mine: 내 훅만 모두, 위험 명령 확인은 그대로)",
+		description: "훅 목록과 켜고 끄기: /hooks, /hooks off|on <guard|docs|checks|rules|syntax|내 훅 이름|mine> (mine: 내 훅만 모두, 위험 명령 확인은 그대로)",
 		handler: async (args: string, ctx: any) => {
 			const [verb, ...rest] = (args || "").trim().split(/\s+/).filter(Boolean);
 			const name = rest.join(" ");
 			if (!verb) return ctx.ui.notify(listText(), "info");
-			if ((verb !== "on" && verb !== "off") || !name) return ctx.ui.notify("사용법: /hooks, /hooks off <guard|docs|checks|이름|mine>, /hooks on <…>", "warning");
+			if ((verb !== "on" && verb !== "off") || !name) return ctx.ui.notify("사용법: /hooks, /hooks off <guard|docs|checks|rules|syntax|이름|mine>, /hooks on <…>", "warning");
 			const on = verb === "on";
 			if (name === "guard") {
 				if (!on) {
@@ -1008,6 +1181,14 @@ export default function (pi: ExtensionAPI) {
 				saveSetting("done_checks", on ? undefined : false);
 				const n = on ? clearCheckNo(workDir(ctx)) : 0;
 				return ctx.ui.notify(`완료 점검을 ${on ? "켰습니다" : "껐습니다"} (다음 요청부터)${n ? `. 이 프로젝트에서 '아니요' 로 답한 점검 ${n}개는 다음에 다시 묻습니다` : ""}`, "info");
+			}
+			if (name === "rules") {
+				saveSetting("team_rules", on ? undefined : false);
+				return ctx.ui.notify(`팀 규칙을 ${on ? "켰습니다" : "껐습니다"} (다음 요청부터. 읽은 규칙이 있으면 지침이 바뀝니다)`, "info");
+			}
+			if (name === "syntax") {
+				saveSetting("syntax_check", on ? undefined : false);
+				return ctx.ui.notify(`문법 확인을 ${on ? "켰습니다" : "껐습니다"} (다음 도구 결과부터)`, "info");
 			}
 			const mine = myHooks();
 			const pick = name === "mine" ? mine : mine.filter((h) => [h.name, h.name.replace(/\.(ts|js)$/, "")].includes(name));

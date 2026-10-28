@@ -6,8 +6,8 @@
  * 파이프라인(단순 명령 목록), 안에서 실행되는 글, heredoc 본문, 출력 리다이렉트를 돌려준다.
  */
 
-/** 단순 명령: 낱말들과 출력 리다이렉트 대상(> 파일, >> 파일, &> 파일, >& 파일. /dev/null 은 뺌) */
-export type Simple = { words: string[]; redirects: string[] };
+/** 단순 명령: 낱말들과 출력 리다이렉트 대상(> 파일, >> 파일, &> 파일, >& 파일. /dev/null 은 뺌), 입력 리다이렉트 대상(< 파일: 낱말에도 그대로 있음) */
+export type Simple = { words: string[]; redirects: string[]; inputs?: string[] };
 export type Parsed = { pipelines: Simple[][]; nested: string[]; heredocs: { words: string[]; body: string; pipe: number }[] };
 
 /** 셸 글 -> 파이프라인(단순 명령 목록)들, 안에서 실행되는 글($(...), `...`), heredoc 본문 */
@@ -18,6 +18,8 @@ export function parseShell(src: string): Parsed {
 	let cur = "";
 	let has = false; // 지금 낱말이 시작됐는지 (빈 따옴표 "" 도 낱말)
 	let redirects: string[] = [];
+	let inputs: string[] = [];
+	let inNext = false; // 다음 낱말이 입력 리다이렉트 대상 (< 파일)
 	let redirNext = false; // 다음 낱말이 출력 리다이렉트 대상
 	let dupNext = false; // 다음 낱말이 >& 뒤: 숫자·- 면 다른 출력으로 보내기(2>&1, >&-), 아니면 파일 (bash 에서 >&파일 은 &>파일 과 같음)
 	const pending: { delim: string; strip: boolean; words: string[] }[] = [];
@@ -26,18 +28,21 @@ export function parseShell(src: string): Parsed {
 			if (!(dupNext && /^(\d+-?|-)$/.test(cur))) {
 				words.push(cur);
 				if ((redirNext || dupNext) && cur !== "/dev/null") redirects.push(cur);
+				if (inNext) inputs.push(cur);
 			}
 			redirNext = false;
 			dupNext = false;
+			inNext = false;
 		}
 		cur = "";
 		has = false;
 	};
 	const endCmd = () => {
 		endWord();
-		if (words.length) pipeline.push({ words, redirects });
+		if (words.length) pipeline.push({ words, redirects, inputs });
 		words = [];
 		redirects = [];
+		inputs = [];
 	};
 	const endPipe = () => {
 		endCmd();
@@ -213,6 +218,7 @@ export function parseShell(src: string): Parsed {
 		if (c === "<") {
 			endWord();
 			i += src[i + 1] === "&" ? 2 : 1;
+			inNext = true;
 			continue;
 		}
 		if (c === ";" || c === "(" || c === ")") {
@@ -281,6 +287,30 @@ export function strip(words: string[]): { rest: string[]; sudo: boolean } {
 	return { rest: words.slice(k), sudo };
 }
 
+
+/** bash 명령이 쓰는 파일: 출력 리다이렉트(> 파일, >> 파일, &> 파일)와 tee 의 파일 인자 (hooks.ts 의 문서 규칙·문법 확인, rules.ts 의 팀 규칙이 함께 씀).
+ *  앞의 cd 를 따라 경로를 붙임 ('cd tools && cat > a.py <<EOF' -> tools/a.py, cd /abs 면 /abs/a.py). $변수·`…` 가 든 경로는 뺌 (펼친 값을 모름).
+ *  2026-10-27 실사용 시험: 모델이 새 .py 를 write 대신 'cd <폴더> && cat > tools/x.py <<'PY'' 로 만들어 문법 확인·파일 규칙이 걸리지 않았음 */
+export function writtenPaths(command: string): string[] {
+	const out: string[] = [];
+	let dir = "";
+	const join = (d: string, p: string) => (!d || /^([\\/~]|[A-Za-z]:)/.test(p) ? p : `${d.replace(/[\\/]+$/, "")}/${p}`);
+	try {
+		for (const pl of parseShell(command).pipelines)
+			for (const cmd of pl) {
+				const { rest } = strip(cmd.words);
+				if (rest.length && base(rest[0]) === "cd" && pl.length === 1) {
+					const to = rest[1];
+					dir = to && to !== "-" && !/[$`]/.test(to) ? join(dir, to) : "";
+					continue;
+				}
+				const files = [...cmd.redirects];
+				if (rest.length && base(rest[0]) === "tee") for (const a of rest.slice(1)) if (!a.startsWith("-") && !cmd.inputs?.includes(a)) files.push(a);
+				for (const f of files) if (f && !/[$`]/.test(f)) out.push(join(dir, f));
+			}
+	} catch {}
+	return out.filter((p, i) => out.indexOf(p) === i);
+}
 
 export const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh", "busybox"]);
 export const INTERP: Record<string, RegExp> = {

@@ -12,6 +12,7 @@
  *             생기면 벨과 알림. /watch 지금 상태 · /watch 보내기 [요청] 로그 끝부분을 pi 에게 · /watch 끄기 (작업은 그대로 돎).
  *             bash 결과에 "[pi-watch] <로그>" 줄이 있으면 저절로 시작한다 (kubeflow-notebook 스킬의 실행 방식)
  * /kit·/doctor 는 편집기 위에 띄우고, 다음 요청을 보내거나 같은 명령을 다시 입력하면 닫는다. LLM 에게는 보내지 않는다.
+ *  ask_user 도구  모델이 사용자만 정할 수 있는 것을 고르기 창으로 묻고 답을 받아 이어서 일한다 (한 요청에 두 번까지, Esc 면 묻지 말고 정리)
  */
 
 import { spawn } from "node:child_process";
@@ -20,6 +21,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { localPython, NB_FIND_PY, pythonCandidates, runProc } from "./lib/python.ts";
 import { call, decodeText, nbRun, type RelayError, shown as shownPath, shq, type Target, target, transformInput, workDir } from "./lib/relay.ts";
 
 const agentDirRaw = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -373,6 +375,76 @@ export function addKitGuides(g: unknown) {
 	if (Array.isArray(g)) for (const line of KIT_GUIDES) if (!g.includes(line)) g.push(line);
 }
 
+// ── ask_user 도구: 사용자만 정할 수 있는 것을 고르기 창으로 묻기 (2026-10-27, oh-my-pi 의 ask 도구를 참고해 새로 씀) ─────────
+// 답에 질문을 남기고 끝내면 사용자가 다음 요청을 다시 써야 하지만, 이 도구는 고르기 창으로 답을 받아 같은 요청에서 이어 일한다.
+// 질문마다 '직접 입력…' 을 붙이고, Esc 로 닫으면 더 묻지 말고 정리하라고 돌려준다. 한 요청에 ASK_MAX 번까지 (질문마다 Copilot·사내AI 에 한 번 더 묻게 되므로)
+export const ASK_MAX = 2;
+export const ASK_QUESTIONS = 4; // 한 번에 묻는 질문
+export const ASK_OTHER = "직접 입력…";
+export const ASK_DONE = "다 골랐습니다";
+export const ASK_GUIDE =
+	"사용자만 정할 수 있는 것(모호한 요구사항, 여러 방법 중 고르기, 되돌리기 어려운 작업의 승인) 때문에 더 진행할 수 없으면 ask_user 로 묻고 답에 따라 이어서 한다. " +
+	"파일·코드·명령으로 알 수 있는 것은 묻지 않는다. 물을 것은 한 번에 모아 묻고, ask_user 를 부르는 답에는 다른 도구를 함께 넣지 않는다.";
+export type AskQ = { question: string; options?: string[]; recommended?: number; multi?: boolean };
+/** 질문의 고를 것 (빈 것은 빼고 9개까지). rec: 추천인지 (recommended 는 모델이 준 options 의 번호) */
+const askItems = (q: AskQ): { text: string; rec: boolean }[] =>
+	(Array.isArray(q.options) ? q.options : [])
+		.map((o, i) => ({ text: String(o ?? "").trim(), rec: i === q.recommended }))
+		.filter((o) => o.text)
+		.slice(0, 9);
+export const askChoices = (q: AskQ): string[] => askItems(q).map((o) => o.text);
+/** 고르기 창의 항목: 번호를 붙이고(같은 글이 겹쳐도 가를 수 있게) 추천은 '(추천)' */
+export const askLabels = (q: AskQ): string[] => askItems(q).map((o, i) => `${i + 1}. ${o.text}${o.rec ? " (추천)" : ""}`);
+/** 모델에게 돌려줄 글. closed: 사용자가 Esc 로 닫음, skipped: 많아서 묻지 않은 질문 수 */
+export function askResult(qs: AskQ[], answers: string[], closed: boolean, skipped = 0): string {
+	const lines: string[] = [];
+	if (answers.length) {
+		lines.push("사용자의 답:");
+		answers.forEach((a, i) => lines.push(`${i + 1}. ${String(qs[i].question).trim()}`, `   → ${a}`));
+	}
+	if (closed)
+		lines.push(
+			`(${answers.length ? `질문 ${answers.length + 1}부터는 ` : ""}사용자가 답하지 않고 창을 닫았습니다. 다시 묻지 말고, ` +
+				`${answers.length ? "받은 답으로 할 수 있는 일을 하거나 " : ""}정할 것을 답에 적어 마치세요)`,
+		);
+	if (skipped) lines.push(`(질문이 많아 앞의 ${qs.length}개만 물었습니다. 나머지는 답에 적어 물으세요)`);
+	return lines.join("\n");
+}
+/** 질문 하나 묻기 (Esc 면 undefined) */
+async function askOne(ctx: any, q: AskQ, k: number, n: number, signal?: AbortSignal): Promise<string | undefined> {
+	const title = `pi 의 질문${n > 1 ? ` ${k + 1}/${n}` : ""}: ${String(q.question).trim()}`;
+	const opts = signal ? { signal } : undefined;
+	const choices = askChoices(q);
+	const labels = askLabels(q);
+	const typed = async () => {
+		const t = await ctx.ui.input(title, "답을 적고 Enter", opts);
+		return t?.trim() ? `${t.trim()} (직접 입력)` : undefined;
+	};
+	if (!labels.length) return typed();
+	if (!q.multi) {
+		const pick = await ctx.ui.select(title, [...labels, ASK_OTHER], opts);
+		if (pick === undefined) return undefined;
+		if (pick === ASK_OTHER) return typed();
+		const i = labels.indexOf(pick);
+		return i < 0 ? pick : choices[i];
+	}
+	const on = new Set<number>();
+	const picked = () => [...on].sort((a, b) => a - b).map((i) => choices[i]);
+	for (;;) {
+		const shownL = labels.map((l, i) => `${on.has(i) ? "[x]" : "[ ]"} ${l}`);
+		const pick = await ctx.ui.select(`${title}\n(여러 개: 고를 때마다 [x] 가 바뀜, 다 고르면 '${ASK_DONE}')`, [...shownL, ASK_OTHER, ASK_DONE], opts);
+		if (pick === undefined) return undefined;
+		if (pick === ASK_DONE) return on.size ? picked().join(", ") : "(고른 것 없음)";
+		if (pick === ASK_OTHER) {
+			const t = await typed();
+			if (t !== undefined) return [...picked(), t].join(", ");
+			continue;
+		}
+		const i = shownL.indexOf(pick);
+		if (i >= 0) on.has(i) ? on.delete(i) : on.add(i);
+	}
+}
+
 export const DOCS_MAX = 5500; // 결과 글 길이 (wiki_read 와 같음. Copilot·사내AI 의 도구 결과 한도 안)
 export const DOCS_GUIDE = "라이브러리의 함수·클래스 사용법(인자, 반환값, 버전 차이)이 확실하지 않으면 추측하지 말고 docs_lookup 으로 지금 설치된 버전의 설명을 먼저 본다";
 export const docsDir = () => process.env.PI_DOCS_DIR || join(homedir(), "pi-docs");
@@ -692,73 +764,12 @@ export function formatDocs(d: DocsInfo, query: string, folder: { text: string; f
 	return parts.join("\n");
 }
 
-type Proc = { code: number | null; out: string };
-function runProc(cmd: string, args: string[], ms: number): Promise<Proc> {
-	return new Promise((ok) => {
-		let out = "";
-		let done = false;
-		const env = { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONWARNINGS: "ignore", PYTHONDONTWRITEBYTECODE: "1", TF_CPP_MIN_LOG_LEVEL: "3" };
-		let ch: ReturnType<typeof spawn>;
-		try {
-			ch = spawn(cmd, args, { windowsHide: true, env });
-		} catch (e) {
-			return ok({ code: null, out: `(실행하지 못함: ${(e as Error).message})` });
-		}
-		const finish = (code: number | null, extra = "") => {
-			if (done) return;
-			done = true;
-			ok({ code, out: out + extra });
-		};
-		const t = setTimeout(() => {
-			ch.kill();
-			finish(null, "\n(시간 초과로 멈춤)");
-		}, ms);
-		ch.stdout?.on("data", (d) => (out += d));
-		ch.stderr?.on("data", () => {}); // 불러오는 패키지의 경고는 버림
-		ch.on("error", (e) => {
-			clearTimeout(t);
-			finish(null, `\n(실행하지 못함: ${e.message})`);
-		});
-		ch.on("close", (code) => {
-			clearTimeout(t);
-			finish(code);
-		});
-	});
-}
-
-/** 이 컴퓨터의 Python 후보 (차례대로): 작업 폴더의 가상 환경, 켜 둔 가상 환경·conda, pi 가 찾은 Python, PATH */
-export function pythonCandidates(cwd: string, env = process.env, win = process.platform === "win32"): string[][] {
-	const inEnv = win ? ["Scripts/python.exe", "python.exe"] : ["bin/python3", "bin/python"];
-	const c: string[][] = [];
-	for (const d of [".venv", "venv"]) for (const v of inEnv) c.push([join(cwd, d, v)]);
-	for (const e of [env.VIRTUAL_ENV, env.CONDA_PREFIX]) if (e) for (const v of inEnv) c.push([join(e, v)]);
-	if (env.PI_PYTHON_EXE) c.push([env.PI_PYTHON_EXE]);
-	c.push(["python3"], ["python"]);
-	if (win) c.push(["py", "-3"]);
-	return c;
-}
-const pyCache = new Map<string, string[] | null>();
-async function localPython(cwd: string): Promise<string[] | null> {
-	if (pyCache.has(cwd)) return pyCache.get(cwd) ?? null;
-	let found: string[] | null = null;
-	for (const c of pythonCandidates(cwd)) {
-		if (/[\\/]/.test(c[0]) && !existsSync(c[0])) continue;
-		const r = await runProc(c[0], [...c.slice(1), "-c", "import sys; print(sys.executable)"], 15000);
-		if (r.code === 0 && r.out.trim()) {
-			found = c;
-			break;
-		}
-	}
-	pyCache.set(cwd, found);
-	return found;
-}
+// Python 찾기·실행은 lib/python.ts (hooks.ts 의 문법 확인과 함께 씀)
+export { pythonCandidates };
 /** 노트북에서: 작업 폴더의 가상 환경, conda, pi 가 찾은 Python, python3, python 가운데 돌아가는 것으로 */
 export function notebookDocsCommand(name: string, query: string): string {
 	return [
-		'PY=""',
-		'for c in "$PWD/.venv/bin/python" "$PWD/venv/bin/python" "${CONDA_PREFIX:+$CONDA_PREFIX/bin/python}" "${PI_PYTHON_EXE:-}" python3 python; do',
-		"  [ -n \"$c\" ] && \"$c\" -c 'import sys' >/dev/null 2>&1 && PY=\"$c\" && break",
-		"done",
+		NB_FIND_PY,
 		"[ -n \"$PY\" ] || { echo '@@DOCS@@{\"name\":\"\",\"error\":\"python\"}'; exit 0; }",
 		`PYTHONIOENCODING=utf-8 PYTHONWARNINGS=ignore PYTHONDONTWRITEBYTECODE=1 TF_CPP_MIN_LOG_LEVEL=3 timeout 40 "$PY" - ${shq(name)} ${shq(query)} <<'PIDOCSEOF' 2>/dev/null`,
 		DOCS_PY.trimEnd(),
@@ -1194,6 +1205,47 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id: string, params: any) {
 			const text = await lookupDocs(String(params.name || ""), String(params.query || ""));
 			return { content: [{ type: "text" as const, text }], details: undefined };
+		},
+	});
+	let asked = 0; // 이번 요청에서 ask_user 를 부른 횟수
+	pi.on("agent_start", async () => {
+		asked = 0;
+	});
+	pi.registerTool({
+		name: "ask_user",
+		label: "사용자에게 묻기",
+		description:
+			"사용자에게 고르기 창으로 묻고 답을 받는다 (답을 받아 같은 요청에서 이어 일함). questions 에 질문 1~4개: question(물을 것과 왜 묻는지), " +
+			"options(고를 것 2~6개, 각각 '이름 — 고르면 어떻게 되는지'. 없으면 글로 답을 받음), recommended(추천하는 options 의 번호, 0부터), multi(여러 개 고르기). " +
+			`'${ASK_OTHER}' 은 늘 붙는다. 한 요청에 ${ASK_MAX}번까지, 이 도구를 부르는 답에는 다른 도구를 함께 넣지 않는다`,
+		promptSnippet: "사용자만 정할 수 있는 것을 고르기 창으로 묻고 답을 받아 이어서 일하기",
+		promptGuidelines: [ASK_GUIDE],
+		parameters: Type.Object({
+			questions: Type.Array(
+				Type.Object({
+					question: Type.String({ description: "물을 것 (왜 묻는지 짧게 포함)" }),
+					options: Type.Optional(Type.Array(Type.String(), { description: "고를 것 2~6개 ('이름 — 고르면 어떻게 되는지')" })),
+					recommended: Type.Optional(Type.Integer({ description: "추천하는 options 의 번호 (0부터)" })),
+					multi: Type.Optional(Type.Boolean({ description: "여러 개를 고를 수 있으면 true" })),
+				}),
+				{ description: `질문 1~${ASK_QUESTIONS}개 (한 번에 모아서)` },
+			),
+		}),
+		async execute(_id: string, params: any, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: any) {
+			const reply = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+			const all: AskQ[] = (Array.isArray(params?.questions) ? params.questions : []).filter((q: any) => q && String(q.question ?? "").trim());
+			if (!all.length) return reply("questions 에 물을 것을 주세요 (question 과 고를 것 options)");
+			if (!ctx?.hasUI) return reply("이 실행 방식(화면 없음)에서는 사용자에게 물을 수 없습니다. 질문을 답에 적어 마치세요 (사용자가 다음 요청에서 답합니다)");
+			if (asked >= ASK_MAX) return reply(`이번 요청에서 이미 ${ASK_MAX}번 물었습니다. 더 묻지 말고 받은 답으로 진행하거나, 남은 질문을 답에 적어 마치세요`);
+			asked++;
+			const qs = all.slice(0, ASK_QUESTIONS);
+			const answers: string[] = [];
+			for (let k = 0; k < qs.length; k++) {
+				const a = await askOne(ctx, qs[k], k, qs.length, signal);
+				if (a === undefined) return reply(askResult(qs, answers, true, all.length - qs.length));
+				answers.push(a);
+			}
+			return reply(askResult(qs, answers, false, all.length - qs.length));
 		},
 	});
 	pi.registerCommand("docs", {

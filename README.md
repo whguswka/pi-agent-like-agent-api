@@ -132,7 +132,8 @@ pi -p "이 폴더의 파이썬 파일 목록과 역할을 알려줘"     # 한 �
 | pi 가 고친 파일 되돌리기 | `/undo` (마지막 요청), `/undo 2` (마지막 두 요청) — 아래 3-6 |
 | 앞으로도 지킬 것 기억시키기 | `/remember 커밋 메시지는 한국어로` (지침 파일 AGENTS.md 에 적음, [5장 메모리](#메모리)) |
 | 지난 세션에서 하던 일 이어 가기 | 저절로 됩니다: 요청마다 남긴 작업 기록을 같은 프로젝트의 새 세션에 알려 줌. 보기 `/recall`, 다음 세션에 넘길 요약 `/recall save` ([5장 메모리](#메모리)) |
-| 훅 목록·켜고 끄기 | `/hooks`, 내 훅만 끄기 `/hooks off mine` (위험 명령 확인은 그대로), 문서 규칙 끄기 `/hooks off docs`, 완료 점검 끄기 `/hooks off checks` ([5장](#hook-확장-파일)) |
+| 훅 목록·켜고 끄기 | `/hooks`, 내 훅만 끄기 `/hooks off mine` (위험 명령 확인은 그대로), 문서 규칙 끄기 `/hooks off docs`, 완료 점검 끄기 `/hooks off checks`, 팀 규칙 끄기 `/hooks off rules`, 문법 확인 끄기 `/hooks off syntax` ([5장](#hook-확장-파일)) |
+| 다른 코딩 도구의 지침·팀 규칙 보기 | `/rules` (pi 가 읽은 `.github/copilot-instructions.md`, `.cursor/rules` 등과 언제 쓰는지, [5장](#팀-규칙-키트-훅-rules)) |
 | 도구 출력 펼치기·접기 | `Ctrl+O` |
 | 모델 고르기 | `/model` 또는 `Ctrl+L` ([4장](#4-모델-설정)) |
 | 지침·스킬을 고친 뒤 다시 읽기 | `/reload` |
@@ -263,6 +264,13 @@ pi 가 파일을 고치기 직전과 직후 내용을 요청마다 기록해 두
   `import` 와 같아서 그 패키지의 시작 코드가 돕니다. 40초 안에 불러오지 못하면 멈춥니다.
 - **문서 폴더:** 받아 둔 문서(`.md`·`.txt`·`.rst`·`.html`)를 노트북의 `~/pi-docs` 에 넣어 두면 같은 말로 함께 찾습니다 (하위 폴더도. 다른 폴더는 환경 변수 `PI_DOCS_DIR`).
 
+### 3-10. pi 가 고르기 창으로 물을 때 (ask_user)
+모호한 요구사항, 여러 방법 중 고르기, 되돌리기 어려운 작업의 승인처럼 사용자만 정할 수 있는 것이 있으면, pi 가 답에 질문을 남기고 끝내는 대신 고르기 창으로 묻고 답을 받아 같은 요청에서 이어 일합니다 (2026-10-28.1 부터, `ask_user` 도구).
+- 질문마다 고를 것과 `직접 입력…` 이 나옵니다. pi 가 추천하는 것에는 `(추천)` 이 붙습니다. 여러 개를 고르는 질문은 고를 때마다 `[x]` 가 바뀌고, `다 골랐습니다` 로 끝냅니다.
+- `Esc` 로 닫으면 pi 는 더 묻지 않고, 그때까지 한 일과 정할 것을 정리해 답합니다.
+- 한 요청에 두 번까지 묻습니다. `pi -p` 처럼 물을 수 없는 실행에서는 답에 질문을 적고 끝냅니다. 계획 모드에서도 씁니다.
+- 예 (2026-10-27 실사용 시험): "us_spike 의 학습 주기를 바꿔 줘" → pi 가 설정 파일을 읽은 뒤 "무엇으로 바꿀까요? 현재는 1(매월)" 을 고를 것 5개(3개월 추천)로 묻고, 고른 값으로 고침.
+
 ## 4. 모델 설정
 pi 가 쓰는 모델은 `~/.pi/agent/models.json` 에 적습니다. 처음 설정은 [2-5](#2-5-llm-연결), 항목 설명과 예는 [docs/API-연결.md](docs/API-연결.md) 에 있습니다.
 - 모델을 여러 개 적으면 `/model`(또는 `Ctrl+L`)에서 고릅니다. 시작할 때 고르기: `pi --model <모델 id>`
@@ -279,6 +287,7 @@ pi 에게 무엇을 어디에 적어 두는지 정리한 표입니다.
 |---|---|---|
 | 항상 지킬 규칙, 내 작업 방식 | `~/.pi/agent/AGENTS.md` (공통 지침) | 모든 세션 |
 | 이 프로젝트의 규칙, 구조, 빌드·테스트 방법 | 프로젝트 폴더의 `AGENTS.md` (프로젝트 지침) | 그 폴더(또는 하위 폴더)에서 시작한 세션 |
+| 팀이 다른 코딩 도구용으로 둔 지침, 파일·명령마다의 규칙 | 저장소의 `.github/copilot-instructions.md`, `.github/instructions/`, `.cursor/rules/`, `.pi/rules/` ([팀 규칙](#팀-규칙-키트-훅-rules)) | 늘, 또는 해당 파일·명령을 다룰 때 |
 | 특정 작업의 절차, 양식, 참고 자료 | 스킬: `~/.pi/agent/skills/<이름>/SKILL.md` | 작업이 스킬 설명과 맞을 때 LLM 이 읽음. `/skill:이름` 으로 직접 부를 수도 있음 |
 | 자주 쓰는 지시문 | 프롬프트 템플릿: `~/.pi/agent/prompts/<이름>.md` (기본 명령은 아래) | `/이름` 을 입력할 때 |
 | 지난 작업의 맥락 | 세션 기록 (자동 저장) | `pi -c`, `/resume` |
@@ -291,6 +300,7 @@ pi 는 세션을 시작할 때 아래 파일을 찾아 **지침으로 함께 읽
 1. `~/.pi/agent/AGENTS.md`: 공통 지침. 어느 폴더에서 시작하든 적용됩니다.
 2. 작업 폴더와 그 **상위 폴더들**의 `AGENTS.md`: 프로젝트 지침. 예를 들어 `~/work/AGENTS.md` 는 `~/work` 아래 모든 프로젝트에 적용됩니다.
    (`AGENTS.md` 대신 `CLAUDE.md` 라는 이름도 읽습니다.)
+3. 다른 코딩 도구용 지침 파일 (`.github/copilot-instructions.md` 등): 키트가 더해 읽습니다 ([팀 규칙](#팀-규칙-키트-훅-rules)).
 
 **기본 지침:** 처음 설치할 때 `~/.pi/agent/AGENTS.md` 를 만들어 둡니다 (이미 있으면 만들지 않고, 업데이트해도 바꾸지 않음). 내용은 자유롭게 고쳐 쓰세요.
 - 한국어로 답하고, 끝에 한 일·바꾼 파일·확인 방법을 정리
@@ -447,7 +457,7 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 
 | 명령 | 뜻 |
 |---|---|
-| `/hooks` | 키트 훅(위험 명령 확인 `guard`, 문서 규칙 `docs`, 완료 점검 `checks`)과 내 훅(확장 폴더의 키트 밖 파일)의 켜짐·꺼짐 |
+| `/hooks` | 키트 훅(위험 명령 확인 `guard`, 문서 규칙 `docs`, 완료 점검 `checks`, 팀 규칙 `rules`, 문법 확인 `syntax`)과 내 훅(확장 폴더의 키트 밖 파일)의 켜짐·꺼짐 |
 | `/hooks off mine` · `/hooks on mine` | 내 훅만 모두 끄기·켜기. **위험 명령 확인은 그대로** 남습니다 |
 | `/hooks off <이름>` · `/hooks on <이름>` | 훅 하나 (`docs`, `my-plan.ts` 처럼) |
 | `/hooks off guard` | 위험 명령 확인 끄기 (한 번 더 확인. 끄면 git push 같은 작업도 묻지 않음). 켜기: `/hooks on guard` |
@@ -487,6 +497,42 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 - 점검 명령은 팀이 만듭니다: 바뀐 것을 찾아(예: 운영에 아직 반영하지 않은 변경) 표준에 맞는지, 시험을 끝까지 했는지 보고, 고칠 것을 한 줄씩 찍고 종료 코드 1 로 끝나게 합니다.
   `project-harness` 스킬에게 "우리 저장소에 맞게 완료 점검을 만들어 줘" 라고 하면 실제 코드를 읽고 만듭니다 (모델 운영 저장소의 예가 스킬 폴더의 `examples/` 에 있음).
 - 끄기: `/hooks off checks` (내 설정 파일의 `"done_checks": false`).
+
+### 팀 규칙 (키트 훅 `rules`)
+팀이 다른 코딩 도구용으로 저장소에 둔 지침·규칙 파일을 pi 도 읽습니다 (2026-10-28.1 부터, oh-my-pi 의 방식을 참고해 새로 씀). pi 는 원래 `AGENTS.md`·`CLAUDE.md` 만 읽습니다.
+
+| 파일 | 쓰는 방법 |
+|---|---|
+| `.github/copilot-instructions.md`, `.cursorrules`, `.claude/CLAUDE.md`, `AGENTS.md` 옆의 `CLAUDE.md` | 지침에 늘 넣음 |
+| `.github/instructions/*.instructions.md` | 머리말의 `applyTo` 가 모든 파일(`**`)이면 늘, 경로 패턴(`**/*.py` 등)이면 그 파일을 읽고·쓰고·고칠 때, 없으면 목록만 |
+| `.cursor/rules/*.mdc` | `alwaysApply: true` 면 늘, `globs` 가 있으면 그 파일을 다룰 때, 설명만 있으면 목록만 |
+| `.pi/rules/*.md` (이 키트의 형식) | `always: true` 면 늘, `globs`(경로 패턴)·`condition`(쓰는 내용·명령에 맞춰 볼 정규식)·`tools`(걸릴 도구) |
+| `~/.pi/agent/rules/*.md` (내 규칙) | `.pi/rules` 와 같은 형식. 어느 프로젝트에서나 (`globs` 는 작업 폴더 기준) |
+
+- **찾는 곳:** 작업 폴더부터 위로 git 저장소 맨 위까지. 홈 폴더는 보지 않습니다 (`~/.claude/CLAUDE.md` 같은 다른 도구의 개인 설정은 읽지 않음).
+- **늘 넣는 것:** 지침 파일 목록에 들어갑니다 (파일 하나 8000자, 모두 16000자까지). 맨 앞의 '너는 … 전문가다' 같은 역할 줄(IDE 용 지침에 흔함)은 빼고, 이미 같은 내용이 지침에 있으면 넣지 않습니다.
+- **파일·명령에 걸리는 것:** 지침에 넣지 않고, 해당 도구를 실행한 뒤 그 결과 끝에 붙입니다 (규칙마다 세션에 한 번, `condition` 규칙은 파일마다 한 번). 도구는 이미 실행됐으므로 규칙에 어긋나면 pi 가 다음 호출에서 고칩니다.
+- **목록만 있는 것:** 이름·설명·경로를 지침에 적어, 해당하는 일을 할 때 pi 가 읽게 합니다.
+- 세션마다 처음 찾은 것을 그대로 씁니다. 새로 둔 파일은 `/new` 뒤에 읽습니다.
+- 처음 보거나 바뀐 규칙이 있으면 시작할 때 한 번 알립니다. 보기: `/rules`, 끄기: `/hooks off rules` (내 설정 파일의 `"team_rules": false`).
+
+예 `.pi/rules/no-drop.md` (테이블을 지우는 SQL 을 쓰거나 실행하면 그 결과에 붙음):
+
+```markdown
+---
+condition: "(?i)\\b(drop|truncate)\\s+table\\b"
+---
+- 테이블을 지우는 SQL(DROP·TRUNCATE)은 쓰지 않는다. 꼭 필요하면 먼저 사용자에게 묻는다.
+```
+
+`condition` 은 write·edit 로 쓰는 내용과 bash 명령에 맞춰 봅니다 (`(?i)` 로 시작하면 대소문자 무시, 큰따옴표 안에서는 `\` 를 두 번). `tools` 를 적지 않으면 `condition` 규칙은 write·edit·bash, `globs` 규칙은 read·write·edit 에 걸립니다.
+
+### 문법 확인 (키트 훅 `syntax`)
+- write·edit 로 고친 `.py`·`.json`·`.ipynb`·`.yaml`·`.yml` 이 깨졌으면 그 도구 결과에 줄 번호와 까닭을 붙입니다. 통과하면 아무것도 붙이지 않습니다 (2026-10-28.1 부터).
+- `.py` 는 그 프로젝트의 Python 으로 봅니다. 작업 폴더의 `.venv` 가 있으면 그것으로 (그 버전의 문법).
+- `.yaml` 은 그 Python 에 PyYAML 이 있을 때만, 구조만 봅니다 (`!Ref` 같은 태그는 오류로 보지 않음). JSON 은 주석·끝 쉼표만 있는 것(tsconfig.json, VS Code 설정)과 `{{ }}` 틀(Helm 등)을 깨진 것으로 보지 않고, 2MB 가 넘는 것(그림이 든 노트북 등)은 보지 않습니다.
+- bash 로 쓴 파일(`cat > x.py <<EOF … EOF`, `tee`)도 봅니다 (앞의 `cd` 를 따라 경로를 찾음).
+- 끄기: `/hooks off syntax` (내 설정 파일의 `"syntax_check": false`).
 
 ### LLM 위키 (/wiki)
 안드레 카파시의 'LLM Wiki' 방식입니다. 원본을 넣으면 pi 가 마크다운 위키 페이지를 쓰고 서로 이어 두어, 다음에 물을 때 처음부터 다시 찾지 않고 쌓인 위키를 근거로 답합니다.
@@ -619,6 +665,8 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 | `doc_index` | `"docs/INDEX.md"` | 새 문서의 링크를 모을 목록 문서 (작업 폴더 기준) |
 | `doc_new_limit` | `2` | 한 요청에서 새 문서가 이 수를 넘으면 묻기 |
 | `done_checks` | `true` | 완료 점검 ([5장](#완료-점검-키트-훅-checks)): 프로젝트의 `.pi/checks.json` 명령을 요청이 끝날 때 돌리기. `false` 면 끔 (`/hooks off checks` 와 같음) |
+| `team_rules` | `true` | 팀 규칙 ([5장](#팀-규칙-키트-훅-rules)): 다른 코딩 도구의 지침 파일과 `.pi/rules` 읽기. `false` 면 끔 (`/hooks off rules` 와 같음) |
+| `syntax_check` | `true` | 문법 확인 ([5장](#문법-확인-키트-훅-syntax)): 고친 `.py`·`.json`·`.yaml` 이 깨졌으면 알리기. `false` 면 끔 (`/hooks off syntax` 와 같음) |
 | `notify_after_seconds` | `30` | 요청이 이 초보다 오래 걸리면 끝날 때 터미널 벨과 알림 (0 이면 끔) |
 | `default_mode` | `auto` | pi 를 시작할 때의 작업 모드: `plan`(계획) · `ask`(확인) · `auto`(자동) ([3-5](#3-5-작업-모드-plan-mode)) |
 | `plan_dir` | `"docs/plans"` | 계획 모드에서도 쓸 수 있는 계획서 폴더 (작업 폴더 기준. 이름에 '계획'·'플랜'·'할 일'·`plan`·`todo` 가 든 `.md` 는 작업 폴더 안 어디서나) |
@@ -654,7 +702,7 @@ pi 에는 hook 설정 파일이 따로 없고, `~/.pi/agent/extensions/` 의 Typ
 | `runtime/` | pi 0.87.1 과 JS 라이브러리 3종 (npm 공식 배포본 그대로) |
 | `bin/`, `compat/` | 실행기, Node 탐색, Node 20 호환 레이어 |
 | `install.sh`, `update.sh`, `check-node.sh`, `VERSION` | 설치, 새 버전으로 바꾸기, Node 진단 스크립트, 버전 번호 |
-| `profiles/` | 설정 템플릿과 기본 지침(`jupyter`: Kubeflow 노트북용), 확장(`common`: 위험 명령 확인, 작업 모드 `/plan`·`/mode`, 되돌리기 `/undo`, 기억하기 `/remember`·작업 기록 `/recall`, `@파일`, 작업 끝 알림, `/kit`·`/doctor`, 문서 찾기 `/docs`, LLM 위키 `/wiki`, 문서 규칙·훅 `/hooks`) |
+| `profiles/` | 설정 템플릿과 기본 지침(`jupyter`: Kubeflow 노트북용), 확장(`common`: 위험 명령 확인, 작업 모드 `/plan`·`/mode`, 되돌리기 `/undo`, 기억하기 `/remember`·작업 기록 `/recall`, `@파일`, 작업 끝 알림, `/kit`·`/doctor`, 문서 찾기 `/docs`, 사용자에게 묻기 `ask_user`, LLM 위키 `/wiki`, 문서 규칙·완료 점검·문법 확인·훅 `/hooks`, 팀 규칙 `/rules`) |
 | `prompts/`, `skills/` | 기본 명령 6개, 기본 스킬 9개 (설치할 때 `~/.pi/agent` 에 복사) |
 | `tests/` | 단위 테스트 (`node tests/test_guard.mjs`, `node tests/test_modes.mjs`, `node tests/test_memory.mjs`, `node tests/test_files.mjs`, `node tests/test_merge_config.mjs`, `node tests/test_wiki.mjs`, `node tests/test_kitenv.mjs`, `node tests/test_watch.mjs`, `node tests/test_docs.mjs`, `node tests/test_changelog_notes.mjs`, `node tests/test_hooks.mjs`) |
 | `CHANGELOG.md` | 버전마다 바뀐 점과 바꾼 뒤 할 일 |

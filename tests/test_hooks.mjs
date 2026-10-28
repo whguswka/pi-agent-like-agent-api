@@ -1,5 +1,6 @@
 // 키트 훅(profiles/common/agent-template/extensions/hooks.ts) 단위 시험: 문서 규칙, /hooks, 위험 명령 확인 경고
 // 사용법: node tests/test_hooks.mjs   (저장소의 runtime/node_modules/jiti 로 .ts 를, pi-tui 는 tests/stubs 의 것으로)
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -88,6 +89,14 @@ const bt = (c) => h.docTargets("bash", { command: c }).map((x) => x.path).join("
 check("bash 로 만드는 문서: > 파일, >> 파일, tee (Markdown 만, /dev/null·따옴표 안은 뺌)",
 	bt("cat > docs/a.md <<'EOF'\n# A\nEOF") === "docs/a.md" && bt("echo x >> b.md && tee -a c.md d.txt < x") === "b.md,c.md" && bt("cat a.md > /dev/null") === "" && bt('echo "> e.md"') === "", [bt("echo x >> b.md && tee -a c.md d.txt < x")]);
 check("write 의 문서와 내용", JSON.stringify(h.docTargets("write", { path: "a.md", content: "# A" })) === JSON.stringify([{ path: "a.md", content: "# A" }]) && h.docTargets("read", { path: "a.md" }).length === 0);
+// bash 가 쓰는 파일 (문서 규칙·문법 확인·팀 규칙이 함께 씀): 앞의 cd 를 따라 경로를 붙임 (2026-10-27 실사용 시험: 'cd <폴더> && cat > tools/x.py <<'PY'')
+const shell = await jiti.import("../profiles/common/agent-template/extensions/lib/shell.ts");
+const wp = (c) => shell.writtenPaths(c).join(",");
+check("bash 가 쓰는 파일: 리다이렉트·tee, cd 를 따라 (상대·절대), $변수 경로와 /dev/null·2>&1 은 뺌",
+	wp("cat > a.py <<'PY'\nprint(1)\nPY") === "a.py" && wp("cd tools && cat > x.py <<EOF\nx = (\nEOF\npython x.py") === "tools/x.py"
+	&& wp("cd /home/jovyan/w && echo 1 > a.json; cd sub && tee -a b.yaml < in") === "/home/jovyan/w/a.json,/home/jovyan/w/sub/b.yaml"
+	&& wp('cat > "$OUT/x.py" <<EOF\nEOF') === "" && wp("make 2>&1 > /dev/null") === "" && wp("cd $X && echo > a.py") === "a.py" && wp("cd C:/w && echo > b.py") === "C:/w/b.py",
+	[wp("cd /home/jovyan/w && echo 1 > a.json; cd sub && tee -a b.yaml < in"), wp("cd $X && echo > a.py")]);
 
 // ── 가짜 pi 로 이벤트 차례대로 ───────────────────────────────────────────────
 function fakePi() {
@@ -532,6 +541,95 @@ await cmd("on docs", ctx);
 ctx = fakeCtx();
 await cmd("", ctx);
 check("/hooks: 목록 (guard·docs 켜짐, 내 훅)", ctx.log[0].includes("guard  켜짐") && ctx.log[0].includes("docs   켜짐") && ctx.log[0].includes("my-plan.ts 켜짐") && ctx.log[0].includes("/hooks off mine"), ctx.log[0]);
+check("/hooks: 팀 규칙·문법 확인도 목록에", ctx.log[0].includes("rules  켜짐") && ctx.log[0].includes("syntax 켜짐"), ctx.log[0]);
+await cmd("off rules", ctx);
+await cmd("off syntax", ctx);
+let cfgNow = JSON.parse(read(join(AGENT, "bridge.json")));
+check("/hooks off rules·syntax: 내 설정 파일에 team_rules·syntax_check false", cfgNow.team_rules === false && cfgNow.syntax_check === false, cfgNow);
+await cmd("on rules", ctx);
+await cmd("on syntax", ctx);
+cfgNow = JSON.parse(read(join(AGENT, "bridge.json")));
+check("/hooks on rules·syntax: 지움", !("team_rules" in cfgNow) && !("syntax_check" in cfgNow), cfgNow);
+
+// ── 문법 확인 ────────────────────────────────────────────────────────────
+check("문법 확인할 파일: .py·.json·.ipynb·.yaml·.yml (틀 폴더 {{ }} 는 뺌)",
+	h.syntaxKind("a/b.py") === "py" && h.syntaxKind("X.JSON") === "json" && h.syntaxKind("n.ipynb") === "json" && h.syntaxKind("c.yml") === "yaml" && h.syntaxKind("d.yaml") === "yaml"
+	&& h.syntaxKind("{{cookiecutter.name}}/a.py") === null && h.syntaxKind("a.txt") === null && h.syntaxKind("Makefile") === null);
+const jp = h.jsonProblem('{\n  "a": 1\n  "b": 2\n}');
+check("JSON: 깨졌으면 줄·칸과 까닭", jp?.line === 3 && jp.col >= 1 && jp.msg.length > 0 && !/position/.test(jp.msg), jp);
+check("JSON: 맞으면, 빈 파일, 주석·끝 쉼표만 있는 JSONC(tsconfig·VS Code 설정), {{ }} 틀은 문제 아님",
+	h.jsonProblem('{"a": [1, 2]}') === null && h.jsonProblem("  \n") === null && h.jsonProblem('{\n  // 주석\n  "a": 1, /* 끝 */\n  "b": [1, 2,],\n}') === null
+	&& h.jsonProblem('{"replicas": {{ .Values.n }}}') === null && h.jsonProblem('\uFEFF{"a": "http://x//y"}') === null);
+check("JSONC 지우기: 글 안의 // 와 \\\" 는 그대로", h.stripJsonc('{"u": "a//b \\" /* c */", // x\n"v": 1,}') === '{"u": "a//b \\" /* c */", \n"v": 1}', h.stripJsonc('{"u": "a//b \\" /* c */", // x\n"v": 1,}'));
+check("확인 결과 읽기: 문제만 (통과·건너뜀·이상한 출력은 null)",
+	JSON.stringify(h.parseSyntaxOut('잡음\n@@SYNTAX {"line": 2, "col": 5, "msg": "invalid syntax", "text": "x = (", "by": "3.11.4"}\n')) === JSON.stringify({ line: 2, col: 5, msg: "invalid syntax", text: "x = (", by: "3.11.4" })
+	&& h.parseSyntaxOut('@@SYNTAX {"ok": 1}') === null && h.parseSyntaxOut('@@SYNTAX {"skip": 1}') === null && h.parseSyntaxOut("Traceback") === null && h.parseSyntaxOut('@@SYNTAX {"line": null, "msg": "x"}')?.line === undefined);
+check("붙일 글", h.syntaxNote("src/a.py", "py", { line: 2, col: 5, msg: "invalid syntax", text: "x = (", by: "3.11.4" })
+	=== "(문법 확인: src/a.py 2번째 줄 5번째 글자 — Python 문법 오류 (Python 3.11.4 기준): invalid syntax · x = (. 이대로는 실행되지 않으니 고치세요)"
+	&& h.syntaxNote("k.yaml", "yaml", { msg: "x" }).includes("YAML 형식 오류: x. 이대로는 읽히지"));
+// 실제 Python 으로 (PI_TEST_PYTHON 이나 PI_PYTHON, 없으면 PATH 의 python3·python. 없으면 이 부분은 건너뜀)
+const runsPy = (c) => {
+	try {
+		return spawnSync(c, ["-c", "import sys"], { encoding: "utf8" }).status === 0;
+	} catch {
+		return false;
+	}
+};
+const realPy = [process.env.PI_TEST_PYTHON, process.env.PI_PYTHON, "python3", "python"].find((c) => c && runsPy(c));
+if (!realPy) console.log("SKIP 문법 확인의 Python 부분 (돌아가는 Python 이 없음)");
+else {
+	const W3 = join(tmp, "work3");
+	mkdirSync(W3, { recursive: true });
+	const pyOut = (file, kind) => spawnSync(realPy, ["-c", h.SYNTAX_PY, join(W3, file), kind], { encoding: "utf8" }).stdout;
+	writeFileSync(join(W3, "ok.py"), "def f(x):\n    return x + 1\n");
+	writeFileSync(join(W3, "bad.py"), "def f(x):\n    return (x + 1\n\nprint('a')\n");
+	writeFileSync(join(W3, "tab.py"), "if True:\n\tx = 1\n        y = 2\n");
+	const bad = h.parseSyntaxOut(pyOut("bad.py", "py"));
+	check("Python: 맞으면 통과, 깨졌으면 줄·까닭·버전 (실제 Python)", h.parseSyntaxOut(pyOut("ok.py", "py")) === null && bad?.line >= 2 && /never closed|invalid syntax|was not closed/.test(bad.msg) && /^\d+\.\d+/.test(bad.by), bad);
+	check("Python: 들여쓰기 오류도", /indent/i.test(h.parseSyntaxOut(pyOut("tab.py", "py"))?.msg || ""), pyOut("tab.py", "py"));
+	check("파일을 못 읽으면 건너뜀", h.parseSyntaxOut(pyOut("없음.py", "py")) === null);
+	writeFileSync(join(W3, "k.yaml"), "a: 1\n  b: [2\n");
+	writeFileSync(join(W3, "helm.yaml"), "{{- if .Values.on }}\nkind: x\n{{- end }}\n");
+	const hasYaml = spawnSync(realPy, ["-c", "import yaml"]).status === 0;
+	const ky = h.parseSyntaxOut(pyOut("k.yaml", "yaml"));
+	check(`YAML: PyYAML 이 ${hasYaml ? "있어 깨진 것을 알림" : "없어 건너뜀"}, {{ }} 틀은 건너뜀`, (hasYaml ? ky?.line >= 1 : ky === null) && h.parseSyntaxOut(pyOut("helm.yaml", "yaml")) === null, ky);
+	// 노트북에서 돌리는 명령 (실제 bash: Python 은 NB_FIND_PY 가 PI_PYTHON_EXE 로 찾음)
+	const nbOut = spawnSync("bash", ["-c", h.notebookSyntaxCmd(join(W3, "bad.py").split("\\").join("/"), "py")], { cwd: W3, env: { ...process.env, PI_PYTHON_EXE: realPy }, encoding: "utf8" });
+	check("노트북 명령 (실제 bash): 같은 결과", h.parseSyntaxOut(nbOut.stdout)?.line === bad?.line, { out: nbOut.stdout, err: nbOut.stderr });
+	const noPy = spawnSync("bash", ["-c", h.notebookSyntaxCmd("/x.py", "py")], { cwd: W3, env: { ...process.env, PATH: "/nonexistent", PI_PYTHON_EXE: "" }, encoding: "utf8" });
+	check("노트북에 Python 이 없으면 건너뜀", /@@SYNTAX \{"skip": 1\}/.test(noPy.stdout) || noPy.status !== 0, noPy.stdout);
+	// 확장 그대로 (write 는 쓴 글로, edit 는 고친 파일을 읽어서)
+	process.env.PI_PYTHON_EXE = realPy;
+	globalThis.__piWorkDir = { remote: false, cwd: W3 };
+	ctx = fakeCtx();
+	await request();
+	const synt = async (toolName, input) => {
+		const res = await F.emit("tool_result", { toolName, toolCallId: `s${++n}`, input, content: [{ type: "text", text: "ok" }], isError: false }, ctx);
+		return (res?.content || []).slice(1).map((c) => c.text).join("\n");
+	};
+	let sn = await synt("write", { path: "cfg.json", content: '{\n  "a": 1,\n  "b" 2\n}' });
+	check("확장: 깨진 JSON 을 쓰면 결과에 알림 (쓴 글로 봄)", sn.startsWith("(문법 확인: cfg.json 3번째 줄") && sn.includes("JSON 형식 오류"), sn);
+	check("확장: 맞는 JSON 이면 붙이지 않음", (await synt("write", { path: "ok.json", content: '{"a": 1}' })) === "");
+	sn = await synt("edit", { path: "bad.py", edits: [{ oldText: "x", newText: "y" }] });
+	check("확장: 고친 .py 가 깨졌으면 알림 (파일을 읽어 실제 Python 으로)", sn.startsWith("(문법 확인: bad.py") && sn.includes("Python 문법 오류"), sn);
+	check("확장: 맞는 .py, 다른 파일, 오류 결과는 보지 않음", (await synt("edit", { path: "ok.py", edits: [] })) === "" && (await synt("write", { path: "a.txt", content: "{" })) === ""
+		&& (await F.emit("tool_result", { toolName: "write", toolCallId: "e1", input: { path: "x.json", content: "{" }, content: [], isError: true }, ctx)) === undefined);
+	// bash 로 쓴 파일 (cat > … <<EOF): 쓴 파일을 읽어 보고, 뒤 명령이 실패한 결과(오류)여도 봄
+	mkdirSync(join(W3, "sub"), { recursive: true });
+	writeFileSync(join(W3, "sub", "made.py"), "def f(:\n    pass\n");
+	writeFileSync(join(W3, "made.json"), '{"a": 1,, }');
+	sn = await synt("bash", { command: "cd sub && cat > made.py <<'PY'\ndef f(:\n    pass\nPY\npython made.py" });
+	check("확장: bash 로 쓴 .py 도 (cd 를 따라 sub/made.py)", sn.startsWith("(문법 확인: sub/made.py 1번째 줄") && sn.includes("Python 문법 오류"), sn);
+	const errRes = await F.emit("tool_result", { toolName: "bash", toolCallId: "e2", input: { command: "echo '{\"a\": 1,, }' > made.json && python made.json" }, content: [{ type: "text", text: "오류" }], isError: true }, ctx);
+	check("확장: bash 결과가 오류여도 쓴 파일은 봄 (JSON)", (errRes?.content || []).slice(1).map((c) => c.text).join("").includes("(문법 확인: made.json"), errRes);
+	writeFileSync(join(W3, "big.ipynb"), `{"cells": [${'"x",'.repeat(h.SYNTAX_JSON_MAX / 4)}`);
+	check(`확장: ${h.SYNTAX_JSON_MAX / 1e6}MB 가 넘는 JSON(그림이 든 노트북 등)은 다시 읽지 않음`, (await synt("edit", { path: "big.ipynb", edits: [] })) === "");
+	h.saveSetting("syntax_check", false, join(AGENT, "bridge.json"));
+	check("확장: 끄면 (syntax_check false) 보지 않음", (await synt("write", { path: "cfg2.json", content: "{" })) === "");
+	h.saveSetting("syntax_check", undefined, join(AGENT, "bridge.json"));
+	globalThis.__piWorkDir = local;
+	delete process.env.PI_PYTHON_EXE;
+}
 
 rmSync(tmp, { recursive: true, force: true });
 console.log(fails ? `RESULT: FAIL (${fails})` : "RESULT: PASS");
