@@ -169,6 +169,10 @@ check("두 번째 새 문서: 묻지 않고 링크 (목록 폴더 기준 ../)", 
 ctx = fakeCtx([false]);
 r = await writeDoc(ctx, "c.md");
 check("세 번째 새 문서: 한 번 묻고, 아니요면 막고 이유를 모델에게", r.blocked?.includes("사용자 문서 규칙") && r.blocked.includes("docs/plans/a.md") && ctx.log.join() === "새 문서가 많습니다" && !existsSync(join(W, "c.md")), [r, ctx.log]);
+globalThis.__piReview = "running"; // /review 중: 쓰기는 modes.ts 가 막으므로 여기서는 묻지도 막지도 않음
+r = await F.emit("tool_call", { toolName: "write", toolCallId: "rv", input: { path: "rv.md", content: "# 리뷰\n" } }, ctx);
+globalThis.__piReview = undefined;
+check("리뷰 중: 문서 규칙은 묻지 않음", r === undefined && ctx.log.length === 1, [r, ctx.log]);
 r = await writeDoc(ctx, "d.md");
 check("네 번째: 다시 묻지 않고 같은 답으로 막음", !!r.blocked && ctx.log.length === 1, ctx.log);
 r = await tool(ctx, "read", { path: "c.md" });
@@ -435,6 +439,13 @@ ctx = fakeCtx([]);
 await doneReq(ctx, { write: "src/d.py", flag: "bad", none: true });
 globalThis.__piMode = "auto";
 check("계획 모드에서는 하지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);
+for (const r of ["running", "done"]) {
+	globalThis.__piReview = r; // /review 의 요청 (읽기만 하는 bash 를 써도): 고칠지는 리뷰 뒤에 물으므로 점검하지 않음
+	ctx = fakeCtx([]);
+	await doneReq(ctx, { write: "src/d.py", flag: "bad", tool: "bash", none: true });
+	globalThis.__piReview = undefined;
+	check(`리뷰(${r}) 요청 뒤에는 하지 않음`, ctx.log.length === 0 && sent.length === 2, ctx.log);
+}
 ctx = fakeCtx([], { hasUI: false });
 await doneReq(ctx, { write: "src/e.py", flag: "bad", none: true });
 check("화면이 없는 실행(pi -p)에서는 하지 않음", ctx.log.length === 0 && sent.length === 2, ctx.log);

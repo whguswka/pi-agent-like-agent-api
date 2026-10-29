@@ -6,6 +6,7 @@
  * 이 폴더(lib)에는 index.ts 가 없으므로 pi 가 확장으로 불러오지 않는다.
  */
 
+import { spawn } from "node:child_process";
 import { promises as fsp, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, posix, resolve } from "node:path";
@@ -61,6 +62,52 @@ export async function nbRun(command: string, cwd: string): Promise<{ code: numbe
 export const shq = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
 export type WorkDir = { remote: boolean; cwd: string; home?: string };
 export const workDir = (): WorkDir => (globalThis as any).__piWorkDir || { remote: false, cwd: process.cwd() };
+
+/** pi 의 bash 도구와 같은 셸 (Windows 에서 cmd·PowerShell 로 pi.cmd 를 켜면 PATH 의 bash 가 WSL 의 것일 수 있어 pi 가 고른 것으로) */
+export async function piShell(): Promise<{ shell: string; args: string[]; stdin: boolean }> {
+	try {
+		const m: any = await import("@earendil-works/pi-coding-agent");
+		const c = typeof m.getShellConfig === "function" ? m.getShellConfig() : null;
+		if (c?.shell) return { shell: c.shell, args: Array.isArray(c.args) ? c.args : ["-c"], stdin: c.commandTransport === "stdin" };
+	} catch {}
+	return { shell: "bash", args: ["-c"], stdin: false };
+}
+/** 지금 실행 위치(jupyter 모드면 노트북, 아니면 PC 의 작업 폴더)에서 셸 명령. 표준 출력과 오류를 합쳐 돌려줌, ms 가 지나면 멈춤 (code null) */
+export async function runHere(command: string, wd: WorkDir = workDir(), ms = 60000): Promise<{ code: number | null; out: string }> {
+	const sec = Math.max(1, Math.ceil(ms / 1000));
+	if (wd.remote) return nbRun(`timeout ${sec} bash -c ${shq(command)} 2>&1`, wd.cwd || wd.home || "/");
+	const sh = await piShell();
+	return new Promise((ok) => {
+		let out = "";
+		let done = false;
+		let ch: ReturnType<typeof spawn>;
+		const finish = (code: number | null, extra = "") => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			ok({ code, out: out + extra });
+		};
+		const timer = setTimeout(() => {
+			// Windows 에서 kill 은 bash 만 끝내고 그 아래 프로그램은 남으므로 프로세스 나무째
+			if (process.platform === "win32" && ch?.pid) {
+				try {
+					spawn("taskkill", ["/pid", String(ch.pid), "/T", "/F"], { windowsHide: true });
+				} catch {}
+			} else ch?.kill();
+			finish(null, `\n(${sec}초가 지나 멈춤)`);
+		}, ms);
+		try {
+			ch = spawn(sh.shell, sh.stdin ? sh.args : [...sh.args, command], { cwd: wd.cwd, windowsHide: true, env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
+			if (sh.stdin) ch.stdin?.end(command);
+		} catch (e) {
+			return finish(null, `(실행하지 못함: ${(e as Error).message})`);
+		}
+		ch.stdout?.on("data", (d) => (out += d));
+		ch.stderr?.on("data", (d) => (out += d));
+		ch.on("error", (e) => finish(null, `\n(실행하지 못함: ${e.message})`));
+		ch.on("close", (code) => finish(code));
+	});
+}
 export type Target = { abs: string; remote: boolean };
 const slash = (p: string) => p.split("\\").join("/");
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || `${homedir()}/.pi/agent`;

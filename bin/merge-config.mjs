@@ -153,6 +153,15 @@ function hashOf(p) {
 	return h.digest("hex");
 }
 
+// 키트에서 뺀 기본 명령·스킬. hashes: 내보낸 적 있는 내용의 hashOf (상태 파일이 없어도 고치지 않은 것을 알아봄)
+const RETIRED = {
+	"prompts/review.md": {
+		label: "/review 템플릿",
+		why: "2026-10-29.1 부터 /review 는 고급 모델로 리뷰하는 명령",
+		hashes: ["9b5d3eb32b63c2457af69bc661d3b8e13dd7319c2b53e58286a5d21994ec95cf"],
+	},
+};
+
 /** 기본 명령·스킬을 사용자 설정 폴더에 복사 (고친 것·지운 것은 그대로) */
 function syncKitFiles() {
 	if (!kitHome) return;
@@ -200,6 +209,20 @@ function syncKitFiles() {
 	if (added.length) console.log(`기본 명령·스킬 추가: ${added.join(", ")}`);
 	if (updated.length) console.log(`기본 명령·스킬 새 버전으로: ${updated.join(", ")}`);
 	if (kept.length) console.log(`직접 고친 것은 그대로 둠: ${kept.join(", ")} (새 버전은 ${kitHome} 의 prompts·skills 에 있음)`);
+	// 키트에서 뺀 것: 설치한 그대로면 <폴더>.removed/ 로 옮김 (지우지 않음), 고쳤으면 그대로 두고 알림
+	for (const [rel, r] of Object.entries(RETIRED)) {
+		const dst = path.join(agentDir, rel);
+		if (items.some(([x]) => x === rel) || !fs.existsSync(dst)) continue; // 키트에 다시 생겼으면 위에서 다룸
+		const cur = hashOf(dst);
+		const [dir, ...rest] = rel.split("/");
+		if (cur === prevFiles[rel] || r.hashes.includes(cur)) {
+			const to = path.join(agentDir, `${dir}.removed`, ...rest);
+			fs.mkdirSync(path.dirname(to), { recursive: true });
+			fs.rmSync(to, { recursive: true, force: true });
+			fs.renameSync(dst, to);
+			console.log(`치움: ${dst} (${r.label}: ${r.why} -> ${dir}.removed/)`);
+		} else console.log(`직접 고친 ${r.label}(${dst})은 그대로 둠 (${r.why}). 이 파일은 쓰이지 않으니 계속 쓰려면 이름을 바꾸세요 (예: my-${rest.join("/")})`);
+	}
 }
 let failed = false;
 for (const name of FILES) {

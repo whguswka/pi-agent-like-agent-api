@@ -718,6 +718,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event: any, ctx: any) => {
 		if (event.toolName !== "write" && event.toolName !== "bash") return;
+		if ((globalThis as any).__piReview === "running") return; // /review 중에는 쓰기를 modes.ts 가 막음 (묻지 않음)
 		const cfg = docCfg();
 		if (!cfg.on) return;
 		const plan = (globalThis as any).__piMode === "plan";
@@ -1096,8 +1097,8 @@ export default function (pi: ExtensionAPI) {
 		C.used = false;
 		C.end = "";
 		C.round = 0;
-		// 끝까지 쓴 답으로 끝난 요청만 (Esc·오류·거부로 멈춘 요청은 사용자가 정함). 계획 모드·화면이 없는 실행은 하지 않음
-		if (end !== "stop" || !ctx?.hasUI || (globalThis as any).__piMode === "plan" || !checksOn()) return;
+		// 끝까지 쓴 답으로 끝난 요청만 (Esc·오류·거부로 멈춘 요청은 사용자가 정함). 계획 모드·리뷰(/review: 고칠지는 리뷰 뒤에 물음)·화면이 없는 실행은 하지 않음
+		if (end !== "stop" || !ctx?.hasUI || (globalThis as any).__piMode === "plan" || (globalThis as any).__piReview || !checksOn()) return;
 		if (round === 0 && (!used || !t0)) return;
 		// 앞 요청의 점검이 아직 돌면 버리지 않고 그 뒤에 (릴리스 전 검토: 점검 중에 끝난 요청의 점검이 사라졌음)
 		if (C.busy) return void (C.queued = { round, t0, gen: C.gen, ctx });

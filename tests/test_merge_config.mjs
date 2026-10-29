@@ -149,6 +149,42 @@ fs.rmSync(path.join(agent4, ".pi-agent-kit-template.json"));
 writeJson(path.join(agent4, "settings.json"), { defaultModel: "gpt-6.0-sol" });
 out = run4();
 check("지난 설치 기록이 없어도 예전 키트 기본값(gpt-6.0-sol)이면 새 기본으로", readJson(path.join(agent4, "settings.json")).defaultModel === "gpt-5.6-sol-think", out);
+
+// 키트에서 뺀 기본 명령 (2026-10-28: prompts/review.md -> /review 는 modes.ts 의 명령): 설치한 그대로면 prompts.removed/ 로, 고쳤으면 그대로 + 알림
+const kit5 = path.join(tmp, "kit5");
+put(path.join(kit5, "prompts", "test.md"), "test v1");
+const run5 = (ag) => execFileSync(process.execPath, [script, tpl, ag, kit5], { encoding: "utf8" });
+// 2026-10-02 부터 내보낸 그대로의 prompts/review.md (LF)
+const SHIPPED_REVIEW = [
+	"---",
+	"description: 바뀐 내용(git diff) 검토 - 버그·빠진 처리·보안·테스트 위주",
+	'argument-hint: "[파일이나 볼 점]"',
+	"---",
+	"작업 폴더의 바뀐 내용을 검토해 주세요. 대상: ${@:-커밋하지 않은 모든 변경 (git diff, git diff --staged)}",
+	"- 먼저 `git status` 와 `git diff --stat` 으로 범위를 보고, 필요한 파일의 diff 만 읽습니다.",
+	"- 볼 점: 버그 가능성, 예외·빈 값 처리, 보안(비밀번호·키·내부 주소가 코드에 들어갔는지), 성능 문제, 테스트가 필요한 부분, 이름·구조가 어색한 곳.",
+	"- 고치지는 말고, 찾은 것을 심각한 순서로 정리합니다: 위치(파일:줄), 문제, 고칠 방법. 문제가 없으면 없다고 말합니다.",
+	"",
+].join("\n");
+const ag5 = path.join(tmp, "agent5a");
+put(path.join(ag5, "prompts", "review.md"), SHIPPED_REVIEW);
+out = run5(ag5);
+check("뺀 명령: 설치 기록이 없어도 내보낸 그대로면 prompts.removed/ 로 옮김", !fs.existsSync(path.join(ag5, "prompts", "review.md"))
+	&& read(path.join(ag5, "prompts.removed", "review.md")) === SHIPPED_REVIEW && out.includes("치움:") && out.includes("/review 템플릿"), out);
+check("뺀 명령: 상태 파일에 남기지 않음, 다른 기본 명령은 그대로 복사", !("prompts/review.md" in readJson(path.join(ag5, ".pi-agent-kit-template.json")).kitFiles)
+	&& read(path.join(ag5, "prompts", "test.md")) === "test v1", readJson(path.join(ag5, ".pi-agent-kit-template.json")).kitFiles);
+const ag5b = path.join(tmp, "agent5b");
+put(path.join(kit, "prompts", "review.md"), "review v9"); // 앞 시험의 키트: 아직 review.md 가 있는 버전으로 설치
+fs.rmSync(path.join(kit, "skills"), { recursive: true, force: true });
+execFileSync(process.execPath, [script, tpl, ag5b, kit], { encoding: "utf8" });
+out = run5(ag5b);
+check("뺀 명령: 지난번에 설치한 그대로(설치 기록의 해시)여도 옮김", !fs.existsSync(path.join(ag5b, "prompts", "review.md")) && read(path.join(ag5b, "prompts.removed", "review.md")) === "review v9", out);
+const ag5c = path.join(tmp, "agent5c");
+execFileSync(process.execPath, [script, tpl, ag5c, kit], { encoding: "utf8" });
+put(path.join(ag5c, "prompts", "review.md"), "내가 고친 리뷰 템플릿");
+out = run5(ag5c);
+check("뺀 명령: 고쳤으면 그대로 두고, 쓰이지 않으니 이름을 바꾸라고", read(path.join(ag5c, "prompts", "review.md")) === "내가 고친 리뷰 템플릿"
+	&& !fs.existsSync(path.join(ag5c, "prompts.removed")) && out.includes("직접 고친 /review 템플릿") && out.includes("my-review.md"), out);
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log("RESULT:", fails ? `FAIL (${fails})` : "PASS");
 process.exit(fails ? 1 : 0);

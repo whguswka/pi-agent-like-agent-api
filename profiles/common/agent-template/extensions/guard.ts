@@ -717,9 +717,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (!why) return;
-		// 계획·확인 모드(modes.ts)에서는 여기서 묻지 않고 이유만 넘김: 계획 모드는 막고, 확인 모드는 바뀌는 내용과 함께 한 번에 묻는다
+		// 계획·확인 모드(modes.ts)에서는 여기서 묻지 않고 이유만 넘김: 계획 모드는 막고, 확인 모드는 바뀌는 내용과 함께 한 번에 묻는다. /review 중에도 막기만
 		const mode = (globalThis as any).__piMode;
-		if (mode === "plan" || mode === "ask") {
+		if (mode === "plan" || mode === "ask" || (globalThis as any).__piReview === "running") {
 			event.guardReason = why;
 			return;
 		}

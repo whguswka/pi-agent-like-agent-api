@@ -4,6 +4,9 @@
  *  /plan            계획 모드 켜기·끄기. 켜면 파일을 바꾸거나 명령을 실행하지 않고 계획부터 세운다
  *  /plan <요청>     계획 모드로 바꾸고 바로 요청 (다른 작업 중이면 그 작업이 끝난 뒤)
  *  /mode            모드 고르기 (계획 / 확인 / 자동). /mode ask 처럼 바로 바꿀 수도 있음
+ *  /review [볼 점]  고급 모델로 리뷰 (2026-10-28): 바뀐 내용(git status·diff·새 파일)을 모아 리뷰 모델(내 설정 "review_model",
+ *                   Copilot 이면 기본 GPT-6, "same" 이면 지금 모델)로 같은 대화에서 한 번 검토하고 원래 모델로 돌아와 고칠지 묻는다.
+ *                   리뷰하는 동안은 읽기만 (도구 4번까지). 계획 모드와 같은 방식: 고급 모델은 사용량이 적어 리뷰에만
  *
  *  - 계획: read 와 읽기 전용 명령(ls, cat, grep, git status·diff·log 등)만 실행한다. write·edit 와 그 밖의 명령은 막고
  *          LLM 에게 계획으로 적으라고 알린다. 요청마다 앞에 "[계획 모드] ..." 안내를 붙인다.
@@ -27,7 +30,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPlanDoc, projectRel } from "./lib/paths.ts";
-import { readTarget, shown, target, transformInput, userAsk, workDir } from "./lib/relay.ts";
+import { readTarget, runHere, SESSION, shown, target, transformInput, userAsk, workDir } from "./lib/relay.ts";
 import { base, parseShell, strip } from "./lib/shell.ts";
 
 export type Mode = "plan" | "ask" | "auto";
@@ -520,6 +523,84 @@ const planDir = (): string => {
 const textOf = (m: any) => (typeof m?.content === "string" ? m.content : (m?.content || []).filter((c: any) => c?.type === "text").map((c: any) => c.text).join("\n"));
 const READ_TOOLS = new Set(["read", "grep", "find", "ls", "wiki_search", "wiki_read", "docs_lookup", "ask_user"]);
 
+// ── /review: 고급 모델로 리뷰 (2026-10-28) ─────────────────────────────
+// 계획 모드의 '계획은 고급 모델, 진행은 기본 모델' 과 같은 방식: 같은 대화에서 모델만 리뷰 모델로 바꿔 한 번 리뷰하고 원래 모델로 돌아온다.
+// 키트가 바뀐 내용(git status·diff·새 파일)을 모아 요청에 붙여, 리뷰 모델은 보통 도구 없이 답 하나로 끝낸다 (고급 모델은 사용량이 적음).
+// 리뷰하는 동안은 읽기만 (REVIEW_TOOLS_MAX 번까지). 끝나면 '리뷰대로 고칠까요?' 를 묻고, 고치면 원래 모델로 요청한다.
+export const DEFAULT_REVIEW_MODEL = "gpt-6"; // Copilot 을 쓸 때 기본 리뷰 모델 (내 설정 "review_model" 로 바꿈, "same" 이면 지금 모델)
+export const REVIEW_TOOLS_MAX = 4;
+export const REVIEW_DIFF_MAX = 30000;
+export const REVIEW_TAG = "[리뷰]"; // 중계 서버는 이 표시가 있는 요청에 '이어서 하라' 부탁을 하지 않는다 (relay.py NO_TOOLS_RE, 계획 모드와 같게)
+/** 리뷰 모델 {provider, id}: 내 설정 파일의 "review_model" (모델 id 나 provider/id. "same" 이면 null = 지금 모델).
+ *  없으면 Copilot 모델을 쓰는 중일 때 DEFAULT_REVIEW_MODEL, 아니면(사내AI, API 키트의 vLLM 등) 지금 모델. 다른 제공자로는 provider/id 로 적었을 때만 */
+export function reviewModel(cur: { provider?: string; id?: string } | undefined, cfg: any = userConfig()): { provider: string; id: string; explicit: boolean } | null {
+	const v = String(cfg.review_model ?? "").trim();
+	if (v === "same" || !cur?.provider) return null;
+	if (!v) return cur.provider === "copilot" ? { provider: "copilot", id: DEFAULT_REVIEW_MODEL, explicit: false } : null;
+	if (v.includes("/")) return { provider: v.slice(0, v.indexOf("/")), id: v.slice(v.indexOf("/") + 1), explicit: true };
+	return { provider: cur.provider, id: v, explicit: false };
+}
+/** 바뀐 내용을 모으는 명령 (PC 의 bash 와 노트북에서 같게). '@@REVIEW <이름>' 줄로 나눔. 커밋이 없는 저장소는 스테이징한 것도 */
+export const REVIEW_SCAN = [
+	'git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "@@REVIEW nogit"; exit 0; }',
+	'echo "@@REVIEW status"; git status --short 2>/dev/null | head -60',
+	"if git rev-parse --verify -q HEAD >/dev/null 2>&1; then",
+	'  echo "@@REVIEW stat"; git diff HEAD --stat 2>/dev/null | tail -40',
+	`  echo "@@REVIEW diff"; git diff HEAD 2>/dev/null | head -c ${REVIEW_DIFF_MAX}`,
+	"else",
+	'  echo "@@REVIEW stat"; { git diff --cached --stat; git diff --stat; } 2>/dev/null | tail -40',
+	`  echo "@@REVIEW diff"; { git diff --cached; git diff; } 2>/dev/null | head -c ${REVIEW_DIFF_MAX}`,
+	"fi",
+	'echo "@@REVIEW new"; git ls-files --others --exclude-standard 2>/dev/null | head -8 | while IFS= read -r f; do',
+	'  [ -f "$f" ] && [ "$(wc -c < "$f")" -lt 20000 ] && { echo "=== $f"; head -c 6000 "$f"; echo; }',
+	"done",
+	"true",
+].join("\n");
+/** 모은 내용 -> 부분별 글 (nogit: git 저장소가 아님) */
+export function parseReviewScan(out: string): { nogit: boolean; status: string; stat: string; diff: string; fresh: string } {
+	const parts: Record<string, string> = {};
+	let name = "";
+	for (const line of out.replace(/\r/g, "").split("\n")) {
+		const m = line.match(/^@@REVIEW (\w+)$/);
+		if (m) {
+			name = m[1];
+			parts[name] = "";
+		} else if (name) parts[name] += `${line}\n`;
+	}
+	const t = (k: string) => (parts[k] || "").replace(/\s+$/, "");
+	return { nogit: "nogit" in parts, status: t("status"), stat: t("stat"), diff: t("diff"), fresh: t("new") };
+}
+/** 리뷰 요청 글 (who: 리뷰 모델 이름, focus: /review 뒤에 적은 볼 점) */
+export function reviewPrompt(scan: ReturnType<typeof parseReviewScan>, who: string, focus = ""): string {
+	const lines = [
+		`${REVIEW_TAG} 지금까지의 작업을 ${who} 로 검토합니다. 이번 답에서는 파일을 바꾸지 말고, 찾은 것만 적어 주세요.`,
+		"- 볼 점: 이 대화에서 사용자가 요청한 것을 빠뜨리거나 다르게 한 곳, 버그 가능성, 예외·빈 값 처리, 보안(비밀번호·키·내부 주소가 코드에 들어감), 시험하지 않은 곳.",
+		"- 적는 법: 심각한 것부터 하나마다 위치(파일:줄), 문제, 고칠 방법. 문제가 없으면 '문제 없음' 이라고 적으세요.",
+		// 스킬 문서: 2026-10-28 실사용 시험에서 리뷰 모델이 debugging 스킬부터 읽음 (고급 모델은 도구마다 질문 하나)
+		`- 아래 바뀐 내용으로 보통 충분합니다. 꼭 필요할 때만 read·grep 으로 프로젝트 파일을 더 보세요 (${REVIEW_TOOLS_MAX}번까지, 스킬 문서는 읽지 않아도 됨). 이 대화에서 바꾼 것 위주로 봅니다.`,
+	];
+	if (focus.trim()) lines.push(`- 사용자가 특히 볼 점: ${focus.trim()}`);
+	if (scan.nogit) {
+		lines.push("", "(작업 폴더가 git 저장소가 아니라 바뀐 내용을 모으지 못했습니다. 이 대화에서 바꾼 파일을 read 로 보고 검토하세요.)");
+		return lines.join("\n");
+	}
+	if (!scan.status && !scan.diff && !scan.fresh) lines.push("", "(git 에 바뀐 것이 없습니다: 커밋한 뒤라면 이 대화에서 한 일을 보고 검토하세요.)");
+	if (scan.status) lines.push("", "## git status", "```text", scan.status, "```");
+	if (scan.stat) lines.push("", "## 바뀐 양 (git diff --stat)", "```text", scan.stat, "```");
+	if (scan.diff) {
+		const cut = scan.diff.length >= REVIEW_DIFF_MAX - 100 ? `\n(바뀐 내용이 길어 앞 ${REVIEW_DIFF_MAX}바이트만. 나머지는 필요하면 read 로)` : "";
+		lines.push("", "## 바뀐 내용 (git diff)", "```diff", scan.diff, "```" + cut);
+	}
+	if (scan.fresh) lines.push("", "## 새 파일 (git 이 아직 모르는 파일, 앞부분)", "```text", scan.fresh, "```");
+	return lines.join("\n");
+}
+/** 리뷰 답이 '문제 없음' 인지 (그때는 고칠지 묻지 않음): '문제 없음' 류의 말이 있고, 위치(파일:줄)를 하나도 적지 않았을 때 */
+export const reviewClean = (text: string) =>
+	/(문제|고칠 ?(것|점))(이|가|은|는)? ?없(습니다|음|어요|다)/.test(text) && !/[\w/.-]+\.[A-Za-z]{1,5}:\d+/.test(text);
+export const REVIEW_FIX =
+	"[리뷰 뒤 고치기] 방금 리뷰에서 찾은 것 가운데 이번 작업에 관계된 것을 고치고, 고친 뒤 실행·시험해 확인해 주세요. " +
+	"리뷰가 틀렸다고 보이는 것은 고치지 말고 까닭을 적어 주세요. 사용자 승인이 필요한 일(운영 반영, 지우기 등)은 하지 말고 물어 주세요.";
+
 export default function (pi: ExtensionAPI) {
 	let mode: Mode = (globalThis as any).__piMode; // 확장을 다시 불러와도(/kit share 등) 모드 유지
 	let before: Mode = "auto"; // /plan 으로 끌 때 돌아갈 모드
@@ -527,6 +608,9 @@ export default function (pi: ExtensionAPI) {
 	let planDoc = ""; // 계획 모드에서 쓴 계획서 (도구가 받은 경로. 답에 단계가 없으면 이 파일의 단계로)
 	let asking = false;
 	let steps: { text: string; done: boolean }[] = [];
+	// /review: running 리뷰 요청 중, done 끝남 (다음 요청이 시작될 때 지움: 계획 모드의 '진행할까요?' 가 리뷰 답을 계획으로 보지 않게).
+	//  prev: 리뷰 모델로 바꾸기 전의 모델 (바꾸지 않았으면 null), wantId: 리뷰에 쓴 모델 id, answer: 리뷰 답
+	let review: { phase: "running" | "done"; prev: any; who: string; wantId: string; tools: number; statusUrl: string; answer: string } | null = null;
 
 	const setMode = (ctx: any, m: Mode) => {
 		if (m === "plan" && mode !== "plan") planDoc = ""; // 새 계획: 지난 계획서는 잊음
@@ -566,11 +650,19 @@ export default function (pi: ExtensionAPI) {
 		const text = String(event.text || "");
 		if (text.startsWith("/")) return;
 		if (event.source !== "extension" && steps.length && steps.every((s) => s.done)) clearSteps(ctx);
-		if (mode !== "plan" || !text.trim()) return;
+		if (mode !== "plan" || !text.trim() || review?.phase === "running") return; // 리뷰 요청에는 계획 안내를 붙이지 않음 (리뷰는 따로 읽기만)
 		return transformInput(text, `${planNote(planDir())}\n\n${text}`);
 	});
 
 	pi.on("tool_call", async (event: any, ctx: any) => {
+		// 리뷰하는 동안: 읽기만, REVIEW_TOOLS_MAX 번까지 (고급 모델은 도구마다 질문 하나를 더 씀)
+		if (review?.phase === "running") {
+			const t = String(event.toolName || "");
+			const ok = t === "bash" ? !readOnlyProblem(String(event.input?.command || "")) && !event.guardReason : READ_TOOLS.has(t) && t !== "ask_user";
+			if (!ok) return { block: true, reason: "리뷰 중이라 파일을 바꾸거나 명령을 실행하지 않습니다. 고칠 것은 답에 적어 주세요 (리뷰가 끝나면 사용자가 고칠지 정합니다)." };
+			if (++review.tools > REVIEW_TOOLS_MAX) return { block: true, reason: `리뷰에서 도구는 ${REVIEW_TOOLS_MAX}번까지입니다. 지금까지 본 것으로 답해 주세요.` };
+			return;
+		}
 		if (mode === "auto") return;
 		const tool = String(event.toolName || "");
 		const input = event.input || {};
@@ -610,6 +702,47 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async () => {
 		lastText = "";
+		if (review?.phase === "done") review = null;
+		if (!review) (globalThis as any).__piReview = undefined;
+	});
+
+	// 리뷰 요청이 끝나면 바로 원래 모델로 (그사이 사용자가 넣어 둔 다음 요청이 리뷰 모델로 돌지 않게). Esc·오류로 끝나도.
+	//  오류 뒤 pi 의 자동 다시 시도는 키트 설정에서 꺼 둠 (settings.json retry.enabled false. 확장은 다시 시도할지 알 수 없음).
+	//  __piReview 는 다음 요청이 시작될 때 지움: 확장마다 불러오는 순서가 달라도(리눅스는 폴더 순서) 이 요청의 끝 처리에서 리뷰였음을 봄
+	pi.on("agent_end", async (event: any, ctx: any) => {
+		if (review?.phase !== "running") return;
+		const r = review;
+		r.phase = "done";
+		(globalThis as any).__piReview = "done";
+		const msgs: any[] = event?.messages || [];
+		const last = [...msgs].reverse().find((m) => m?.role === "assistant");
+		r.answer = last && last.stopReason !== "aborted" && last.stopReason !== "error" ? textOf(last) : "";
+		// 오류 글: 중계 서버의 오류는 '429: {"message":"…"}' 모양이라 message 만
+		const err = String(last?.errorMessage || "오류");
+		const why = last?.stopReason === "error" ? `: ${(err.match(/"message"\s*:\s*"((?:[^"\\]|\\.)+)"/)?.[1] || err.split("\n")[0]).slice(0, 160)}` : last?.stopReason === "aborted" ? " (멈춤)" : "";
+		if (r.prev) {
+			try {
+				const ok = await (pi as any).setModel(r.prev);
+				if (ok === false) ctx.ui?.notify?.(`원래 모델(${r.prev.id})로 돌아가지 못했습니다. /model 로 골라 주세요`, "warning");
+			} catch (e) {
+				ctx.ui?.notify?.(`원래 모델(${r.prev.id})로 돌아가지 못했습니다: ${(e as Error).message}`, "warning");
+			}
+		}
+		// Copilot·사내AI: 중계 서버가 리뷰 모델을 실제로 골랐는지 (메뉴에 없거나 꺼져 있으면 지금 모델로 답함)
+		if (r.statusUrl) {
+			try {
+				const st: any = await (await fetch(r.statusUrl, { signal: AbortSignal.timeout(3000) })).json();
+				if (st?.model_id === r.wantId && st.model_ok === false) {
+					r.who = `${r.who} 대신 그때의 모델`; // '고칠까요?'·'문제 없음' 에 리뷰한 모델을 바로 적음
+					ctx.ui?.notify?.(
+						`리뷰 모델 '${st.model || r.wantId}' 을(를) Copilot 메뉴에서 고르지 못해 그때의 모델로 리뷰했습니다 (메뉴에 없거나 사용량 한도로 보임, 추측). 리뷰 결과를 그 점을 감안해 보세요`,
+						"warning",
+					);
+				}
+			} catch {}
+		}
+		// 사용량 제한이어도 리뷰는 자동으로 다시 하지 않음 (copilot-session.ts 가 __piReview 를 보고 건너뜀)
+		if (!r.answer) ctx.ui?.notify?.(`리뷰가 끝까지 되지 않았습니다${why}${r.prev ? ` (원래 모델 ${r.prev.id} 로 돌아옴)` : ""}. 다시 하려면 /review`, "warning");
 	});
 
 	pi.on("message_end", async (event: any, ctx: any) => {
@@ -648,7 +781,7 @@ export default function (pi: ExtensionAPI) {
 	// 계획이 오면 진행할지 묻는다 (기다리지 않고 따로: 다른 확장의 '끝남' 알림이 늦어지지 않게.
 	//  계획서 읽기도 따로: jupyter 모드에서는 노트북을 거쳐 오래 걸릴 수 있고, 그동안 pi 는 새 입력을 미룸)
 	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
-		if (mode !== "plan" || asking || !ctx.hasUI) return;
+		if (mode !== "plan" || asking || !ctx.hasUI || review) return; // 리뷰 답(번호 목록)은 계획이 아님
 		const fromAnswer = planSteps(lastText);
 		const doc0 = planDoc;
 		if (fromAnswer.length < 2 && !doc0) return;
@@ -687,6 +820,21 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				asking = false;
 			}
+		}, 0);
+	});
+	// 리뷰가 끝나 쉬면: 찾은 것이 있으면 고칠지 묻는다 (다른 확장의 '끝남' 처리가 늦어지지 않게 따로. 계획 모드의 위 처리는 review 가 있으면 건너뜀)
+	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
+		const r = review;
+		if (r?.phase !== "done" || !r.answer || !ctx.hasUI) return;
+		const answer = r.answer;
+		r.answer = ""; // 한 번만
+		if (reviewClean(answer)) return ctx.ui.notify(`리뷰(${r.who}): 문제 없음${r.prev ? ` · 원래 모델 ${r.prev.id} 로 돌아왔습니다` : ""}`, "info");
+		setTimeout(async () => {
+			try {
+				const now = ctx.model?.id || "지금 모델";
+				const pick = await ctx.ui.select(`리뷰(${r.who})에서 찾은 것을 고칠까요?`, [`고치기 (${now} 로)`, "그대로 두기 (나중에 직접)"]);
+				if (typeof pick === "string" && pick.startsWith("고치기")) pi.sendUserMessage(userAsk(REVIEW_FIX, "(리뷰대로 고치기)"));
+			} catch {}
 		}, 0);
 	});
 
@@ -733,6 +881,52 @@ export default function (pi: ExtensionAPI) {
 			if (want === "plan" && mode !== "plan") before = mode;
 			setMode(ctx, want);
 			ctx.ui.notify(`${LABEL[want]} 모드${want === "plan" ? ": 파일을 바꾸지 않고 계획부터 세웁니다" : want === "ask" ? ": 바꾸기 전에 내용을 보여 주고 묻습니다" : ": 묻지 않고 실행합니다 (위험한 명령만 확인)"}`, "info");
+		},
+	});
+
+	pi.registerCommand("review", {
+		description:
+			"리뷰: 바뀐 내용(git diff)을 모아 리뷰 모델(내 설정 review_model)로 한 번 검토하고, 원래 모델로 돌아와 고칠지 묻기. /review <볼 점>",
+		handler: async (args, ctx) => {
+			if (!ctx.isIdle()) return ctx.ui.notify("pi 가 일하는 중입니다. 지금 요청이 끝난 뒤 다시 /review 해 주세요", "warning");
+			if (review?.phase === "running") return ctx.ui.notify("리뷰가 이미 진행 중입니다", "info");
+			const focus = String(args || "").trim();
+			// 바뀐 내용을 먼저 모은다 (모델을 바꾸기 전에: 여기서 실패해도 모델은 그대로)
+			ctx.ui.notify("리뷰할 바뀐 내용을 모으는 중입니다...", "info");
+			let out = "@@REVIEW nogit\n";
+			try {
+				out = (await runHere(REVIEW_SCAN, workDir(), 60000)).out;
+			} catch {}
+			const scan = parseReviewScan(out);
+			const cur = ctx.model;
+			let use = cur;
+			let prev: any = null;
+			const want = reviewModel(cur);
+			if (want && !(cur?.provider === want.provider && cur?.id === want.id)) {
+				const m = ctx.modelRegistry?.find?.(want.provider, want.id);
+				if (!m) ctx.ui.notify(`리뷰 모델 ${want.provider}/${want.id} 을(를) 모델 목록에서 찾지 못해 지금 모델(${cur?.id})로 리뷰합니다 (내 설정 파일의 review_model 확인)`, "warning");
+				else {
+					try {
+						const ok = await (pi as any).setModel(m);
+						if (ok === false) ctx.ui.notify(`리뷰 모델(${want.id})로 바꾸지 못해 지금 모델(${cur?.id})로 리뷰합니다 (그 모델의 로그인·인증 확인)`, "warning");
+						else [use, prev] = [m, cur];
+					} catch (e) {
+						ctx.ui.notify(`리뷰 모델(${want.id})로 바꾸지 못해 지금 모델(${cur?.id})로 리뷰합니다: ${(e as Error).message}`, "warning");
+					}
+				}
+			}
+			const who = String(use?.name || use?.id || "지금 모델");
+			// 중계 서버(이 PC 의 127.0.0.1)면 리뷰 뒤 /status 로 그 모델을 실제로 골랐는지 본다 (API 키트의 vLLM 등은 보지 않음)
+			let statusUrl = "";
+			try {
+				const u = new URL(String(use?.baseUrl || ""));
+				if (/^(127\.0\.0\.1|localhost)$/.test(u.hostname)) statusUrl = `${u.origin}/status?session=${encodeURIComponent(SESSION)}`;
+			} catch {}
+			review = { phase: "running", prev, who, wantId: String(use?.id || ""), tools: 0, statusUrl, answer: "" };
+			// 다른 확장도 리뷰 중임을 봄: guard·hooks 는 묻지 않고(막는 것은 여기서), 완료 점검·사용량 제한 뒤 자동 다시 시도는 하지 않음
+			(globalThis as any).__piReview = "running";
+			ctx.ui.notify(`${who} 로 리뷰합니다${prev ? ` (끝나면 ${prev.id} 로 돌아옵니다)` : ""}. 리뷰하는 동안은 파일을 바꾸지 않습니다`, "info");
+			pi.sendUserMessage(userAsk(reviewPrompt(scan, who, focus), `(리뷰: ${who}${focus ? ` · ${focus}` : ""})`));
 		},
 	});
 }

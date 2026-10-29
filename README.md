@@ -137,7 +137,8 @@ pi -p "이 폴더의 파이썬 파일 목록과 역할을 알려줘"     # 한 �
 | 도구 출력 펼치기·접기 | `Ctrl+O` |
 | 모델 고르기 | `/model` 또는 `Ctrl+L` ([4장](#4-모델-설정)) |
 | 지침·스킬을 고친 뒤 다시 읽기 | `/reload` |
-| 자주 하는 일 | 기본 명령 `/init` `/handoff` `/review` `/test` `/commit` `/explain` ([5장](#5-지침-스킬-메모리)) |
+| 리뷰 | `/review [볼 점]`: 바뀐 내용을 한 번 검토하고 고칠지 묻기 (리뷰 모델은 설정의 `review_model`, 없으면 지금 모델. [3-5](#3-5-작업-모드-plan-mode)) |
+| 자주 하는 일 | 기본 명령 `/init` `/handoff` `/test` `/commit` `/explain` ([5장](#5-지침-스킬-메모리)) |
 | 명령 목록 | `/` 를 치면 나옴 |
 | 빠른 도움말 | `/kit` (키, 세션, 명령·스킬 목록, 설정 파일 위치를 편집기 위에 보여 줌. 다시 입력하면 닫힘). 팀 공유 폴더 등록은 `/kit share <폴더>` |
 | 실행 환경(버전)을 알려 두기 | `/kit env` (지금 실행 위치의 Python·주요 패키지·GPU·CUDA·노트북 이미지 버전을 조사해 보여 주고, 원하면 지침 AGENTS.md 에 적음. 다음 요청부터 그 버전에 맞춰 일함) |
@@ -224,6 +225,19 @@ pi 는 기본으로 묻지 않고 바로 고치고 실행합니다 (자동 모�
 - 단계 체크는 LLM 이 답에 `[1단계 완료]` 처럼 적어 줄 때 됩니다. 적지 않으면 목록만 그대로 남고 작업에는 영향이 없습니다.
 - pi 를 시작할 때의 모드는 [8장](#8-설정)의 `default_mode` 로 정합니다 (예: 늘 확인 모드로 시작하려면 `"default_mode": "ask"`).
   `pi -p` 처럼 물을 수 없는 실행은 늘 자동 모드로 시작합니다.
+
+**리뷰하기 (/review)**
+작업을 마친 뒤 `/review` 를 치면 바뀐 내용을 리뷰 모델로 한 번 검토합니다. 볼 점을 덧붙일 수 있습니다 (`/review 보안·경계값 위주`).
+1. 작업 폴더의 바뀐 내용(`git status`, `git diff`, 새 파일의 앞부분)을 모아 요청에 함께 보냅니다.
+2. 리뷰 모델로 바꿔 묻습니다. 리뷰 모델은 내 설정 파일의 `review_model` 이고, 없으면 지금 모델입니다 (같은 대화에서 모델만 바뀜).
+3. 리뷰하는 동안은 파일을 바꾸거나 명령을 실행하지 않습니다. 읽기만 하고, 파일을 더 볼 때도 도구는 4번까지입니다.
+4. 리뷰가 끝나면 바로 원래 모델로 돌아오고, 찾은 것이 있으면 "리뷰(…)에서 찾은 것을 고칠까요?" 를 묻습니다. **고치기** 를 고르면 원래 모델로 고치고 실행·시험해 확인합니다. 문제가 없으면 알리기만 합니다.
+
+- 리뷰 모델로 바꾸지 못하면(모델 목록에 없음, 로그인 없음 등) 알리고 지금 모델로 리뷰합니다.
+- 리뷰가 오류로 끝나거나 Esc 로 멈춰도 원래 모델로 돌아옵니다 (다시 하려면 `/review`).
+- 리뷰 모델은 내 설정 파일의 `review_model` 로 정합니다 (모델 id, 다른 제공자는 `provider/id`, 지금 모델 그대로는 `"same"`. [8장](#8-설정)).
+- 계획 모드에서도 됩니다 (리뷰 답을 계획으로 보지 않음). 고치기를 고르면 계획 모드 그대로라 고칠 계획부터 세웁니다.
+- git 저장소가 아니면 바뀐 내용을 모으지 못해, 이 대화에서 바꾼 파일을 리뷰 모델이 직접 읽습니다 (4번까지).
 
 ### 3-6. 되돌리기 (/undo)
 pi 가 파일을 고치기 직전과 직후 내용을 요청마다 기록해 두고, `/undo` 로 원래대로 돌립니다.
@@ -401,12 +415,12 @@ description: 주간 업무 보고서를 쓸 때 사용. 이번 주 git 기록을
 |---|---|
 | `/init` | 프로젝트를 살펴보고 그 폴더의 `AGENTS.md`(프로젝트 지침) 초안을 씀. 이미 있으면 빠진 내용만 제안 |
 | `/handoff [메모]` | 지금까지 한 일·다음 할 일을 `NOTES.md` 에 정리. 다음 날 `pi -c` 나 새 세션에서 이어 가기 좋음 |
-| `/review [파일·볼 점]` | 커밋하지 않은 변경(git diff)을 검토. 고치지 않고 문제를 심각한 순서로 정리 |
 | `/test [대상]` | 테스트를 돌리고, 실패하면 원인을 찾아 고침 (테스트를 지우거나 건너뛰게 하지 않음) |
 | `/commit [내용]` | 바뀐 내용으로 한국어 커밋 메시지를 써서 커밋 (push 는 하지 않음) |
 | `/explain <파일·함수>` | 코드를 읽고 하는 일·구조·흐름·주의할 점을 설명 |
 
-- 기본 명령은 설치할 때 `~/.pi/agent/prompts/` 에 복사됩니다 (예: `review.md`). 고쳐 써도 됩니다.
+- 기본 명령은 설치할 때 `~/.pi/agent/prompts/` 에 복사됩니다 (예: `test.md`). 고쳐 써도 됩니다.
+- `/review` 는 2026-10-29.1 부터 기본 명령이 아니라 리뷰 명령입니다 ([3-5](#3-5-작업-모드-plan-mode)). 예전 `prompts/review.md` 는 업데이트할 때 고치지 않았으면 `prompts.removed/` 로 옮기고, 고쳤으면 그대로 두지만 쓰이지 않으니 이름을 바꿔 쓰세요 (예: `my-review.md` → `/my-review`).
 - 내 명령은 같은 곳에 `<이름>.md` 로 만듭니다 (형식은 기본 명령 파일을 참고).
 
 ### 팀과 스킬·명령 같이 쓰기
@@ -671,6 +685,7 @@ condition: "(?i)\\b(drop|truncate)\\s+table\\b"
 | `default_mode` | `auto` | pi 를 시작할 때의 작업 모드: `plan`(계획) · `ask`(확인) · `auto`(자동) ([3-5](#3-5-작업-모드-plan-mode)) |
 | `plan_dir` | `"docs/plans"` | 계획 모드에서도 쓸 수 있는 계획서 폴더 (작업 폴더 기준. 이름에 '계획'·'플랜'·'할 일'·`plan`·`todo` 가 든 `.md` 는 작업 폴더 안 어디서나) |
 | `plan_execute_model` | (pi 의 기본 모델) | 승인한 계획을 진행할 모델 (모델 id, 또는 `provider/id`). id 만 적으면 계획을 세운 모델과 제공자가 같을 때만 바꿈. `"same"` 이면 계획을 세운 모델 그대로 ([3-5](#3-5-작업-모드-plan-mode)) |
+| `review_model` | (지금 모델) | `/review` 에 쓸 모델 (모델 id, 또는 `provider/id`). id 만 적으면 지금 모델과 같은 제공자에서. `"same"` 이면 지금 모델 그대로 ([3-5](#3-5-작업-모드-plan-mode)) |
 
 - 작업 기록([5장 메모리](#메모리))은 `/recall off` 로 끕니다 (`~/.pi/agent/work-log/settings.json` 에 적힘). 문서 찾기([3-9](#3-9-설치된-라이브러리의-설명-찾기-docs))의 문서 폴더는 환경 변수 `PI_DOCS_DIR` 로 바꿉니다 (기본 `~/pi-docs`).
 - git 기준점 제안([3-6](#3-6-되돌리기-undo))을 어디서도 받지 않으려면 `~/.pi/agent/git-offer.json` 에 `{"enabled": false}` 를 적습니다 ('아니요' 한 폴더 목록 `declined` 도 이 파일에 있음. 환경 변수 `PI_GIT_OFFER=0` 도 됨). 묻는 창은 2분 안에 답이 없으면 그냥 넘어가고 다음 세션에 다시 묻습니다.
@@ -703,7 +718,7 @@ condition: "(?i)\\b(drop|truncate)\\s+table\\b"
 | `bin/`, `compat/` | 실행기, Node 탐색, Node 20 호환 레이어 |
 | `install.sh`, `update.sh`, `check-node.sh`, `VERSION` | 설치, 새 버전으로 바꾸기, Node 진단 스크립트, 버전 번호 |
 | `profiles/` | 설정 템플릿과 기본 지침(`jupyter`: Kubeflow 노트북용), 확장(`common`: 위험 명령 확인, 작업 모드 `/plan`·`/mode`, 되돌리기 `/undo`, 기억하기 `/remember`·작업 기록 `/recall`, `@파일`, 작업 끝 알림, `/kit`·`/doctor`, 문서 찾기 `/docs`, 사용자에게 묻기 `ask_user`, LLM 위키 `/wiki`, 문서 규칙·완료 점검·문법 확인·훅 `/hooks`, 팀 규칙 `/rules`) |
-| `prompts/`, `skills/` | 기본 명령 6개, 기본 스킬 9개 (설치할 때 `~/.pi/agent` 에 복사) |
+| `prompts/`, `skills/` | 기본 명령 5개, 기본 스킬 9개 (설치할 때 `~/.pi/agent` 에 복사) |
 | `tests/` | 단위 테스트 (`node tests/test_guard.mjs`, `node tests/test_modes.mjs`, `node tests/test_memory.mjs`, `node tests/test_files.mjs`, `node tests/test_merge_config.mjs`, `node tests/test_wiki.mjs`, `node tests/test_kitenv.mjs`, `node tests/test_watch.mjs`, `node tests/test_docs.mjs`, `node tests/test_changelog_notes.mjs`, `node tests/test_hooks.mjs`) |
 | `CHANGELOG.md` | 버전마다 바뀐 점과 바꾼 뒤 할 일 |
 | `docs/` | [한 장 요약](docs/빠른시작.md), [API 연결](docs/API-연결.md), [수동 작업 절차](docs/수동-작업-절차.md), [설치 세부](docs/설치.md), [반입 검토 자료](docs/반입-검토-요청서.md), [runtime 파일 해시 목록](docs/runtime-SHA256SUMS.txt) |

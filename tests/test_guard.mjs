@@ -227,6 +227,11 @@ if (process.platform === "win32") {
 	check("tool_call: bash build.sh 는 묻지 않음", r2 === undefined && asked.length === 1, asked);
 	const r3 = await handlers.tool_call({ toolName: "bash", input: { command: "glab mr merge 3" } }, { hasUI: false, ui: {} });
 	check("tool_call: 물을 수 없으면 막고, 확인을 끄는 법은 알려 주지 않음", r3?.block === true && !/guard"?\s*:\s*false/.test(r3.reason) && r3.reason.includes("피하는 방법"), r3);
+	globalThis.__piReview = "running"; // /review 중: 묻지 않고 이유만 넘김 (modes.ts 가 막음)
+	const ev = { toolName: "bash", input: { command: "bash deploy.sh" } };
+	const rv = await handlers.tool_call(ev, ctx);
+	globalThis.__piReview = undefined;
+	check("tool_call: 리뷰 중에는 묻지 않고 이유(guardReason)만", rv === undefined && asked.length === 1 && String(ev.guardReason || "").length > 0, [rv, asked.length, ev.guardReason]);
 	// 읽기 전용 폴더: 설정 파일의 guard_readonly 로 (write·edit 는 작업 폴더 안이어도 묻고, bash 는 cd 한 뒤의 실행도)
 	const cfgFile = join(d, "bridge.json");
 	writeFileSync(cfgFile, JSON.stringify({ guard_readonly: [join(d, "prod")] }));
