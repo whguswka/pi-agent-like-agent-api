@@ -21,13 +21,19 @@
  *  - 처음 모드는 내 설정 파일 ~/.pi/agent/bridge.json 의 "default_mode": "plan" | "ask" | "auto" (기본 auto)
  *  - 진행한 계획은 단계 목록으로 입력창 위에 보여 주고, LLM 이 "[N단계 완료]" 라고 적으면 체크한다.
  *    목록은 새 계획을 진행하거나 /plan·/mode 를 쓰면 닫히고, 모두 끝난 뒤에는 다음 요청을 보낼 때 닫힌다
+ *  /todo [open|clear] 할 일 목록 (2026-11-02): LLM 이 todo 도구로 만든 목록(단계·하위 단계, 하는 중·끝남)이나 승인한 계획의 단계를
+ *                   입력창 위와 브라우저로 보는 HTML 파일(~/.pi/agent/todo/<프로젝트>.html)에 보인다. 시작·끝 시각과 진행률은 이 확장이 적는다.
+ *                   localhost 서버 없이 파일만: 브라우저가 3초마다 옆의 .data.js 를 다시 읽는다 (file:// 에서도 <script> 는 읽힘)
  *  - guard.ts 와 함께: 계획·확인 모드에서는 guard 가 직접 묻지 않고 이유만 넘겨(event.guardReason) 여기서 한 번에 막거나 묻는다
  *  - 지금 모드는 상태 줄에 보인다 (자동이면 표시 없음)
  */
 
-import { readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPlanDoc, projectRel } from "./lib/paths.ts";
 import { readTarget, runHere, SESSION, shown, target, transformInput, userAsk, workDir } from "./lib/relay.ts";
@@ -601,13 +607,351 @@ export const REVIEW_FIX =
 	"[리뷰 뒤 고치기] 방금 리뷰에서 찾은 것 가운데 이번 작업에 관계된 것을 고치고, 고친 뒤 실행·시험해 확인해 주세요. " +
 	"리뷰가 틀렸다고 보이는 것은 고치지 말고 까닭을 적어 주세요. 사용자 승인이 필요한 일(운영 반영, 지우기 등)은 하지 말고 물어 주세요.";
 
+// ── 할 일 목록: todo 도구, /todo (2026-11-02) ─────────────────────────────
+// 사용자 요청: 지금 작업의 할 일을 pi 가 도는 PC 의 브라우저에서 단계별로 보고, 전체 진행과 시작·끝 시각도 보기.
+//  localhost 서버 대신 HTML 파일 (~/.pi/agent/todo/<프로젝트>.html): 브라우저가 3초마다 옆의 <프로젝트>.data.js 만 다시 읽는다.
+//  모델은 목록과 상태만 보내고, 시각·진행률은 이 확장이 적는다 (모델이 적은 시각은 믿기 어려움). 승인한 계획의 단계도 같은 목록으로
+export type TodoStatus = "todo" | "doing" | "done";
+export type TodoItem = { level: number; text: string; status: TodoStatus; started: number | null; ended: number | null; approx?: boolean };
+export type TodoState = {
+	v: 1;
+	project: string;
+	cwd: string;
+	remote: boolean;
+	source: "todo" | "plan";
+	request: string;
+	created: number;
+	updated: number;
+	updates: number;
+	items: TodoItem[];
+	// 목록이 다 끝나지 않은 채 요청이 끝난 때 (모델이 남은 단계를 고치지 않고 답을 끝냄). 목록을 고치거나 다음 요청이 시작되면 지움
+	stopped?: number | null;
+};
+type TodoLine = { level: number; text: string; status: TodoStatus };
+type TodoMeta = { project: string; cwd: string; remote: boolean; request: string; source?: "todo" | "plan" };
+export const TODO_MAX = 60;
+const TODO_MARKS: Record<string, TodoStatus> = { "": "todo", " ": "todo", "~": "doing", ">": "doing", "-": "doing", "/": "doing", "*": "doing", x: "done", X: "done", v: "done", V: "done", "✓": "done", "✔": "done" };
+export const TODO_GUIDE =
+	"세 단계가 넘는 작업은 시작할 때 todo 로 할 일 목록(단계와, 필요하면 두 칸 들여 쓴 하위 단계)을 만들고, 단계를 시작하거나 끝낼 때 목록 전체를 다시 보낸다. " +
+	"todo 는 그때 할 다른 도구와 같은 답에 함께 보낸다 (todo 만 따로 보내지 않음). 간단한 질문이나 한두 단계 작업에는 쓰지 않는다";
+const TODO_HELP = "목록을 읽지 못했습니다. text 에 '- [ ] 할 일' 처럼 한 줄에 하나씩 적어 주세요 ([~] 하는 중, [x] 끝남, 하위 단계는 두 칸 들여 씀)";
+// 목록을 만든 뒤 작업이 이어지는데 고치지 않으면 도구 결과에 짧은 안내 (2026-11-02 실사용 시험: 처음에 만들고 끝에 한 번에 [x] 만 보내
+//  단계마다의 시각이 모두 어림이 됨). 목록을 고친 뒤 다른 도구가 이만큼 쓰이면, 그래도 고치지 않으면 TODO_NUDGE_AGAIN 번째에 한 번 더
+export const TODO_NUDGE_AT = 3;
+export const TODO_NUDGE_AGAIN = 8;
+export const todoNudge = (cur: string) =>
+	`[할 일 목록] 목록을 고친 뒤로 작업이 이어졌습니다. 끝낸 단계나 새로 시작한 단계가 있으면 다음 블록과 같은 답에 todo 로 목록 전체를 고쳐 보내세요${cur ? ` (목록에서 지금 하는 중: ${cur})` : ""}.`;
+
+/** todo 도구의 text -> 항목. 한 줄에 하나: '- [ ] 할 일', '- [~] 하는 중', '- [x] 끝남'. 들여쓰기(두 칸)나 '1.2' 같은 번호가 하위 단계 */
+export function parseTodo(text: unknown): TodoLine[] {
+	const out: TodoLine[] = [];
+	const widths: number[] = [];
+	for (const line of String(text ?? "").replace(/\r/g, "").split("\n")) {
+		const m = line.match(/^([ \t]*)(?:[-*+•]|(\d{1,3}(?:\.\d{1,3})*)[.)]?)[ \t]+(?:\[([^\]]?)\][ \t]*)?(.*\S)/);
+		if (!m || /^\[.?\]$/.test(m[4])) continue;
+		const width = m[1].replace(/\t/g, "  ").length;
+		while (widths.length && width < widths[widths.length - 1]) widths.pop();
+		if (!widths.length || width > widths[widths.length - 1]) widths.push(width);
+		const level = m[2]?.includes(".") ? m[2].split(".").length - 1 : widths.length - 1; // '1.2' 는 번호대로
+		out.push({ level, text: cut(m[4].replace(/\*\*/g, "").trim(), 120), status: m[3] === undefined ? "todo" : (TODO_MARKS[m[3]] ?? "todo") });
+		if (out.length >= TODO_MAX) break;
+	}
+	// 첫 항목은 0 단계부터, 한 번에 한 단계씩만 깊어지게 (3 단계까지)
+	for (let i = 0; i < out.length; i++) out[i].level = i === 0 ? 0 : Math.min(out[i].level, out[i - 1].level + 1, 3);
+	return out;
+}
+
+/** 항목 번호: 1, 1.1, 1.2, 2 ... */
+export function todoNumbers(items: { level: number }[]): string[] {
+	const c: number[] = [];
+	return items.map((it) => {
+		c.length = it.level + 1;
+		c[it.level] = (c[it.level] || 0) + 1;
+		return Array.from(c, (x) => x || 1).join(".");
+	});
+}
+const hasKids = (items: { level: number }[], i: number) => i + 1 < items.length && items[i + 1].level > items[i].level;
+function endTodo(it: TodoItem, now: number, since: number) {
+	it.status = "done";
+	if (it.ended === null) it.ended = now;
+	if (it.started === null) [it.started, it.approx] = [since, true]; // 시작을 알리지 않고 끝남: 앞 목록을 받은 때부터 (어림)
+}
+/** 하위 단계가 있는 항목: 상태·시작·끝을 하위 단계로 (모두 끝나면 끝남, 하나라도 시작했으면 하는 중) */
+function rollUp(items: TodoItem[]) {
+	for (let i = items.length - 1; i >= 0; i--) {
+		const it = items[i];
+		const kids: TodoItem[] = [];
+		for (let j = i + 1; j < items.length && items[j].level > it.level; j++) if (items[j].level === it.level + 1) kids.push(items[j]);
+		if (!kids.length) continue;
+		const all = kids.every((k) => k.status === "done");
+		it.status = all ? "done" : kids.some((k) => k.status !== "todo") || it.status === "doing" ? "doing" : "todo";
+		// 시작 = 자기와 하위 단계 가운데 가장 이른 시각. 어림(~)은 그 시각이 어림일 때만 (같으면 어림이 아닌 쪽)
+		const starts = [it, ...kids].filter((x) => x.started !== null).sort((a, b) => (a.started as number) - (b.started as number) || Number(!!a.approx) - Number(!!b.approx));
+		it.started = starts.length ? starts[0].started : null;
+		const approx = !!starts[0]?.approx;
+		it.ended = all ? Math.max(...kids.map((k) => k.ended ?? 0)) : null;
+		if (approx) it.approx = true;
+		else delete it.approx;
+	}
+}
+/** 새로 받은 목록에 앞 목록의 시각을 이어 붙인다 (같은 단계·같은 글, 아니면 같은 번호의 자리). 하는 중이 되면 시작, 끝나면 끝 시각 */
+export function mergeTodo(prev: TodoState | null, lines: TodoLine[], now: number, meta: TodoMeta): TodoState {
+	const old = prev?.items || [];
+	const key = (t: string) => t.replace(/\s+/g, " ").trim().toLowerCase();
+	const [oldNo, newNo] = [todoNumbers(old), todoNumbers(lines)];
+	const used = new Set<number>();
+	const find = (ok: (o: TodoItem, k: number) => boolean) => {
+		const j = old.findIndex((o, k) => !used.has(k) && ok(o, k));
+		if (j >= 0) used.add(j);
+		return j;
+	};
+	const match = lines.map((p) => find((o) => o.level === p.level && key(o.text) === key(p.text)));
+	const fresh = !prev || used.size === 0; // 글이 같은 단계가 하나도 없으면 새 작업 (앞 목록의 시각을 쓰지 않음)
+	// 글만 조금 고친 단계: 같은 번호의 자리
+	if (!fresh) lines.forEach((p, i) => match[i] < 0 && (match[i] = find((o, k) => o.level === p.level && oldNo[k] === newNo[i])));
+	const items: TodoItem[] = lines.map((p, i) => {
+		const o = !fresh && match[i] >= 0 ? old[match[i]] : null;
+		const it: TodoItem = { level: p.level, text: p.text, status: p.status, started: o?.started ?? null, ended: o?.ended ?? null };
+		if (o?.approx) it.approx = true;
+		if (p.status === "todo") [it.started, it.ended, it.approx] = [null, null, undefined];
+		if (p.status === "doing") [it.ended, it.started] = [null, it.started ?? now];
+		return it;
+	});
+	const since = fresh ? now : (prev as TodoState).updated;
+	for (let i = 0; i < items.length; i++) {
+		if (lines[i].status !== "done") continue;
+		endTodo(items[i], now, since);
+		// 하위 단계가 있는 단계를 끝났다고 하면 아직 체크하지 않은 하위 단계도 끝난 것으로
+		for (let j = i + 1; j < items.length && items[j].level > items[i].level; j++) if (items[j].status !== "done") endTodo(items[j], now, since);
+	}
+	for (const it of items) if (it.approx === undefined) delete it.approx;
+	rollUp(items);
+	return {
+		v: 1,
+		project: meta.project,
+		cwd: meta.cwd,
+		remote: meta.remote,
+		source: meta.source || "todo",
+		request: (fresh ? meta.request : prev?.request || meta.request) || "",
+		created: fresh ? now : (prev as TodoState).created,
+		updated: now,
+		updates: fresh ? 1 : (prev as TodoState).updates + 1,
+		items,
+	};
+}
+/** 승인한 계획의 단계 -> 목록 (첫 단계는 하는 중) */
+export const planTodo = (steps: string[], now: number, meta: TodoMeta): TodoState =>
+	mergeTodo(null, steps.map((text, i) => ({ level: 0, text, status: i === 0 ? "doing" : "todo" })), now, { ...meta, source: "plan" });
+/** "[N단계 완료]": 맨 위 단계 N (과 그 하위 단계)을 끝내고 다음 단계를 하는 중으로. 바뀌었으면 true */
+export function stepDone(s: TodoState, n: number, now: number): boolean {
+	const tops = s.items.flatMap((it, i) => (it.level === 0 ? [i] : []));
+	const i = tops[n - 1];
+	if (i === undefined || s.items[i].status === "done") return false;
+	const end = i + 1 + s.items.slice(i + 1).findIndex((it) => it.level === 0);
+	for (let j = i; j < (end > i ? end : s.items.length); j++) if (s.items[j].status !== "done") endTodo(s.items[j], now, s.updated);
+	const next = s.items[tops[n]];
+	if (next && next.status === "todo" && !hasKids(s.items, tops[n])) [next.status, next.started] = ["doing", now];
+	rollUp(s.items);
+	[s.updated, s.updates, s.stopped] = [now, s.updates + 1, null];
+	return true;
+}
+export function todoSummary(s: TodoState | null) {
+	const items = s?.items || [];
+	const no = todoNumbers(items);
+	const leaves = items.flatMap((it, i) => (hasKids(items, i) ? [] : [[it, no[i]] as const]));
+	const done = leaves.filter(([it]) => it.status === "done").length;
+	const cur = leaves.find(([it]) => it.status === "doing");
+	const starts = items.map((it) => it.started).filter((x): x is number => x !== null);
+	const all = leaves.length > 0 && done === leaves.length;
+	return {
+		total: leaves.length,
+		done,
+		pct: leaves.length ? Math.round((done * 100) / leaves.length) : 0,
+		current: cur ? `${cur[1]} ${cur[0].text}` : "",
+		all,
+		started: starts.length ? Math.min(...starts) : null,
+		ended: all ? Math.max(...items.map((it) => it.ended ?? 0)) : null,
+	};
+}
+/** 입력창 위 목록 (한 글로: pi 화면은 항목 10개까지만 보여 줌). 승인한 계획은 예전 모양 그대로 */
+export function todoWidget(s: TodoState): string {
+	const sum = todoSummary(s);
+	const no = todoNumbers(s.items);
+	const mark = (it: TodoItem) => (it.status === "done" ? "x" : it.status === "doing" ? "~" : " ");
+	const stop = !sum.all && s.stopped ? " · 요청 끝 (남은 단계 있음)" : "";
+	const head =
+		s.source === "plan"
+			? `── 계획 진행 ${sum.done}/${sum.total}${sum.all ? " · 모두 완료 (다음 요청 때 닫힘)" : stop} · 브라우저: /todo open ──`
+			: `── 할 일 ${sum.done}/${sum.total} (${sum.pct}%)${sum.all ? " · 모두 끝남 (다음 요청 때 닫힘)" : stop} · 브라우저: /todo open ──`;
+	const lines = s.items.map((it, i) => `${"   ".repeat(it.level)} [${mark(it)}] ${no[i]}${s.source === "plan" ? "." : ""} ${it.text}`);
+	return [head, ...lines.slice(0, 12), ...(lines.length > 12 ? [`     … 외 ${lines.length - 12}개`] : [])].join("\n");
+}
+
+const agentDirOf = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+export const todoDir = () => join(agentDirOf(), "todo");
+/** 프로젝트마다 파일 이름: 작업 폴더의 끝 두 이름 + 경로의 짧은 해시 (이름이 같은 다른 폴더와 섞이지 않게). 노트북 폴더는 nb- */
+export function todoKey(cwd: string, remote: boolean): string {
+	const p = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
+	const ci = !remote && process.platform === "win32";
+	const id = (remote ? "nb:" : "pc:") + (ci ? p.toLowerCase() : p);
+	const name =
+		p
+			.split("/")
+			.filter((x) => x && !/^[A-Za-z]:$/.test(x))
+			.slice(-2)
+			.join("-")
+			.replace(/[^\p{L}\p{N}._-]+/gu, "_")
+			.slice(0, 60) || "home";
+	return `${remote ? "nb-" : ""}${name}-${createHash("sha256").update(id).digest("hex").slice(0, 8)}`;
+}
+const safeJson = (x: unknown) => JSON.stringify(x).replace(/</g, "\\u003c");
+export const todoDataJs = (s: TodoState | null) => `window.__piTodoData && window.__piTodoData(${safeJson(s)});\n`;
+/** 브라우저로 여는 쪽: 처음 그릴 목록을 담고, 3초마다 dataFile 을 <script> 로 다시 읽어 바뀌었으면 다시 그린다 (밖의 파일·서버를 쓰지 않음) */
+export function todoHtml(s: TodoState | null, dataFile: string): string {
+	return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pi 할 일</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--mute:#6b7383;--line:#e3e6eb;--todo:#9aa3b2;--doing:#2f6fde;--done:#1f9d57;--warn:#b7791f}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--fg:#e6e9ee;--mute:#98a1b1;--line:#2c323c;--todo:#6f7889;--doing:#6ea0ff;--done:#43c27f;--warn:#e0a84a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI","Malgun Gothic",system-ui,sans-serif}
+main{max-width:980px;margin:0 auto;padding:20px 16px 40px}h1{font-size:20px;margin:0 0 2px}.mute{color:var(--mute)}.small{font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0}
+.bar{height:10px;border-radius:5px;background:var(--line);overflow:hidden;margin:8px 0}.bar i{display:block;height:100%;background:var(--done);width:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px 16px}.grid b{display:block;font-size:12px;color:var(--mute);font-weight:400}
+.lv{margin:4px 0 0}.lv button{border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:2px 10px;margin-right:4px;cursor:pointer}
+.lv button.on{border-color:var(--doing);color:var(--doing)}
+.row{display:flex;gap:10px;align-items:baseline;padding:7px 4px;border-top:1px solid var(--line)}.row:first-child{border-top:0}
+.ic{width:1.2em;text-align:center;flex:none}.no{color:var(--mute);flex:none;min-width:2.6em}.tx{flex:1;min-width:0;overflow-wrap:anywhere}
+.tm{flex:none;text-align:right;font-size:12.5px;color:var(--mute);white-space:nowrap}
+.todo .ic{color:var(--todo)}.doing .ic,.doing .tx{color:var(--doing)}.doing .tx{font-weight:600}.done .ic{color:var(--done)}.done .tx{color:var(--mute)}
+.kids{font-size:12px;color:var(--mute)}.warn{color:var(--warn)}.empty{padding:20px 4px;color:var(--mute)}
+</style></head>
+<body><main>
+<h1 id="title">할 일</h1><div id="sub" class="mute small"></div>
+<div class="card"><div id="head"></div><div class="bar"><i id="fill"></i></div><div class="grid" id="times"></div>
+<div class="lv" id="lv"></div></div>
+<div class="card" id="list"></div>
+<div class="mute small" id="foot"></div>
+</main>
+<script>window.__PI_TODO_INIT = ${safeJson(s)};</script>
+<script>
+(function () {
+  var FILE = ${JSON.stringify(dataFile)};
+  var data = window.__PI_TODO_INIT, seen = Date.now(), fails = 0, depth = 99;
+  try { depth = Number(localStorage.getItem("piTodoDepth")) || 99; } catch (e) {}
+  function $(id) { return document.getElementById(id); }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function p2(n) { return (n < 10 ? "0" : "") + n; }
+  function hms(t) { var d = new Date(t); return p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds()); }
+  function when(t) { if (!t) return "—"; var d = new Date(t); return (d.toDateString() === new Date().toDateString() ? "" : (d.getMonth() + 1) + "/" + d.getDate() + " ") + hms(t); }
+  function dur(ms) { var s = Math.max(0, Math.round(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60); s = s % 60; return h ? h + "시간 " + m + "분" : m ? m + "분 " + s + "초" : s + "초"; }
+  function ago(t) { var s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 60 ? s + "초 전" : s < 3600 ? Math.floor(s / 60) + "분 전" : Math.floor(s / 3600) + "시간 전"; }
+  function nums(items) { var c = []; return items.map(function (it) { c.length = it.level + 1; c[it.level] = (c[it.level] || 0) + 1; return c.map(function (x) { return x || 1; }).join("."); }); }
+  function kids(items, i) { return i + 1 < items.length && items[i + 1].level > items[i].level; }
+  function sum(items) {
+    var leaves = items.filter(function (it, i) { return !kids(items, i); }), done = leaves.filter(function (x) { return x.status === "done"; }).length;
+    var starts = items.map(function (x) { return x.started; }).filter(function (x) { return x; });
+    var all = leaves.length > 0 && done === leaves.length;
+    return { total: leaves.length, done: done, pct: leaves.length ? Math.round(done * 100 / leaves.length) : 0, all: all,
+      started: starts.length ? Math.min.apply(null, starts) : null, ended: all ? Math.max.apply(null, items.map(function (x) { return x.ended || 0; })) : null };
+  }
+  function render() {
+    var d = data, items = (d && d.items) || [];
+    if (!items.length) {
+      $("title").textContent = "할 일"; document.title = "pi 할 일";
+      $("sub").textContent = ""; $("head").textContent = "할 일 목록이 없습니다"; $("fill").style.width = "0"; $("times").innerHTML = ""; $("lv").innerHTML = "";
+      $("list").innerHTML = '<div class="empty">pi 가 여러 단계 작업을 시작하면(todo 도구, 또는 /plan 으로 승인한 계획) 여기에 보입니다. 이 창은 열어 두면 3초마다 새로 읽습니다.</div>';
+      return tick();
+    }
+    var s = sum(items), no = nums(items), max = Math.max.apply(null, items.map(function (x) { return x.level; }));
+    var stopped = d.stopped && !s.all; // 목록이 다 끝나지 않은 채 요청이 끝남 (남은 단계를 pi 의 답에서 확인)
+    $("title").textContent = "할 일 · " + d.project;
+    document.title = (s.all ? "끝남 " : stopped ? "멈춤 " + s.pct + "% " : s.pct + "% ") + "· pi 할 일 · " + d.project;
+    $("sub").textContent = (d.source === "plan" ? "승인한 계획" : "pi 가 만든 목록") + (d.request ? " · 요청: " + d.request : "") + " · " + d.cwd;
+    $("head").innerHTML = "<b>" + (s.all ? "모두 끝남" : (stopped ? '<span class="warn">요청 끝남 · 남은 단계 있음</span> · ' : "") + "진행 " + s.pct + "%") +
+      "</b> <span class=mute>· 끝남 " + s.done + " / " + s.total + "</span>";
+    $("fill").style.width = s.pct + "%";
+    $("times").innerHTML = "<div><b>시작</b>" + when(s.started || d.created) + "</div><div><b>끝</b>" + (s.ended ? when(s.ended) : stopped ? "요청 끝 " + when(d.stopped) : "진행 중") +
+      "</div><div><b>걸린 시간</b><span id=el></span></div><div><b>마지막 갱신</b><span id=up></span></div>";
+    var lv = "";
+    if (max > 0) { [[1, "1단계만"], [2, "2단계까지"], [99, "모두"]].forEach(function (b) { if (b[0] <= max || b[0] === 99) lv += '<button data-d="' + b[0] + '" class="' + (depth === b[0] ? "on" : "") + '">' + b[1] + "</button>"; }); }
+    $("lv").innerHTML = lv;
+    var html = "";
+    items.forEach(function (it, i) {
+      if (it.level >= depth) return;
+      var k = "";
+      if (kids(items, i)) { var t = 0, dn = 0; for (var j = i + 1; j < items.length && items[j].level > it.level; j++) if (!kids(items, j)) { t++; if (items[j].status === "done") dn++; } k = ' <span class=kids>(' + dn + "/" + t + ")</span>"; }
+      // 어림(~): 시작을 알리지 않고 끝난 단계는 앞 목록을 받은 때부터. 처음 목록에서 이미 끝난 단계는 걸린 시간을 모르므로 끝 시각만
+      var tm = !it.started ? "" : it.approx && it.ended && it.ended - it.started < 1000 ? "끝 " + hms(it.ended)
+        : (it.approx ? "~" : "") + hms(it.started) + " → " + (it.ended ? hms(it.ended) + " · " + dur(it.ended - it.started) : '<span class=live data-s="' + it.started + '"></span>');
+      html += '<div class="row ' + it.status + '" style="padding-left:' + (4 + it.level * 24) + 'px"><span class=ic>' + (it.status === "done" ? "●" : it.status === "doing" ? "◐" : "○") +
+        "</span><span class=no>" + no[i] + "</span><span class=tx>" + esc(it.text) + k + "</span><span class=tm>" + tm + "</span></div>";
+    });
+    $("list").innerHTML = html;
+    tick();
+  }
+  function tick() {
+    var d = data, items = (d && d.items) || [], s = sum(items), stop = d && !s.all && d.stopped;
+    if ($("el")) $("el").textContent = s.started ? dur((s.ended || stop || Date.now()) - s.started) : "—";
+    if ($("up") && d) { var stale = !s.all && !stop && Date.now() - d.updated > 10 * 60000; $("up").innerHTML = '<span class="' + (stale ? "warn" : "") + '">' + when(d.updated) + " (" + ago(d.updated) + ")</span>"; }
+    var l = document.querySelectorAll(".live");
+    for (var i = 0; i < l.length; i++) { var st = Number(l[i].getAttribute("data-s")); l[i].textContent = stop ? "하던 중 (요청 끝까지 " + dur(stop - st) + ")" : "하는 중 · " + dur(Date.now() - st); }
+    $("foot").textContent = (fails > 2 ? "목록 파일(" + FILE + ")을 읽지 못하고 있습니다. " : "3초마다 새로 읽음 · ") + "파일: " + FILE + (d ? " · 갱신 " + d.updates + "번" : "");
+  }
+  document.addEventListener("click", function (e) { var b = e.target.closest && e.target.closest("button[data-d]"); if (!b) return; depth = Number(b.getAttribute("data-d")); try { localStorage.setItem("piTodoDepth", depth); } catch (x) {} render(); });
+  window.__piTodoData = function (nd) { seen = Date.now(); fails = 0; if (JSON.stringify(nd) !== JSON.stringify(data)) { data = nd; render(); } };
+  function poll() { var sc = document.createElement("script"); sc.src = FILE + "?r=" + Date.now(); sc.onload = function () { sc.remove(); }; sc.onerror = function () { fails++; sc.remove(); }; document.head.appendChild(sc); }
+  render(); setInterval(poll, 3000); setInterval(tick, 1000);
+})();
+</script></body></html>
+`;
+}
+function writeAtomic(file: string, text: string) {
+	const tmp = `${file}.${process.pid}.tmp`;
+	writeFileSync(tmp, text);
+	try {
+		renameSync(tmp, file);
+	} catch {
+		writeFileSync(file, text); // 다른 프로그램이 잡고 있으면 그냥 덮어씀
+	}
+}
+/** 목록 파일 세 개 (상태 .json, 브라우저가 다시 읽는 .data.js, 여는 .html). 여는 파일의 경로를 돌려준다 */
+export function saveTodo(s: TodoState | null, key: string): string {
+	const dir = todoDir();
+	mkdirSync(dir, { recursive: true });
+	writeAtomic(join(dir, `${key}.json`), `${JSON.stringify(s, null, 1)}\n`);
+	writeAtomic(join(dir, `${key}.data.js`), todoDataJs(s));
+	writeAtomic(join(dir, `${key}.html`), todoHtml(s, `${key}.data.js`));
+	return join(dir, `${key}.html`);
+}
+export function loadTodo(key: string): TodoState | null {
+	try {
+		const s = JSON.parse(readFileSync(join(todoDir(), `${key}.json`), "utf8"));
+		return s && s.v === 1 && Array.isArray(s.items) ? s : null;
+	} catch {
+		return null;
+	}
+}
+/** 기본 브라우저로 여는 명령 (Windows explorer, macOS open, 화면이 있는 Linux xdg-open). PI_TODO_OPEN=0 이면 열지 않음 (시험) */
+export function openCmd(file: string, platform: string = process.platform, env: NodeJS.ProcessEnv = process.env): [string, string[]] | null {
+	if (env.PI_TODO_OPEN === "0") return null;
+	if (platform === "win32") return ["explorer.exe", [file]];
+	if (platform === "darwin") return ["open", [file]];
+	return env.DISPLAY || env.WAYLAND_DISPLAY ? ["xdg-open", [file]] : null;
+}
+
 export default function (pi: ExtensionAPI) {
 	let mode: Mode = (globalThis as any).__piMode; // 확장을 다시 불러와도(/kit share 등) 모드 유지
 	let before: Mode = "auto"; // /plan 으로 끌 때 돌아갈 모드
 	let lastText = ""; // 이번 요청의 마지막 답 (계획인지 볼 때)
 	let planDoc = ""; // 계획 모드에서 쓴 계획서 (도구가 받은 경로. 답에 단계가 없으면 이 파일의 단계로)
 	let asking = false;
-	let steps: { text: string; done: boolean }[] = [];
+	let todo: TodoState | null = null; // 할 일 목록 (todo 도구 또는 승인한 계획). 끝난 목록은 다음 요청 때 화면에서 닫고, 파일에는 남김
+	let lastReq = ""; // 사용자가 마지막으로 보낸 요청의 첫 줄 (목록 머리에)
+	let saveWarned = false;
+	let autoOpened = false;
+	let sinceTodo = 0; // 목록을 고친 뒤 쓰인 다른 도구 수 (todoNudge)
 	// /review: running 리뷰 요청 중, done 끝남 (다음 요청이 시작될 때 지움: 계획 모드의 '진행할까요?' 가 리뷰 답을 계획으로 보지 않게).
 	//  prev: 리뷰 모델로 바꾸기 전의 모델 (바꾸지 않았으면 null), wantId: 리뷰에 쓴 모델 id, answer: 리뷰 답
 	let review: { phase: "running" | "done"; prev: any; who: string; wantId: string; tools: number; statusUrl: string; answer: string } | null = null;
@@ -620,19 +964,50 @@ export default function (pi: ExtensionAPI) {
 		const fg = (c: string, s: string) => (ctx.ui.theme?.fg ? ctx.ui.theme.fg(c, s) : s);
 		ctx.ui.setStatus("mode", m === "plan" ? fg("warning", "계획 모드 · 읽기와 계획서만 (/plan 끄기)") : m === "ask" ? fg("accent", "확인 모드 (/mode 바꾸기)") : undefined);
 	};
+	// 한 글로 넘김: pi 화면은 목록의 항목을 10개까지만 보여 주고 나머지는 "... (widget truncated)" 로 자름 (줄바꿈은 그대로 보임)
 	const showSteps = (ctx: any) => {
 		if (!ctx?.hasUI) return;
-		if (!steps.length) return ctx.ui.setWidget("pi-kit-plan", undefined);
-		const done = steps.filter((s) => s.done).length;
-		const all = done === steps.length;
-		const head = `── 계획 진행 ${done}/${steps.length}${all ? " · 모두 완료 (다음 요청 때 닫힘)" : ""} ──`;
-		const shownSteps = steps.slice(0, 12).map((s, i) => ` [${s.done ? "x" : " "}] ${i + 1}. ${s.text}`);
-		// 한 글로 넘김: pi 화면은 목록의 항목을 10개까지만 보여 주고 나머지는 "... (widget truncated)" 로 자름 (줄바꿈은 그대로 보임)
-		ctx.ui.setWidget("pi-kit-plan", [[head, ...shownSteps, ...(steps.length > 12 ? [`     … 외 ${steps.length - 12}단계`] : [])].join("\n")]);
+		ctx.ui.setWidget("pi-kit-plan", todo?.items.length ? [todoWidget(todo)] : undefined);
+	};
+	const todoWhere = () => {
+		const w = workDir();
+		const cwd = String(w.cwd || process.cwd());
+		const name = cwd.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean).slice(-2).join("/") || cwd;
+		return { cwd, remote: !!w.remote, key: todoKey(cwd, !!w.remote), project: `${w.remote ? "노트북 " : ""}${name}` };
+	};
+	const todoFile = () => join(todoDir(), `${todoWhere().key}.html`);
+	const saveNow = (ctx: any) => {
+		try {
+			return saveTodo(todo, todoWhere().key);
+		} catch (e) {
+			if (!saveWarned) ctx?.ui?.notify?.(`할 일 목록 파일을 쓰지 못했습니다: ${(e as Error).message}`, "warning");
+			saveWarned = true;
+			return "";
+		}
+	};
+	const openTodo = (file: string): boolean => {
+		const c = openCmd(file);
+		if (!c) return false;
+		try {
+			const ch = spawn(c[0], c[1], { detached: true, stdio: "ignore" });
+			ch.on("error", () => {});
+			ch.unref();
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	const setTodo = (ctx: any, next: TodoState | null) => {
+		const fresh = !!next && next.updates === 1;
+		todo = next;
+		const file = saveNow(ctx);
+		showSteps(ctx);
+		// 내 설정 "todo_open": true 면 새 목록이 생길 때 (세션에 한 번) 브라우저로 연다
+		if (fresh && file && ctx?.hasUI && !autoOpened && userConfig().todo_open === true) autoOpened = openTodo(file);
 	};
 	const clearSteps = (ctx: any) => {
-		if (!steps.length) return;
-		steps = [];
+		if (todo?.source !== "plan") return; // /plan·/mode 는 승인한 계획의 목록만 닫음 (todo 로 만든 목록은 그대로)
+		todo = null;
 		showSteps(ctx);
 	};
 
@@ -643,13 +1018,23 @@ export default function (pi: ExtensionAPI) {
 			if (want && ctx.hasUI) return setMode(ctx, want); // pi -p 처럼 물을 수 없는 실행은 늘 자동
 		}
 		setMode(ctx, mode);
+		// 이 프로젝트의 끝나지 않은 목록은 이어서 (pi 를 다시 켜거나 /reload). 끝난 목록은 파일에만 남아 있음
+		const saved = loadTodo(todoWhere().key);
+		if (saved && !todoSummary(saved).all && saved.cwd === todoWhere().cwd) {
+			todo = saved;
+			showSteps(ctx);
+		}
 	});
 
 	// 계획 모드: 요청 앞에 안내 (/ 로 시작하는 명령·템플릿은 그대로 두어야 펼쳐짐)
 	pi.on("input", async (event: any, ctx: any) => {
 		const text = String(event.text || "");
 		if (text.startsWith("/")) return;
-		if (event.source !== "extension" && steps.length && steps.every((s) => s.done)) clearSteps(ctx);
+		if (event.source !== "extension" && text.trim()) lastReq = cut(text.trim().split("\n")[0], 100);
+		if (event.source !== "extension" && todo && todoSummary(todo).all) {
+			todo = null; // 끝난 목록은 화면에서 닫음 (브라우저 파일에는 남음: 다음 목록이 생길 때까지)
+			showSteps(ctx);
+		}
 		if (mode !== "plan" || !text.trim() || review?.phase === "running") return; // 리뷰 요청에는 계획 안내를 붙이지 않음 (리뷰는 따로 읽기만)
 		return transformInput(text, `${planNote(planDir())}\n\n${text}`);
 	});
@@ -669,7 +1054,7 @@ export default function (pi: ExtensionAPI) {
 		const guardWhy: string | undefined = event.guardReason;
 		const problem = tool === "bash" ? readOnlyProblem(String(input.command || "")) : null;
 		if (mode === "plan") {
-			if (READ_TOOLS.has(tool) && !guardWhy) return;
+			if ((READ_TOOLS.has(tool) || tool === "todo") && !guardWhy) return; // 할 일 목록은 작업 폴더를 바꾸지 않음
 			if (tool === "bash" && !problem && !guardWhy) return;
 			const dir = planDir();
 			if ((tool === "write" || tool === "edit") && !guardWhy && isPlanDoc(projectRel(input.path, workDir()), dir)) {
@@ -700,7 +1085,29 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("agent_start", async () => {
+	// 모델이 만든 목록을 작업 중에 고치지 않으면 결과에 안내 (질문을 더 쓰지 않음: 이미 가는 결과에 붙고, todo 는 다음 블록과 함께 돎)
+	pi.on("tool_result", async (event: any) => {
+		if (event.toolName === "todo" || review?.phase === "running" || todo?.source !== "todo" || todoSummary(todo).all) return;
+		sinceTodo++;
+		if (sinceTodo !== TODO_NUDGE_AT && sinceTodo !== TODO_NUDGE_AGAIN) return;
+		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: todoNudge(todoSummary(todo).current) }] };
+	});
+
+	// 요청이 끝났는데 목록이 다 끝나지 않았으면 그 시각을 적음 (브라우저가 '진행 중' 으로 시간을 계속 세지 않게). 다음 요청이 시작되면 지움
+	pi.on("agent_end", async (_event: unknown, ctx: any) => {
+		if (!todo?.items.length || todoSummary(todo).all || review) return;
+		todo.stopped = Date.now();
+		saveNow(ctx);
+		showSteps(ctx);
+	});
+
+	pi.on("agent_start", async (_event: unknown, ctx: any) => {
+		if (todo?.stopped) {
+			todo.stopped = null;
+			saveNow(ctx);
+			showSteps(ctx);
+		}
+		sinceTodo = 0;
 		lastText = "";
 		if (review?.phase === "done") review = null;
 		if (!review) (globalThis as any).__piReview = undefined;
@@ -750,13 +1157,11 @@ export default function (pi: ExtensionAPI) {
 		if (m?.role !== "assistant") return;
 		const text = textOf(m);
 		lastText = m.stopReason === "aborted" || m.stopReason === "error" ? "" : text;
-		if (!steps.length || !text) return;
+		if (!todo?.items.length || !text) return;
 		let changed = false;
-		for (const x of text.matchAll(/(\d{1,2})\s*단계\s*(?:완료|끝)/g)) {
-			const s = steps[Number(x[1]) - 1];
-			if (s && !s.done) changed = s.done = true;
-		}
-		if (changed) showSteps(ctx);
+		const now = Date.now();
+		for (const x of text.matchAll(/(\d{1,2})\s*단계\s*(?:완료|끝)/g)) if (stepDone(todo, Number(x[1]), now)) changed = true;
+		if (changed) setTodo(ctx, todo);
 	});
 
 	/** 승인한 계획을 진행할 모델로 바꾼다 (고급 모델로 계획했으면 기본 모델로). 같은 대화에서 모델만 바뀌므로 계획은 그대로 이어 봄.
@@ -807,8 +1212,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				setMode(ctx, next);
-				steps = found.map((text) => ({ text, done: false }));
-				showSteps(ctx);
+				const w = todoWhere();
+				setTodo(ctx, planTodo(found, Date.now(), { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq }));
 				planDoc = "";
 				await toExecuteModel(ctx);
 				pi.sendUserMessage(userAsk(proceedText(found.length, next, doc), `(계획대로 진행, ${found.length}단계)`));
@@ -858,6 +1263,56 @@ export default function (pi: ExtensionAPI) {
 			// 다른 작업 중이면 그 작업이 끝난 뒤 보내지도록 줄 세움 (그냥 보내면 "이미 처리 중" 오류로 요청이 사라짐. 쉬고 있으면 바로 보냄)
 			if (!ctx.isIdle()) ctx.ui.notify("지금 작업이 끝나면 이 요청을 계획 모드로 이어서 보냅니다", "info");
 			setTimeout(() => pi.sendUserMessage(userAsk(req), { deliverAs: "followUp" }), 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "todo",
+		label: "할 일 목록",
+		description:
+			"지금 작업의 할 일 목록을 만들거나 고친다 (사용자가 입력창 위와 브라우저에서 진행을 본다). text 에 목록 전체를 한 줄에 하나씩: " +
+			"'- [ ] 할 일', '- [~] 하는 중', '- [x] 끝남', 하위 단계는 두 칸 들여 쓴다. 고칠 때도 목록 전체를 다시 보낸다 (시작·끝 시각은 pi 가 적음)",
+		promptSnippet: "여러 단계 작업의 할 일 목록(단계·하위 단계와 진행 상태)을 만들고 고치기",
+		promptGuidelines: [TODO_GUIDE],
+		parameters: Type.Object({ text: Type.String({ description: "할 일 목록 전체 ('- [ ] …' 한 줄에 하나, 하위 단계는 두 칸 들여 씀)" }) }),
+		async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: any) {
+			const reply = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
+			const lines = parseTodo(params?.text);
+			if (!lines.length) return reply(TODO_HELP);
+			const w = todoWhere();
+			const prev = todo && todo.cwd === w.cwd && todo.remote === w.remote ? todo : null;
+			setTodo(ctx, mergeTodo(prev, lines, Date.now(), { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq }));
+			sinceTodo = 0;
+			const s = todoSummary(todo);
+			return reply(`할 일 목록을 고쳤습니다 (끝남 ${s.done}/${s.total}${s.current ? `, 하는 중: ${s.current}` : ""})`);
+		},
+	});
+
+	pi.registerCommand("todo", {
+		description: "할 일 목록 (pi 가 todo 도구나 승인한 계획으로 만든 것): 요약 · /todo open 브라우저로 보기 · /todo clear 지우기",
+		handler: async (args, ctx) => {
+			const sub = String(args || "").trim().toLowerCase();
+			if (sub === "clear" || sub === "지우기") {
+				todo = null;
+				saveNow(ctx);
+				showSteps(ctx);
+				return ctx.ui.notify("할 일 목록을 지웠습니다", "info");
+			}
+			if (sub === "open" || sub === "열기") {
+				const file = existsSync(todoFile()) ? todoFile() : saveNow(ctx) || todoFile();
+				return openTodo(file)
+					? ctx.ui.notify(`브라우저로 엽니다 (창을 열어 두면 3초마다 새로 읽음): ${file}`, "info")
+					: ctx.ui.notify(`여기서는 브라우저를 열 수 없습니다. 이 파일을 브라우저로 여세요: ${file}`, "warning");
+			}
+			if (sub) return ctx.ui.notify("사용법: /todo (요약) · /todo open (브라우저로 보기) · /todo clear (지우기)", "warning");
+			showSteps(ctx);
+			const s = todoSummary(todo);
+			ctx.ui.notify(
+				todo?.items.length
+					? `할 일: 끝남 ${s.done}/${s.total} (${s.pct}%)${s.current ? ` · 하는 중: ${s.current}` : ""}\n브라우저로 보기: /todo open (${todoFile()})`
+					: `할 일 목록이 없습니다. pi 가 여러 단계 작업을 시작하거나 승인한 계획을 진행하면 생깁니다 (브라우저 파일: ${todoFile()})`,
+				"info",
+			);
 		},
 	});
 

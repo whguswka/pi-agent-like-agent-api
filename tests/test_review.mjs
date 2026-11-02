@@ -14,7 +14,9 @@ const T = mkdtempSync(join(tmpdir(), "review-test-"));
 process.env.PI_CODING_AGENT_DIR = join(T, "agent");
 process.env.PI_COPILOT_USER_CONFIG = join(T, "agent", "bridge.json");
 mkdirSync(join(T, "agent"), { recursive: true });
-const jiti = createJiti(import.meta.url, { alias: { "@earendil-works/pi-coding-agent": join(ROOT, "tests/stubs/pi-coding-agent.mjs") } });
+const jiti = createJiti(import.meta.url, {
+	alias: { "@earendil-works/pi-coding-agent": join(ROOT, "tests/stubs/pi-coding-agent.mjs"), typebox: join(ROOT, "runtime/node_modules/typebox/build/index.mjs") },
+});
 const m = await jiti.import("../profiles/common/agent-template/extensions/modes.ts");
 let fails = 0;
 const check = (name, cond, detail = "") => {
@@ -87,7 +89,7 @@ let picks = [];
 let idle = true;
 m.default({
 	on: (e, f) => (on[e] ||= []).push(f), registerCommand: (n, def) => (cmds[n] = def), sendUserMessage: (text, opts) => sent.push({ text, opts }),
-	setModel: async (mm) => (modelSets.push(mm.id), true),
+	setModel: async (mm) => (modelSets.push(mm.id), true), registerTool() {},
 });
 const models = { "gpt-5.6-sol-think": { provider: "copilot", id: "gpt-5.6-sol-think", name: "GPT-5.6 Sol 깊이 생각하기 (Copilot)", baseUrl: base },
 	"gpt-6": { provider: "copilot", id: "gpt-6", name: "GPT-6 (Copilot)", baseUrl: base } };
