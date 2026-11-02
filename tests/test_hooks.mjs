@@ -382,14 +382,20 @@ const waitFor = async (cond, ms = 15000) => {
 	return cond();
 };
 const idleWait = () => new Promise((ok) => setTimeout(ok, 300));
+let lastWrite = 0;
 /** 요청 하나: 시작 -> 도구(쓰기) -> 끝(stopReason) -> 다 끝남. 점검이 따로 돌므로 그 결과(알림·보낸 요청)를 기다림 (none: 아무 일도 없어야 할 때는 잠깐만) */
 async function doneReq(ctx, { write, flag, stop = "stop", tool = "write", none = false, bash = false } = {}) {
+	// 앞 요청이 쓴 파일이 이 요청의 시작(1초 여유)보다 앞서게. 빠른 PC(2026-11 x64)에서는 요청 사이가 1초가 안 되어
+	//  앞 요청의 파일을 이 요청이 바꾼 것으로 보고 14개가 실패함
+	const gap = lastWrite + 1200 - Date.now();
+	if (gap > 0) await new Promise((ok) => setTimeout(ok, gap));
 	await F.emit("agent_start", {}, ctx);
 	if (bash) await F.emit("tool_call", { toolName: "bash", toolCallId: `c${++n}`, input: { command: "python run.py" } }, ctx); // 파일은 바꾸지 않는 명령
 	if (write) {
 		await F.emit("tool_call", { toolName: tool, toolCallId: `c${++n}`, input: { path: write, content: "x" } }, ctx);
 		mkdirSync(dirname(join(CW, write)), { recursive: true });
 		writeFileSync(join(CW, write), `x${n}`);
+		lastWrite = Date.now();
 	}
 	if (flag !== undefined) writeFileSync(join(CW, "flag.txt"), flag);
 	await F.emit("agent_end", { messages: [{ role: "user" }, { role: "assistant", stopReason: stop }] }, ctx);
@@ -409,7 +415,6 @@ ctx = fakeCtx([]);
 await doneReq(ctx, { flag: "ok" }); // pi 가 고친 요청 (파일을 바꾸지 않아도 다시 점검)
 check("보낸 요청이 끝나면 다시 점검: 통과를 알리고 더 보내지 않음 (다시 묻지 않음)",
 	ctx.log.includes("알림:완료 점검 통과: 점검A (고친 뒤 다시 확인)") && !ctx.log.includes("완료 점검") && sent.length === 1, [ctx.log, sent.length]);
-await new Promise((ok) => setTimeout(ok, 1200)); // 앞 요청이 쓴 파일이 이 요청의 시작(1초 여유)보다 앞서게
 ctx = fakeCtx([]);
 await doneReq(ctx, { write: "other/x.txt", flag: "bad", none: true });
 check("when 에 맞는 파일을 바꾸지 않은 요청: 점검하지 않음", ctx.log.length === 0 && sent.length === 1, ctx.log);
@@ -467,6 +472,7 @@ ctx = fakeCtx([]);
 await F.emit("agent_start", {}, ctx);
 await F.emit("tool_call", { toolName: "write", toolCallId: `c${++n}`, input: { path: "src/i.py" } }, ctx);
 writeFileSync(join(CW, "src/i.py"), "x");
+lastWrite = Date.now();
 await F.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
 await F.emit("agent_settled", {}, ctx);
 await new Promise((ok) => setTimeout(ok, 1500));

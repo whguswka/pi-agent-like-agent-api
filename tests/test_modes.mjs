@@ -104,18 +104,23 @@ const ctx = {
 	ui: { notify: (t) => notes.push(t), setStatus() {}, setWidget: (k, v) => widgets.push({ k, v }), select: async (_t, opts) => opts[0], confirm: async () => true },
 };
 const tick = () => new Promise((r) => setTimeout(r, 20));
+// 확장이 setTimeout 으로 따로 하는 일(보내기, 계획서·설정 읽기, 모델 바꾸기)은 보낸 글이 늘 때까지 기다림 (5초까지).
+//  20 ms 만 기다리던 때는 가끔 실패함 (2026-10-29 API 키트에서 2개)
+const sentAfter = async (n0) => {
+	for (const t0 = Date.now(); sent.length <= n0 && Date.now() - t0 < 5000; ) await tick();
+};
 await cmds.plan.handler("/review src", ctx);
 await tick();
 check("/plan /명령: 보내지 않고 직접 입력하라고 알림", sent.length === 0 && notes.at(-1).includes("/review src"), { sent, notes });
 check("/plan /명령: 계획 모드로는 바뀜", globalThis.__piMode === "plan");
 idle = false;
 await cmds.plan.handler("a.py 정리 계획", ctx);
-await tick();
+await sentAfter(0);
 check("/plan <요청>: 다른 작업 중이면 끝난 뒤 보냄 (followUp)", sent.length === 1 && sent[0].text === "a.py 정리 계획" && sent[0].opts?.deliverAs === "followUp" && notes.at(-1).includes("끝나면"), { sent, notes });
 idle = true;
 const nNotes = notes.length;
 await cmds.plan.handler("b.py 도", ctx);
-await tick();
+await sentAfter(1);
 check("/plan <요청>: 쉬고 있으면 바로 보냄 (알림 없음)", sent.length === 2 && sent[1].text === "b.py 도" && notes.length === nNotes, { sent, notes });
 const tr = await on.input[0]({ text: "a.py 정리 계획", source: "extension" }, ctx);
 check("보낸 요청에 계획 모드 안내가 붙음", tr?.action === "transform" && tr.text.startsWith("[계획 모드]") && tr.text.endsWith("a.py 정리 계획"), tr);
@@ -128,8 +133,9 @@ check("계획 모드: 위키 찾기·읽기와 문서 찾기는 쓸 수 있고, 
 const plan = Array.from({ length: 11 }, (_, i) => `${i + 1}. 단계${i + 1}`).join("\n");
 await on.agent_start[0]({}, ctx);
 await on.message_end[0]({ message: { role: "assistant", content: plan } }, ctx);
+const nPlan = sent.length;
 await on.agent_settled[0]({}, ctx);
-await tick();
+await sentAfter(nPlan);
 let w = widgets.at(-1);
 check("진행 목록은 글 하나로 (pi 화면은 항목 10개까지만 보여 줌)", w?.k === "pi-kit-plan" && w.v.length === 1 && w.v[0].split("\n").length === 12 && w.v[0].includes("11. 단계11"), w);
 check("진행을 고르면 자동 모드로 바꾸고 진행 요청", globalThis.__piMode === "auto" && sent.at(-1).text.includes("모두 11단계"), sent.at(-1));
@@ -164,7 +170,7 @@ await on.tool_call[0]({ toolName: "write", input: { path: "docs/plans/정리.md"
 await on.message_end[0]({ message: { role: "assistant", content: "계획서를 docs/plans/정리.md 에 썼습니다. 확인해 주세요." } }, ctx);
 const nSent = sent.length;
 await on.agent_settled[0]({}, ctx);
-await tick();
+await sentAfter(nSent);
 check("답에 단계가 없으면 계획서의 단계로 진행할지 묻고, 진행 요청에 계획서를 적음",
 	sent.length === nSent + 1 && sent.at(-1).text.includes("계획서 docs/plans/정리.md") && sent.at(-1).text.includes("모두 3단계") && globalThis.__piMode === "auto", sent.at(-1));
 // 승인한 계획은 기본 모델로 진행 (2026-10: 고급 모델은 사용량이 적어 계획에만 쓰고 진행은 GPT-5.6 Sol 깊이 생각하기로)
@@ -186,8 +192,9 @@ const approve = async () => {
 	await cmds.plan.handler("", ctx);
 	await on.agent_start[0]({}, ctx);
 	await on.message_end[0]({ message: { role: "assistant", content: "1. 나누기\n2. 시험" } }, ctx);
+	const n0 = sent.length;
 	await on.agent_settled[0]({}, ctx);
-	await tick();
+	await sentAfter(n0);
 };
 let nSet = modelSets.length;
 await approve();

@@ -3,6 +3,10 @@
 버전 번호는 `VERSION` 에 있습니다. 새 버전으로 바꾸면(`update.sh`) 끝에 그 버전의 항목을 보여 줍니다.
 버전마다 바탕이 된 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 의 버전을 함께 적습니다.
 
+## 2026-11-02.1
+작은 고침. 바탕: pi-agent-like-agent 2026-11-02.1.
+- **`/new`·`/resume` 의 '요약을 남길까요' 창:** '/new 을 다시 입력하세요' 를 '/new 를 다시 입력하세요' 로 고쳤습니다 (`/resume` 은 '을' 그대로).
+
 ## 2026-10-29.1
 리뷰 명령 `/review`. 바탕: pi-agent-like-agent 2026-10-29.1.
 - **리뷰하기 `/review`** ([README 3-5](README.md#3-5-작업-모드-plan-mode)):

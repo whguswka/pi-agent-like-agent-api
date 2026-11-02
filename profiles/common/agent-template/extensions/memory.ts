@@ -159,6 +159,8 @@ const isBridge = () => {
 		return false;
 	}
 };
+// 명령 이름 + 조사: '/new 를', '/resume 을' (읽는 소리의 끝에 맞춤. 2026-10-21 시험에서 '/new 을' 로 보임)
+const cmdObj = (cmd: string) => `/${cmd} ${cmd === "new" ? "를" : "을"}`;
 
 /** 프로젝트 = 작업 폴더 (jupyter 모드면 노트북 작업 폴더). key 는 기록 파일 이름, label 은 보여 줄 이름. 노트북에 아직 연결되지 않았으면 null */
 export function projectOf(wd: WorkDir): { key: string; label: string } | null {
@@ -386,7 +388,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				appendLog(file, { t: c.t, handoff: cut(text, 1500) });
 				W.handoff = "done";
-				const again = W.again ? `. 이제 /${W.again} 을 다시 입력하세요` : "";
+				const again = W.again ? `. 이제 ${cmdObj(W.again)} 다시 입력하세요` : "";
 				W.again = "";
 				return say(ctx, `다음 세션에 넘길 요약을 남겼습니다 → ${tildePath(file)} (보기 /recall)${again}`);
 			}
@@ -449,7 +451,8 @@ export default function (pi: ExtensionAPI) {
 		const ok = await ctx.ui.confirm(
 			"다음 세션에 넘길 요약",
 			`이 세션에서 요청 ${W.turns}개를 했습니다. 새 세션이 이어 갈 수 있게 지금까지의 요약을 남길까요?\n` +
-				`모델에게 한 번 묻습니다${isBridge() ? " (사내AI 는 하루 질문 수에 들어감)" : ""}. 요약이 끝나면 /${again} 을 다시 입력하세요.\n` +
+				// 하루 질문 수는 지금 모델이 사내AI 일 때만 (Copilot 에서도 보였음: 설정 파일에 두 중계 서버가 다 있어서)
+				`모델에게 한 번 묻습니다${ctx.model?.provider === "inhouse" ? " (사내AI 는 하루 질문 수에 들어감)" : ""}. 요약이 끝나면 ${cmdObj(again)} 다시 입력하세요.\n` +
 				"아니요: 바로 넘어갑니다 (요청마다 남긴 기록은 요약 없이도 다음 세션에 알려 줌)",
 		);
 		if (!ok) return;

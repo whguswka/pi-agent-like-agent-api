@@ -140,11 +140,12 @@ const sent = [];
 m.default({ on: (e, f) => (on[e] ||= []).push(f), registerCommand: (n, def) => (cmds[n] = def), sendUserMessage: (text, opts) => sent.push({ text, opts }) });
 const notes = [];
 const widgets = [];
+const confirms = [];
 let answer = true;
 const ctx = {
 	hasUI: true,
 	isIdle: () => true,
-	ui: { notify: (t, l) => notes.push([t, l]), setWidget: (k, v) => widgets.push({ k, v }), confirm: async () => answer, select: async (_t, o) => o[0] },
+	ui: { notify: (t, l) => notes.push([t, l]), setWidget: (k, v) => widgets.push({ k, v }), confirm: async (_t, body) => (confirms.push(body), answer), select: async (_t, o) => o[0] },
 };
 const emit = async (e, ev = {}) => {
 	let r;
@@ -203,17 +204,24 @@ await emit("session_start", { reason: "reload" });
 check("/reload 뒤에도 같은 글 (확장을 다시 불러와도)", (await prompt()) === d1);
 
 // /new: 요청이 여럿이면 다음 세션에 넘길 요약을 남길지 묻고, '예' 면 새 세션으로 가지 않고 요약을 부탁
+//  (PC 설정처럼 models.json 에 Copilot·사내AI 중계 서버가 둘 다 있음)
+mkdirSync(join(tmp, "agent"), { recursive: true });
+writeFileSync(join(tmp, "agent", "models.json"), JSON.stringify({ providers: { copilot: { baseUrl: "http://127.0.0.1:8765/v1" }, inhouse: { baseUrl: "http://127.0.0.1:8766/v1" } } }));
 answer = false;
 check("요청이 3개 아래면 묻지 않음", (await emit("session_before_switch", { reason: "new" })) === undefined && !sent.length);
 await turn("다섯 번째 요청", { tools: [["edit", { path: "c.py" }]] });
 answer = true;
+ctx.model = { provider: "copilot", id: "gpt-5.6-sol-think" };
 const sw = await emit("session_before_switch", { reason: "new" });
-await new Promise((r) => setTimeout(r, 20));
+delete ctx.model;
+for (const t0 = Date.now(); !sent.length && Date.now() - t0 < 5000; ) await new Promise((r) => setTimeout(r, 20));
 check("/new: '예' 면 넘어가지 않고 요약을 부탁 (모델에게 한 번)", sw?.cancel === true && sent.length === 1 && sent[0].text === m.HANDOFF_PROMPT, [sw, sent]);
+check("/new 확인 창 (Copilot): 사내AI 의 하루 질문 수는 말하지 않음, '/new 를'",
+	confirms.length === 1 && !confirms[0].includes("사내AI") && confirms[0].includes("요약이 끝나면 /new 를 다시 입력"), confirms);
 await turn(m.HANDOFF_PROMPT, { source: "extension", answer: "목표: 검증 손실까지 텐서보드로\n남은 일: 학습률 그래프\n연락: a@b.co" });
 lg = log();
 check("요약은 기록에 (이메일은 뺌), 끝나면 /new 를 다시 입력하라고, 같은 세션에서 다시 묻지 않음",
-	lg.at(-1).handoff === "목표: 검증 손실까지 텐서보드로\n남은 일: 학습률 그래프\n연락: …" && notes.at(-1)[0].includes("/new 을 다시 입력") && (await emit("session_before_switch", { reason: "new" })) === undefined, [lg.at(-1), notes.at(-1)]);
+	lg.at(-1).handoff === "목표: 검증 손실까지 텐서보드로\n남은 일: 학습률 그래프\n연락: …" && notes.at(-1)[0].includes("/new 를 다시 입력") && (await emit("session_before_switch", { reason: "new" })) === undefined, [lg.at(-1), notes.at(-1)]);
 await emit("session_start", { reason: "new" });
 const d2 = await prompt();
 check("다음 세션: 넘겨받은 요약과 최근 요청", d2.includes("넘겨받은 요약") && d2.includes("남은 일: 학습률 그래프") && d2.includes("다섯 번째 요청") && !d2.includes("HANDOFF") && !d2.includes(m.HANDOFF_PROMPT.slice(0, 20)) && !d2.includes("NOTES.md"), d2);
@@ -224,6 +232,13 @@ check("작업 폴더에 NOTES.md(기본 명령 /handoff 로 정리)가 있으면
 check("기록이 없어도 NOTES.md 가 있으면 알림", m.digestOf([], "x", now, m.DIGEST_MAX, true).includes("NOTES.md"));
 await emit("session_start", { reason: "new" });
 const d4 = await prompt();
+for (const t of ["여섯", "일곱", "여덟"]) await turn(`${t} 번째 요청`, { tools: [["edit", { path: "e.py" }]] });
+answer = false;
+ctx.model = { provider: "inhouse", id: "inhouse-sonnet" };
+check("/resume 확인 창 (사내AI): 하루 질문 수에 들어간다고, '/resume 을', 아니요면 넘어감", (await emit("session_before_switch", { reason: "resume" })) === undefined
+	&& confirms.at(-1).includes("(사내AI 는 하루 질문 수에 들어감)") && confirms.at(-1).includes("요약이 끝나면 /resume 을 다시 입력"), confirms.at(-1));
+delete ctx.model;
+answer = true;
 
 // /recall: 보기, 끄기·켜기, 지우기
 await cmds.recall.handler("", ctx);
