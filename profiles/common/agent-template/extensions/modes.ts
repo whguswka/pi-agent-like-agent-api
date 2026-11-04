@@ -20,7 +20,7 @@
  *  - 자동: 묻지 않고 실행 (위험한 명령만 guard.ts 가 묻는다)
  *  - 처음 모드는 내 설정 파일 ~/.pi/agent/bridge.json 의 "default_mode": "plan" | "ask" | "auto" (기본 auto)
  *  - 진행한 계획은 단계 목록으로 입력창 위에 보여 주고, LLM 이 "[N단계 완료]" 라고 적으면 체크한다.
- *    목록은 새 계획을 진행하거나 /plan·/mode 를 쓰면 닫히고, 모두 끝난 뒤에는 다음 요청을 보낼 때 닫힌다
+ *    진행하던 계획을 계획 모드에서 다듬어 다시 승인하면 그 목록에 이어 붙인다 (끝난 단계는 끝남 그대로). 모두 끝난 뒤에는 다음 요청을 보낼 때 닫힌다
  *  /todo [open|clear] 할 일 목록 (2026-11-02): LLM 이 todo 도구로 만든 목록(단계·하위 단계, 하는 중·끝남)이나 승인한 계획의 단계를
  *                   입력창 위와 브라우저로 보는 HTML 파일(~/.pi/agent/todo/<프로젝트>.html)에 보인다. 시작·끝 시각과 진행률은 이 확장이 적는다.
  *                   localhost 서버 없이 파일만: 브라우저가 3초마다 옆의 .data.js 를 다시 읽는다 (file:// 에서도 <script> 는 읽힘)
@@ -451,10 +451,27 @@ export const planNote = (dir: string) =>
 	"(또는 이름에 '계획'·plan 이 든 .md)에 쓰세요. 계획서 쓰기를 계획의 단계로 넣지는 마세요. " +
 	"필요하면 read 와 읽기 전용 명령(ls, grep, git diff 등)으로 살펴본 뒤 번호를 붙인 단계로 계획을 적어 주세요 " +
 	"(단계마다 할 일과 바꿀 파일). 정해야 할 점이 있으면 계획 끝에 질문으로 적어 주세요. 사용자가 승인하면 그때 진행합니다.";
-const proceedText = (n: number, mode: Mode, doc = "") =>
+const proceedText = (n: number, mode: Mode, doc = "", done: number[] = []) =>
 	`위 계획${doc ? `(계획서 ${doc})` : ""}대로 진행해 주세요. 계획 모드는 끝났고 이제 파일을 바꾸고 명령을 실행할 수 있습니다` +
 	`${mode === "ask" ? " (바꾸기 전에 사용자가 하나씩 확인합니다)" : ""}. ` +
-	`단계 하나를 마칠 때마다 답에 "[N단계 완료]" 라고 적어 주세요 (N 은 단계 번호, 모두 ${n}단계).`;
+	`${done.length ? `이미 끝난 단계(${done.join(", ")}단계)는 다시 하지 말고 남은 단계를 이어서 해 주세요. ` : ""}` +
+	`단계 하나를 마칠 때마다 답에 "[N단계 완료]" 라고 적어 주세요 (N 은 단계 번호, 모두 ${n}단계). ` +
+	`할 일 목록은 pi 가 이 계획의 단계로 이미 만들었습니다 (todo 로 진행을 고칠 때는 같은 ${n}개 단계를 같은 차례로).`;
+/** 계획 모드 안내 뒤에 붙이는 지금 목록 (끝나지 않은 목록이 있을 때). 2026-11-04 사용자: 8단계 계획을 진행하다 계획 모드에서 다듬었더니
+ *  목록이 3단계로 줄어듦 (답에 바뀐 점이나 앞 단계만 번호로 적으면 그것이 새 계획이 됨) -> 고친 계획 전체를 번호로 다시 적게 */
+export function planNow(s: TodoState | null): string {
+	if (!s?.items.length || todoSummary(s).all) return "";
+	const tops = s.items.filter((it) => it.level === 0).slice(0, 20);
+	const done = tops.filter((it) => it.status === "done").length;
+	const what = s.source === "plan" ? "계획" : "할 일 목록";
+	return (
+		`\n\n[지금 진행 중인 ${what}: ${tops.length}단계 중 ${done}단계 끝남]\n` +
+		tops.map((it, i) => `${i + 1}. ${cut(it.text, 70)}${it.status === "done" ? DONE_TAIL : ""}`).join("\n") +
+		`\n이 ${what}을 고치거나 보태는 요청이면 고친 계획 전체를 1단계부터 번호를 붙여 다시 적어 주세요. ` +
+		"바뀌지 않은 단계도 빼거나 '그대로' 로 줄이지 말고 같은 글로 적고, 끝난 단계는 끝에 (끝남) 을 붙입니다. 바뀐 점은 번호 없이 따로 적어 주세요. " +
+		`다른 작업의 계획이면 이 ${what}은 신경 쓰지 않아도 됩니다.`
+	);
+}
 const CHOICES: [string, Mode | null][] = [
 	["진행 (자동: 묻지 않고 실행)", "auto"],
 	["진행 (확인: 바꿀 때마다 확인)", "ask"],
@@ -462,6 +479,10 @@ const CHOICES: [string, Mode | null][] = [
 ];
 
 type Item = { indent: number; n: number; text: string };
+// 다듬은 계획에서 끝난 단계: '(끝남)'·'(완료)'·✅ 같은 표시 -> 단계 글 끝의 DONE_TAIL 하나로 (70자로 자르기 전에 봄)
+const DONE_TAIL = " (끝남)";
+const DONE_END_RE = /(?:\s*[(（[]\s*(?:이미\s*)?(?:끝남|끝났음|끝|완료|완료됨|done)\s*[)）\]]|\s*[✅✔✓☑])\s*$/i;
+const DONE_START_RE = /^[✅✔✓☑]\s*/;
 /** 한 깊이의 번호 목록에서 1부터 이어지는 단계 */
 function stepRun(items: Item[]): string[] {
 	const steps: string[] = [];
@@ -471,15 +492,48 @@ function stepRun(items: Item[]): string[] {
 			if (f.n === 1) steps.length = 0;
 			else continue;
 		}
-		steps.push(cut(f.text.replace(/\*\*/g, "").replace(/[:：]\s*$/, "").trim(), 70));
+		let t = f.text.replace(/\*\*/g, "").replace(/[:：]\s*$/, "").trim();
+		const done = DONE_END_RE.test(t) || DONE_START_RE.test(t);
+		if (done) t = t.replace(DONE_END_RE, "").replace(DONE_START_RE, "").replace(/[:：]\s*$/, "").trim();
+		steps.push(cut(t, 70) + (done ? DONE_TAIL : ""));
 	}
 	return steps;
 }
 /** 답에서 계획 단계 (1. 2. 3. 또는 1단계: 2단계: ... 처음부터 이어지는 번호만, 가장 바깥 목록).
  *  '1. 확인한 것: 2. 계획:' 처럼 번호 붙인 절 안에 계획이 있으면 그 절 안의 목록 (2026-10 시험: 2단계로 잘못 셈) */
+const numbered = (text: string): Item[] =>
+	[...String(text || "").matchAll(/^([ \t]*)(?:#{1,4}[ \t]*)?(?:\*\*)?(\d{1,2})(?:[.)]|[ \t]*단계[ \t]*[:.)]?)(?:\*\*)?[ \t]+(.+)$/gm)].map((m) => ({
+		indent: m[1].replace(/\t/g, "    ").length,
+		n: Number(m[2]),
+		text: m[3],
+	}));
+/** 다듬은 계획: 답의 번호 목록 가운데 진행하던 목록(prev)과 글이 같은 단계가 가장 많은 것. planSteps 가 고른 것보다 많을 때만 (아니면 null).
+ *  2026-11-04: '바뀐 점: 1. 2. 3.' 다음에 전체 계획을 다시 적으면 planSteps 는 앞의 3개를 계획으로 봄 */
+/** 단계 가운데 진행하던 목록의 맨 위 단계와 글이 같은 것의 수 ((끝남) 표시는 빼고 봄) */
+export function replanScore(steps: string[], prev: TodoState | null): number {
+	const key = (t: string) => (t.endsWith(DONE_TAIL) ? t.slice(0, -DONE_TAIL.length) : t).replace(/\s+/g, " ").trim().toLowerCase();
+	const olds = new Set((prev?.items || []).filter((it) => it.level === 0).map((it) => key(it.text)));
+	return steps.filter((s) => olds.has(key(s))).length;
+}
+export function replanSteps(text: string, prev: TodoState | null, picked: string[]): string[] | null {
+	if (!prev?.items.length) return null;
+	const score = (steps: string[]) => replanScore(steps, prev);
+	const found = numbered(text);
+	let best: string[] | null = null;
+	let top = score(picked);
+	for (const indent of new Set(found.map((f) => f.indent))) {
+		const same = found.filter((f) => f.indent === indent);
+		same.forEach((f, i) => {
+			if (f.n !== 1) return;
+			const run = stepRun(same.slice(i));
+			const s = score(run);
+			if (run.length >= 2 && (s > top || (best && s === top && run.length > best.length))) [best, top] = [run, s];
+		});
+	}
+	return best;
+}
 export function planSteps(text: string): string[] {
-	const re = /^([ \t]*)(?:#{1,4}[ \t]*)?(?:\*\*)?(\d{1,2})(?:[.)]|[ \t]*단계[ \t]*[:.)]?)(?:\*\*)?[ \t]+(.+)$/gm;
-	const found: Item[] = [...String(text || "").matchAll(re)].map((m) => ({ indent: m[1].replace(/\t/g, "    ").length, n: Number(m[2]), text: m[3] }));
+	const found = numbered(text);
 	if (!found.length) return [];
 	const top = Math.min(...found.map((f) => f.indent));
 	const outer = stepRun(found.filter((f) => f.indent === top));
@@ -635,12 +689,26 @@ export const TODO_GUIDE =
 	"세 단계가 넘는 작업은 시작할 때 todo 로 할 일 목록(단계와, 필요하면 두 칸 들여 쓴 하위 단계)을 만들고, 단계를 시작하거나 끝낼 때 목록 전체를 다시 보낸다. " +
 	"todo 는 그때 할 다른 도구와 같은 답에 함께 보낸다 (todo 만 따로 보내지 않음). 간단한 질문이나 한두 단계 작업에는 쓰지 않는다";
 const TODO_HELP = "목록을 읽지 못했습니다. text 에 '- [ ] 할 일' 처럼 한 줄에 하나씩 적어 주세요 ([~] 하는 중, [x] 끝남, 하위 단계는 두 칸 들여 씀)";
+export const TODO_PLAN_MODE =
+	"계획 모드라 할 일 목록은 그대로 두었습니다. 계획은 답에 번호를 붙인 단계로 적어 주세요 (사용자가 계획을 승인하면 그 단계로 목록이 바뀝니다)";
 // 목록을 만든 뒤 작업이 이어지는데 고치지 않으면 도구 결과에 짧은 안내 (2026-11-02 실사용 시험: 처음에 만들고 끝에 한 번에 [x] 만 보내
 //  단계마다의 시각이 모두 어림이 됨). 목록을 고친 뒤 다른 도구가 이만큼 쓰이면, 그래도 고치지 않으면 TODO_NUDGE_AGAIN 번째에 한 번 더
 export const TODO_NUDGE_AT = 3;
 export const TODO_NUDGE_AGAIN = 8;
-export const todoNudge = (cur: string) =>
-	`[할 일 목록] 목록을 고친 뒤로 작업이 이어졌습니다. 끝낸 단계나 새로 시작한 단계가 있으면 다음 블록과 같은 답에 todo 로 목록 전체를 고쳐 보내세요${cur ? ` (목록에서 지금 하는 중: ${cur})` : ""}.`;
+export const todoNudge = (cur: string, plan = 0) =>
+	`[할 일 목록] 목록을 고친 뒤로 작업이 이어졌습니다. 끝낸 단계나 새로 시작한 단계가 있으면 다음 블록과 같은 답에 ` +
+	`${plan ? `todo 로 계획의 ${plan}개 단계를 같은 차례로 보내 고쳐 주세요 (또는 답에 "[N단계 완료]")` : "todo 로 목록 전체를 고쳐 보내세요"}${cur ? ` (목록에서 지금 하는 중: ${cur})` : ""}.`;
+/** 승인한 계획을 진행하는 중에 모델이 todo 로 보낸 목록: 맨 위 단계 수가 계획과 같으면 단계 글은 계획대로 두고 진행(과 하위 단계)만 받음.
+ *  다르면 null (목록을 바꾸지 않음). 2026-11-04 실제 Copilot: 승인 바로 뒤 모델이 제 글로 쓴 8단계를 todo 로 보내, 글이 겹치지 않아 계획 목록이 새 목록으로 바뀜
+ *  (단계 수가 적었으면 계획의 단계가 사라짐) */
+export function fitPlan(plan: TodoState, lines: TodoLine[]): TodoLine[] | null {
+	const tops = plan.items.filter((it) => it.level === 0);
+	if (lines.filter((l) => l.level === 0).length !== tops.length) return null;
+	let k = 0;
+	return lines.map((l) => (l.level === 0 ? { ...l, text: tops[k++].text } : l));
+}
+export const todoPlanKeep = (n: number) =>
+	`승인한 계획의 단계 목록(${n}단계)이 이미 있어 목록은 그대로 두었습니다. 진행은 답에 "[N단계 완료]" 라고 적거나, todo 로 같은 ${n}개 단계를 같은 차례로 보내 고치세요 (하위 단계는 두 칸 들여 씀)`;
 
 /** todo 도구의 text -> 항목. 한 줄에 하나: '- [ ] 할 일', '- [~] 하는 중', '- [x] 끝남'. 들여쓰기(두 칸)나 '1.2' 같은 번호가 하위 단계 */
 export function parseTodo(text: unknown): TodoLine[] {
@@ -742,6 +810,21 @@ export function mergeTodo(prev: TodoState | null, lines: TodoLine[], now: number
 /** 승인한 계획의 단계 -> 목록 (첫 단계는 하는 중) */
 export const planTodo = (steps: string[], now: number, meta: TodoMeta): TodoState =>
 	mergeTodo(null, steps.map((text, i) => ({ level: 0, text, status: i === 0 ? "doing" : "todo" })), now, { ...meta, source: "plan" });
+/** 계획을 다듬어 다시 승인: 끝나지 않은 목록(prev)이 있으면 이어 붙임. 앞 목록에서 끝난 단계와 글이 같거나 (끝남) 을 붙인 단계는 끝남,
+ *  남은 첫 단계가 하는 중. 같은 단계의 시작·끝 시각과 처음 요청은 이어 감 (겹치는 단계가 없으면 mergeTodo 가 새 목록으로) */
+export function replanTodo(prev: TodoState | null, steps: string[], now: number, meta: TodoMeta): TodoState {
+	const old = prev?.items.length && !todoSummary(prev).all ? prev : null;
+	const key = (t: string) => t.replace(/\s+/g, " ").trim().toLowerCase();
+	const doneOld = new Set((old?.items || []).filter((it) => it.level === 0 && it.status === "done").map((it) => key(it.text)));
+	const lines: TodoLine[] = steps.map((s) => {
+		const marked = s.endsWith(DONE_TAIL);
+		const text = marked ? s.slice(0, -DONE_TAIL.length) : s;
+		return { level: 0, text, status: marked || doneOld.has(key(text)) ? "done" : "todo" };
+	});
+	const first = lines.find((l) => l.status !== "done");
+	if (first) first.status = "doing";
+	return mergeTodo(old, lines, now, { ...meta, source: "plan" });
+}
 /** "[N단계 완료]": 맨 위 단계 N (과 그 하위 단계)을 끝내고 다음 단계를 하는 중으로. 바뀌었으면 true */
 export function stepDone(s: TodoState, n: number, now: number): boolean {
 	const tops = s.items.flatMap((it, i) => (it.level === 0 ? [i] : []));
@@ -1005,10 +1088,11 @@ export default function (pi: ExtensionAPI) {
 		// 내 설정 "todo_open": true 면 새 목록이 생길 때 (세션에 한 번) 브라우저로 연다
 		if (fresh && file && ctx?.hasUI && !autoOpened && userConfig().todo_open === true) autoOpened = openTodo(file);
 	};
-	const clearSteps = (ctx: any) => {
-		if (todo?.source !== "plan") return; // /plan·/mode 는 승인한 계획의 목록만 닫음 (todo 로 만든 목록은 그대로)
-		todo = null;
-		showSteps(ctx);
+	// /plan·/mode 는 목록을 닫지 않음: 진행하던 계획을 계획 모드에서 다듬으면 그 목록에 이어 붙임 (replanTodo). 끝난 목록은 다음 요청 때 닫힘.
+	//  2026-11-04 전에는 승인한 계획의 목록을 닫아서, 다듬은 계획을 승인하면 끝난 단계까지 처음부터 다시 셈
+	const openTodoOf = () => {
+		const w = todoWhere();
+		return todo?.items.length && !todoSummary(todo).all && todo.cwd === w.cwd && todo.remote === w.remote ? todo : null;
 	};
 
 	pi.on("session_start", async (_event: unknown, ctx: any) => {
@@ -1036,7 +1120,7 @@ export default function (pi: ExtensionAPI) {
 			showSteps(ctx);
 		}
 		if (mode !== "plan" || !text.trim() || review?.phase === "running") return; // 리뷰 요청에는 계획 안내를 붙이지 않음 (리뷰는 따로 읽기만)
-		return transformInput(text, `${planNote(planDir())}\n\n${text}`);
+		return transformInput(text, `${planNote(planDir())}${planNow(openTodoOf())}\n\n${text}`);
 	});
 
 	pi.on("tool_call", async (event: any, ctx: any) => {
@@ -1087,10 +1171,12 @@ export default function (pi: ExtensionAPI) {
 
 	// 모델이 만든 목록을 작업 중에 고치지 않으면 결과에 안내 (질문을 더 쓰지 않음: 이미 가는 결과에 붙고, todo 는 다음 블록과 함께 돎)
 	pi.on("tool_result", async (event: any) => {
-		if (event.toolName === "todo" || review?.phase === "running" || todo?.source !== "todo" || todoSummary(todo).all) return;
+		// 승인한 계획의 목록에도 (2026-11-04 실제 Copilot: "[N단계 완료]" 는 마지막 답에 한꺼번에 적어 진행 중에는 0/8 그대로)
+		if (event.toolName === "todo" || review?.phase === "running" || !todo?.items.length || todoSummary(todo).all || mode === "plan") return;
 		sinceTodo++;
 		if (sinceTodo !== TODO_NUDGE_AT && sinceTodo !== TODO_NUDGE_AGAIN) return;
-		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: todoNudge(todoSummary(todo).current) }] };
+		const plan = todo.source === "plan" ? todo.items.filter((it) => it.level === 0).length : 0;
+		return { content: [...(Array.isArray(event.content) ? event.content : []), { type: "text", text: todoNudge(todoSummary(todo).current, plan) }] };
 	});
 
 	// 요청이 끝났는데 목록이 다 끝나지 않았으면 그 시각을 적음 (브라우저가 '진행 중' 으로 시간을 계속 세지 않게). 다음 요청이 시작되면 지움
@@ -1161,7 +1247,10 @@ export default function (pi: ExtensionAPI) {
 		let changed = false;
 		const now = Date.now();
 		for (const x of text.matchAll(/(\d{1,2})\s*단계\s*(?:완료|끝)/g)) if (stepDone(todo, Number(x[1]), now)) changed = true;
-		if (changed) setTodo(ctx, todo);
+		if (changed) {
+			setTodo(ctx, todo);
+			sinceTodo = 0;
+		}
 	});
 
 	/** 승인한 계획을 진행할 모델로 바꾼다 (고급 모델로 계획했으면 기본 모델로). 같은 대화에서 모델만 바뀌므로 계획은 그대로 이어 봄.
@@ -1187,7 +1276,8 @@ export default function (pi: ExtensionAPI) {
 	//  계획서 읽기도 따로: jupyter 모드에서는 노트북을 거쳐 오래 걸릴 수 있고, 그동안 pi 는 새 입력을 미룸)
 	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
 		if (mode !== "plan" || asking || !ctx.hasUI || review) return; // 리뷰 답(번호 목록)은 계획이 아님
-		const fromAnswer = planSteps(lastText);
+		const picked = planSteps(lastText);
+		const fromAnswer = replanSteps(lastText, openTodoOf(), picked) || picked;
 		const doc0 = planDoc;
 		if (fromAnswer.length < 2 && !doc0) return;
 		asking = true;
@@ -1195,28 +1285,40 @@ export default function (pi: ExtensionAPI) {
 			try {
 				let found = fromAnswer;
 				let doc = fromAnswer.length >= 2 ? doc0 : "";
-				if (found.length < 2) {
-					// 계획을 계획서로만 남기고 답에는 '계획서를 썼다' 만 적은 경우 (30초 넘게 걸리면 보지 않음)
+				const old = openTodoOf();
+				// 계획을 계획서로만 남기고 답에는 '계획서를 썼다' 만 적은 경우, 또는 진행하던 계획을 계획서에서 다듬고 답에는 바뀐 점만 번호로 적은 경우
+				//  (계획서 쪽이 진행하던 목록과 겹치는 단계가 더 많으면 계획서로). 30초 넘게 걸리면 보지 않음
+				if (doc0 && (found.length < 2 || old)) {
 					try {
 						let timer: any;
 						const b = await Promise.race([readTarget(target(doc0)), new Promise<null>((ok) => (timer = setTimeout(() => ok(null), 30000)))]).finally(() => clearTimeout(timer));
-						const fromDoc = planSteps(b ? b.toString("utf8") : "");
-						if (fromDoc.length >= 2) [found, doc] = [fromDoc, doc0];
+						const docText = b ? b.toString("utf8") : "";
+						const fromDoc0 = planSteps(docText);
+						const fromDoc = replanSteps(docText, old, fromDoc0) || fromDoc0;
+						if (fromDoc.length >= 2 && (found.length < 2 || replanScore(fromDoc, old) > replanScore(found, old))) [found, doc] = [fromDoc, doc0];
 					} catch {}
 				}
 				if (found.length < 2) return;
-				const pick = await ctx.ui.select(`이 계획대로 진행할까요? (${found.length}단계)`, CHOICES.map((c) => c[0]));
+				// 진행하던 목록이 있으면 (계획을 다듬음) 이어 붙인 모양을 미리 보고, 단계 수가 바뀌는 것을 묻는 창에 적음
+				const w = todoWhere();
+				const meta = { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq };
+				const oldN = old ? old.items.filter((it) => it.level === 0).length : 0;
+				const nDone = replanTodo(old, found, Date.now(), meta).items.filter((it) => it.status === "done").length;
+				const pick = await ctx.ui.select(
+					`이 계획대로 진행할까요? (${found.length}단계${nDone ? `, 그중 ${nDone}단계는 끝남` : ""}${old ? ` · 지금 목록 ${oldN}단계를 이 계획으로 바꿈` : ""})`,
+					CHOICES.map((c) => c[0]),
+				);
 				const next = CHOICES.find((c) => c[0] === pick)?.[1];
 				if (!next || mode !== "plan") {
 					if (mode === "plan") ctx.ui.notify("계획 모드를 유지합니다. 고칠 점을 적어 보내세요 (/plan 으로 끄기)", "info");
 					return;
 				}
 				setMode(ctx, next);
-				const w = todoWhere();
-				setTodo(ctx, planTodo(found, Date.now(), { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq }));
+				setTodo(ctx, replanTodo(openTodoOf(), found, Date.now(), meta));
+				const done = (todo?.items || []).flatMap((it, i) => (it.status === "done" ? [i + 1] : []));
 				planDoc = "";
 				await toExecuteModel(ctx);
-				pi.sendUserMessage(userAsk(proceedText(found.length, next, doc), `(계획대로 진행, ${found.length}단계)`));
+				pi.sendUserMessage(userAsk(proceedText(found.length, next, doc, done), `(계획대로 진행, ${found.length}단계)`));
 			} catch (e) {
 				// 여기서 던지면 처리되지 않은 오류로 pi 가 꺼질 수 있음
 				try {
@@ -1247,7 +1349,6 @@ export default function (pi: ExtensionAPI) {
 		description: "계획 모드 켜기·끄기 (켜면 파일을 바꾸지 않고 계획부터, 승인하면 진행). /plan <요청> 은 계획 모드로 바로 요청",
 		handler: async (args, ctx) => {
 			const req = String(args || "").trim();
-			clearSteps(ctx);
 			if (mode === "plan" && !req) {
 				setMode(ctx, before === "plan" ? "auto" : before);
 				return ctx.ui.notify(`계획 모드를 껐습니다 (지금: ${LABEL[mode]} 모드)`, "info");
@@ -1277,11 +1378,21 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({ text: Type.String({ description: "할 일 목록 전체 ('- [ ] …' 한 줄에 하나, 하위 단계는 두 칸 들여 씀)" }) }),
 		async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: any) {
 			const reply = (text: string) => ({ content: [{ type: "text" as const, text }], details: undefined });
-			const lines = parseTodo(params?.text);
+			// 계획 모드에서는 목록을 바꾸지 않음 (2026-11-04: 진행하던 8단계 계획을 다듬는 동안 모델이 '끝난 두 단계 + 계획 보완' 3줄을 보내면
+			//  목록이 그것으로 바뀜). 승인한 계획이 목록이 됨
+			if (mode === "plan") return reply(TODO_PLAN_MODE);
+			let lines = parseTodo(params?.text);
 			if (!lines.length) return reply(TODO_HELP);
 			const w = todoWhere();
 			const prev = todo && todo.cwd === w.cwd && todo.remote === w.remote ? todo : null;
-			setTodo(ctx, mergeTodo(prev, lines, Date.now(), { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq }));
+			// 진행 중인 승인한 계획: 같은 단계 수일 때만 진행을 받고 글은 계획대로 (다르면 그대로 두고 고치는 법을 알림)
+			const plan = prev?.source === "plan" && !todoSummary(prev).all ? prev : null;
+			if (plan) {
+				const fit = fitPlan(plan, lines);
+				if (!fit) return reply(todoPlanKeep(plan.items.filter((it) => it.level === 0).length));
+				lines = fit;
+			}
+			setTodo(ctx, mergeTodo(prev, lines, Date.now(), { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq, ...(plan ? { source: "plan" as const } : {}) }));
 			sinceTodo = 0;
 			const s = todoSummary(todo);
 			return reply(`할 일 목록을 고쳤습니다 (끝남 ${s.done}/${s.total}${s.current ? `, 하는 중: ${s.current}` : ""})`);
@@ -1332,7 +1443,6 @@ export default function (pi: ExtensionAPI) {
 				want = opts.find((o) => o[0] === pick)?.[1];
 				if (!want) return;
 			}
-			clearSteps(ctx);
 			if (want === "plan" && mode !== "plan") before = mode;
 			setMode(ctx, want);
 			ctx.ui.notify(`${LABEL[want]} 모드${want === "plan" ? ": 파일을 바꾸지 않고 계획부터 세웁니다" : want === "ask" ? ": 바꾸기 전에 내용을 보여 주고 묻습니다" : ": 묻지 않고 실행합니다 (위험한 명령만 확인)"}`, "info");

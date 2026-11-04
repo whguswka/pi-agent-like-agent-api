@@ -276,6 +276,33 @@ check("승인한 계획: 단계 목록, 첫 단계는 하는 중", pl.source ===
 check("[N단계 완료]: 그 단계를 끝내고 다음 단계를 하는 중으로, 이미 끝났거나 없는 단계는 그대로",
 	m.stepDone(pl, 1, 2000) && pl.items[0].ended === 2000 && pl.items[1].status === "doing" && pl.items[1].started === 2000 && !m.stepDone(pl, 1, 2500) && !m.stepDone(pl, 9, 2500)
 	&& m.stepDone(pl, 3, 3000) && pl.items[2].approx === true && pl.items[2].started === 2000, pl.items);
+// 계획을 다듬어 다시 승인 (2026-11-04 사용자: 8단계 계획을 진행하다 계획 모드에서 다듬었더니 1~2단계만 남고 3개로 줄어듦)
+check("계획 단계: 끝난 단계 표시 ((끝남)·(완료)·✅) 는 글 끝의 (끝남) 하나로, 70자로 자르기 전에 봄",
+	JSON.stringify(m.planSteps("1. 가 (끝남)\n2. ✅ 나:\n3. **다** (완료)\n4. 라")) === JSON.stringify(["가 (끝남)", "나 (끝남)", "다 (끝남)", "라"])
+	&& m.planSteps(`1. ${"가".repeat(90)} (끝남)\n2. 나`)[0].endsWith("… (끝남)"), [m.planSteps("1. 가 (끝남)\n2. ✅ 나:\n3. **다** (완료)\n4. 라"), m.planSteps(`1. ${"가".repeat(90)} (끝남)\n2. 나`)[0]]);
+const S8 = Array.from({ length: 8 }, (_, i) => `단계${i + 1}`);
+const p8 = m.planTodo(S8, 1000, meta);
+m.stepDone(p8, 1, 2000);
+m.stepDone(p8, 2, 3000);
+const r8 = m.replanTodo(p8, ["단계1", "단계2 (끝남)", "단계3 + 시험", ...S8.slice(3)], 4000, { ...meta, request: "계획 보완" });
+check("다듬은 계획: 끝난 단계는 끝남과 시각 그대로, 남은 첫 단계가 하는 중 (시작 시각 이어 감), 처음 요청·만든 때 그대로",
+	r8.items.length === 8 && r8.items[0].status === "done" && r8.items[0].ended === 2000 && r8.items[1].ended === 3000 && r8.items[2].status === "doing" && r8.items[2].text === "단계3 + 시험"
+	&& r8.items[2].started === 3000 && r8.items[3].status === "todo" && r8.created === 1000 && r8.request === meta.request && r8.updates === p8.updates + 1 && r8.source === "plan", r8.items);
+const rNew = m.replanTodo(p8, ["전혀 다른 일", "둘째 (끝남)"], 5000, { ...meta, request: "새 일" });
+const rDone = m.replanTodo(m.mergeTodo(null, m.parseTodo("- [x] 단계1"), 1, meta), ["단계1", "단계2"], 6000, meta);
+check("다듬은 계획: 겹치는 단계가 없으면 새 목록 ((끝남) 표시만 끝남), 끝난 목록이나 목록이 없으면 처음부터",
+	rNew.created === 5000 && rNew.request === "새 일" && rNew.items[0].status === "doing" && rNew.items[1].status === "done" && rNew.items[1].text === "둘째"
+	&& rDone.items[0].status === "doing" && rDone.updates === 1 && m.replanTodo(null, ["가", "나"], 1, meta).items[0].status === "doing", [rNew.items, rDone.items]);
+const CHANGED = "바뀐 점:\n1. 3단계에 시험 추가\n2. 6단계 뺌\n3. 끝에 정리\n\n고친 계획:\n" + ["단계1 (끝남)", "단계2 (끝남)", "단계3 + 시험", "단계4", "단계5", "단계7", "단계8", "정리"].map((s, i) => `${i + 1}. ${s}`).join("\n");
+check("다듬은 답: 앞의 '바뀐 점' 번호 목록보다 진행하던 목록과 겹치는 단계가 많은 전체 계획을 고름 (더 나은 것이 없으면 null)",
+	JSON.stringify(m.planSteps(CHANGED)) === JSON.stringify(["3단계에 시험 추가", "6단계 뺌", "끝에 정리"]) && m.replanSteps(CHANGED, p8, m.planSteps(CHANGED))?.length === 8
+	&& m.replanSteps(CHANGED, p8, m.planSteps(CHANGED))[0] === "단계1 (끝남)" && m.replanSteps(PLAN8_OK(), p8, m.planSteps(PLAN8_OK())) === null && m.replanSteps(CHANGED, null, []) === null,
+	m.replanSteps(CHANGED, p8, m.planSteps(CHANGED)));
+function PLAN8_OK() { return S8.map((s, i) => `${i + 1}. ${s}`).join("\n"); }
+check("계획 모드 안내 뒤의 지금 목록: 끝나지 않은 목록만, 끝난 단계에 (끝남), 전체를 다시 적으라고 (바뀐 점은 번호 없이)",
+	m.planNow(p8).includes("[지금 진행 중인 계획: 8단계 중 2단계 끝남]") && m.planNow(p8).includes("\n1. 단계1 (끝남)\n2. 단계2 (끝남)\n3. 단계3\n") && m.planNow(p8).includes("고친 계획 전체를 1단계부터")
+	&& m.planNow(p8).includes("바뀐 점은 번호 없이") && m.planNow(null) === "" && m.planNow(m.mergeTodo(null, m.parseTodo("- [x] a"), 1, meta)) === ""
+	&& m.planNow(t1).includes("[지금 진행 중인 할 일 목록:"), m.planNow(p8));
 check("입력창 위 목록: 계획은 예전 모양 (계획 진행 n/m, [x] 1. 단계), 할 일은 들여 쓴 하위 단계와 [~]·진행률·브라우저 안내",
 	m.todoWidget(pl).startsWith("── 계획 진행 2/3") && m.todoWidget(pl).includes(" [x] 1. 준비") && m.todoWidget(pl).includes(" [~] 2. 실행")
 	&& m.todoWidget(t2).includes("── 할 일 1/4 (25%)") && m.todoWidget(t2).includes("    [~] 2.1 나1") && m.todoWidget(t2).includes("/todo open"), [m.todoWidget(pl), m.todoWidget(t2)]);
@@ -341,6 +368,62 @@ await on.input[0]({ text: "다음 일", source: "interactive" }, ctx);
 check("끝난 목록은 다음 요청 때 입력창 위에서 닫히고 파일에는 남음", widgets.at(-1).v === undefined && JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).items.length === 4);
 await cmds.todo.handler("clear", ctx);
 check("/todo clear: 목록 파일을 비움 (브라우저는 '목록 없음')", rd(join(tdir, `${key}.data.js`), "utf8").includes("window.__piTodoData(null)"));
+// 가짜 pi 로: 8단계 계획 진행 -> 1~2단계 끝 -> /plan 으로 다시 계획 모드 -> 다듬기 -> 승인 (2026-11-04 사용자 보고)
+const items = () => JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).items;
+const titles = [];
+const select0 = ctx.ui.select;
+ctx.ui.select = async (t, opts) => (titles.push(t), opts[0]);
+const answerPlan = async (text) => {
+	await on.agent_start[0]({}, ctx);
+	await on.message_end[0]({ message: { role: "assistant", content: text } }, ctx);
+	const n0 = sent.length;
+	for (const f of on.agent_settled) await f({}, ctx);
+	await sentAfter(n0);
+};
+globalThis.__piMode = "auto";
+await cmds.mode.handler("auto", ctx);
+await cmds.plan.handler("", ctx);
+await answerPlan(PLAN8_OK());
+check("진행 요청: 할 일 목록은 pi 가 계획의 단계로 이미 만들었다고 (todo 로 고칠 때는 같은 단계 수·차례)",
+	sent.at(-1).text.includes("할 일 목록은 pi 가 이 계획의 단계로 이미 만들었습니다") && sent.at(-1).text.includes("같은 8개 단계를 같은 차례로"), sent.at(-1).text);
+// 계획 진행 중에 모델이 제 글로 쓴 목록을 todo 로 보냄 (2026-11-04 실제 Copilot: 계획 목록이 새 목록으로 바뀜)
+const nudges = [];
+for (let i = 1; i <= m.TODO_NUDGE_AT; i++) nudges.push(await tr2("bash"));
+check(`계획 진행 중에도 목록을 고치지 않고 도구 ${m.TODO_NUDGE_AT}번째 결과에 안내 (계획의 8개 단계를 같은 차례로, 또는 [N단계 완료])`,
+	nudges.filter(Boolean).length === 1 && nudges.at(-1)?.includes("todo 로 계획의 8개 단계를 같은 차례로") && nudges.at(-1).includes("[N단계 완료]"), nudges);
+await on.message_end[0]({ message: { role: "assistant", content: "[1단계 완료]" } }, ctx);
+const own8 = Array.from({ length: 8 }, (_, i) => `- [${i === 0 ? "x" : i === 1 ? "~" : " "}] ${i + 1}단계 내 글로 쓴 단계${i === 1 ? "\n  - [x] 하위 일\n  - [ ] 하위 둘" : ""}`).join("\n");
+res = await tools.todo.execute("t8a", { text: own8 }, undefined, undefined, ctx);
+const fitted = items();
+check("계획 진행 중 todo (같은 8단계, 글은 다름): 단계 글은 계획대로, 진행과 하위 단계만 받음 (입력창 위는 '계획 진행')",
+	fitted.length === 10 && fitted[0].text === "단계1" && fitted[0].status === "done" && fitted[1].text === "단계2" && fitted[2].level === 1 && fitted[2].text === "하위 일"
+	&& widgets.at(-1).v?.[0]?.includes("── 계획 진행 2/9") && res.content[0].text.includes("할 일 목록을 고쳤습니다"), [fitted, widgets.at(-1), res]);
+res = await tools.todo.execute("t8b", { text: "- [x] 준비\n- [~] 고치기\n- [ ] 확인" }, undefined, undefined, ctx);
+check("계획 진행 중 todo (단계 수가 다름): 목록은 그대로, 고치는 법을 알림", res.content[0].text === m.todoPlanKeep(8) && items().length === 10 && items()[0].text === "단계1", [res, items().length]);
+check("계획에 맞춰 보기: 맨 위 단계 수가 같을 때만", m.fitPlan(m.planTodo(["가", "나"], 1, meta), m.parseTodo("- [x] a\n  - [ ] a1\n- [ ] b"))?.map((l) => l.text).join("|") === "가|a1|나"
+	&& m.fitPlan(m.planTodo(["가", "나"], 1, meta), m.parseTodo("- a")) === null);
+await tools.todo.execute("t8c", { text: S8.map((s, i) => `- [${i === 0 ? "x" : i === 1 ? "~" : " "}] ${s}`).join("\n") }, undefined, undefined, ctx);
+await on.message_end[0]({ message: { role: "assistant", content: "[2단계 완료]" } }, ctx);
+const before8 = items();
+await cmds.plan.handler("", ctx);
+check("/plan 으로 다시 계획 모드: 진행하던 계획 목록을 닫지 않음 (입력창 위·파일 그대로)",
+	globalThis.__piMode === "plan" && widgets.at(-1).v?.[0]?.includes("── 계획 진행 2/8") && items().length === 8, widgets.at(-1));
+const tr8 = await on.input[0]({ text: "계획 보완해 줘. 3단계에 시험 추가", source: "interactive" }, ctx);
+check("계획 모드의 요청에 지금 목록과 '전체를 다시 적기' 안내가 붙음",
+	tr8?.text.includes("[지금 진행 중인 계획: 8단계 중 2단계 끝남]") && tr8.text.includes("1. 단계1 (끝남)") && tr8.text.endsWith("계획 보완해 줘. 3단계에 시험 추가"), tr8?.text);
+res = await tools.todo.execute("t8", { text: "- [x] 단계1\n- [x] 단계2\n- [~] 계획 보완" }, undefined, undefined, ctx);
+check("계획 모드에서 todo 는 목록을 바꾸지 않고 그렇다고 알림 (승인한 계획이 목록이 됨)", res.content[0].text === m.TODO_PLAN_MODE && items().length === 8, [res, items().length]);
+await answerPlan(CHANGED);
+const after8 = items();
+check("다듬은 계획을 승인: 전체 계획(8단계)을 골라, 끝난 1~2단계는 끝남·시각 그대로, 3단계부터 진행, 묻는 창과 진행 요청에 알림",
+	after8.length === 8 && after8[0].status === "done" && after8[0].ended === before8[0].ended && after8[1].ended === before8[1].ended && after8[2].status === "doing" && after8[2].text === "단계3 + 시험" && after8[7].text === "정리"
+	&& titles.at(-1) === "이 계획대로 진행할까요? (8단계, 그중 2단계는 끝남 · 지금 목록 8단계를 이 계획으로 바꿈)" && sent.at(-1).text.includes("이미 끝난 단계(1, 2단계)는 다시 하지 말고") && sent.at(-1).text.includes("모두 8단계"),
+	[after8, titles.at(-1), sent.at(-1).text]);
+await cmds.mode.handler("ask", ctx);
+check("/mode 도 진행 중인 계획 목록을 닫지 않음", widgets.at(-1).v?.[0]?.includes("── 계획 진행 2/8"), widgets.at(-1));
+await cmds.mode.handler("auto", ctx);
+ctx.ui.select = select0;
+await cmds.todo.handler("clear", ctx);
 rmSync(TW, { recursive: true, force: true });
 rmSync(AGENT0, { recursive: true, force: true });
 
