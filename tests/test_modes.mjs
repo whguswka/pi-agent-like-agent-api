@@ -280,6 +280,34 @@ check("[N단계 완료]: 그 단계를 끝내고 다음 단계를 하는 중으�
 check("계획 단계: 끝난 단계 표시 ((끝남)·(완료)·✅) 는 글 끝의 (끝남) 하나로, 70자로 자르기 전에 봄",
 	JSON.stringify(m.planSteps("1. 가 (끝남)\n2. ✅ 나:\n3. **다** (완료)\n4. 라")) === JSON.stringify(["가 (끝남)", "나 (끝남)", "다 (끝남)", "라"])
 	&& m.planSteps(`1. ${"가".repeat(90)} (끝남)\n2. 나`)[0].endsWith("… (끝남)"), [m.planSteps("1. 가 (끝남)\n2. ✅ 나:\n3. **다** (완료)\n4. 라"), m.planSteps(`1. ${"가".repeat(90)} (끝남)\n2. 나`)[0]]);
+// 계획의 하위 작업 -> 할 일 목록의 하위 단계 (2026-11-05 사용자: 하위 작업까지 세운 계획인데 목록에는 맨 위 5단계만)
+const KX = (kids) => kids.map((k) => k.map((x) => `${x.level}${x.status[0]}:${x.text}`).join("|"));
+const P1 = "계획입니다.\n1. 준비\n   - 파일 읽기\n   - 바꿀 파일: a.py\n2. **고치기**\n   1. 함수 a 고치기\n   2. 함수 b 고치기\n      - b 의 시험\n3. 시험 (끝남)\n   - 할 일: 전체 시험 실행\n\n질문:\n1. 이대로 할까요?";
+const P2 = "### 1단계: 준비\n- 파일 읽기\n- [x] 구조 확인\n### 2단계: 고치기\n- 함수 고치기\n\n## 질문\n- 이대로?";
+const P3 = "1. 준비\n1.1 파일 읽기\n1.2 구조 확인\n2. 고치기\n2.1 함수 a\n2.1.1 a 의 시험";
+check("계획의 하위 작업: 들여 쓴 목록(- · 1.), 제목 단계 아래의 목록, 'N.1' 번호 -> 하위 단계 (깊이대로), '바꿀 파일:' 은 빼고 '할 일:' 은 뗌, 질문 절은 넣지 않음",
+	JSON.stringify(m.planSteps(P1)) === JSON.stringify(["준비", "고치기", "시험 (끝남)"])
+	&& JSON.stringify(KX(m.planKids(P1, m.planSteps(P1)))) === JSON.stringify(["1t:파일 읽기", "1t:함수 a 고치기|1t:함수 b 고치기|2t:b 의 시험", "1t:전체 시험 실행"])
+	&& JSON.stringify(KX(m.planKids(P2, m.planSteps(P2)))) === JSON.stringify(["1t:파일 읽기|1d:구조 확인", "1t:함수 고치기"])
+	&& JSON.stringify(KX(m.planKids(P3, m.planSteps(P3)))) === JSON.stringify(["1t:파일 읽기|1t:구조 확인", "1t:함수 a|2t:a 의 시험"])
+	&& m.planKids(P1, ["없는 단계", "고치기"]).every((k) => k.length === 0), [m.planSteps(P1), KX(m.planKids(P1, m.planSteps(P1))), KX(m.planKids(P2, m.planSteps(P2))), KX(m.planKids(P3, m.planSteps(P3)))]);
+const pk = m.replanTodo(null, m.planSteps(P1), 100, meta, m.planKids(P1, m.planSteps(P1)));
+const PKT = (s) => s.items.map((x) => `${x.level}${{ todo: "_", doing: "~", done: "x" }[x.status]}:${x.text}`).join("|");
+check("하위 작업이 든 계획 -> 목록: 남은 첫 단계와 그 첫 하위 작업이 하는 중, 끝난 단계의 하위 작업도 끝남",
+	PKT(pk) === "0~:준비|1~:파일 읽기|0_:고치기|1_:함수 a 고치기|1_:함수 b 고치기|2_:b 의 시험|0x:시험|1x:전체 시험 실행", PKT(pk));
+m.stepDone(pk, 1, 200);
+check("[1단계 완료]: 다음 단계에 하위 작업이 있으면 그 첫 맨 아래 단계가 하는 중 (위 단계는 따라감)",
+	PKT(pk).startsWith("0x:준비|1x:파일 읽기|0~:고치기|1~:함수 a 고치기|1_:함수 b 고치기") && m.todoSummary(pk).current === "2.1 함수 a 고치기", PKT(pk));
+const fk = m.fitPlan(pk, m.parseTodo("- [x] 첫 단계\n- [~] 둘째 단계\n- [x] 셋째 단계"));
+const FK = fk.map((l) => `${l.level}${{ todo: "_", doing: "~", done: "x" }[l.status]}:${l.text}`).join("|");
+check("계획 진행 중 모델이 맨 위 단계만 보냄: 계획의 하위 작업은 그대로 (끝났다고 한 단계의 하위 작업은 끝남, 글은 계획대로)",
+	FK === "0x:준비|1x:파일 읽기|0~:고치기|1~:함수 a 고치기|1_:함수 b 고치기|2_:b 의 시험|0x:시험|1x:전체 시험 실행", FK);
+const P5 = Array.from({ length: 5 }, (_, i) => `${i + 1}. 큰 단계${i + 1}\n${Array.from({ length: 4 }, (_, j) => `   - 작업${i + 1}-${j + 1}`).join("\n")}`).join("\n");
+const p5 = m.replanTodo(null, m.planSteps(P5), 1, meta, m.planKids(P5, m.planSteps(P5)));
+m.stepDone(p5, 1, 2);
+const w5 = m.todoWidget(p5).split("\n");
+check("입력창 위: 12줄이 넘으면 맨 위 단계와 지금 단계의 하위 단계만, 다른 단계는 하위 단계 수 (5단계 + 하위 20개)",
+	p5.items.length === 25 && w5.length === 1 + 5 + 4 && w5.includes(" [~] 2. 큰 단계2") && w5.includes("    [~] 2.1 작업2-1") && w5.includes(" [x] 1. 큰 단계1 (하위 4/4)") && w5.includes(" [ ] 5. 큰 단계5 (하위 0/4)") && !w5.some((l) => l.includes("작업3-1")), w5);
 const S8 = Array.from({ length: 8 }, (_, i) => `단계${i + 1}`);
 const p8 = m.planTodo(S8, 1000, meta);
 m.stepDone(p8, 1, 2000);
@@ -311,48 +339,84 @@ check("파일 이름: 작업 폴더의 끝 두 이름 + 짧은 해시 (Windows �
 	/^work-lab-[0-9a-f]{8}$/.test(k1) && (process.platform !== "win32" || m.todoKey("c:/users/A/Work/LAB/", false).endsWith(k1.slice(-8))) && m.todoKey("/home/jovyan/work/lab", true).startsWith("nb-work-lab-")
 	&& m.todoKey("C:/w/a b:c*", false).startsWith("w-a_b_c_-") && m.todoKey("C:/x/한글 폴더", false).startsWith("x-한글_폴더-"), [k1, m.todoKey("C:/w/a b:c*", false)]);
 const tricky = m.mergeTodo(null, m.parseTodo("- [~] </script><b>x</b>"), 1, meta);
-const html = m.todoHtml(tricky, "k.data.js");
-check("HTML: 처음 목록을 담고(</script> 같은 글은 바꿔 담음), 옆의 .data.js 를 다시 읽음, 밖의 파일·서버는 쓰지 않음",
-	html.includes('var FILE = "k.data.js"') && html.includes("\\u003c/script>\\u003cb>") && !/https?:\/\//.test(html) && !html.includes("localhost") && (html.match(/<\/script>/g) || []).length === 2
-	&& m.todoDataJs(tricky).startsWith("window.__piTodoData && window.__piTodoData({") && m.todoHtml(null, "k.data.js").includes("window.__PI_TODO_INIT = null"));
+const bt = m.emptyBoard();
+m.addTask(bt, tricky, 1);
+const html = m.boardHtml(bt, "board.data.js");
+check("작업판 HTML: 처음 작업판을 담고(</script> 같은 글은 바꿔 담음), 옆의 board.data.js 를 다시 읽음, 진행·완료 탭, 밖의 파일·서버는 쓰지 않음",
+	html.includes('var FILE = "board.data.js"') && html.includes("\\u003c/script>\\u003cb>") && !/https?:\/\//.test(html) && !html.includes("localhost") && (html.match(/<\/script>/g) || []).length === 2
+	&& html.includes('data-tab="open"') && html.includes('data-tab="closed"') && m.boardDataJs(bt).startsWith("window.__piBoard && window.__piBoard({") && m.boardHtml(null, "x.js").includes("window.__PI_BOARD_INIT = null"));
+// 작업판의 작업 (2026-11-04 사용자: 급한 일로 바꾸면 하던 일을 잊음 -> 모든 작업을 작업판에, 입력창 위에는 지금 작업만)
+const b1 = m.emptyBoard();
+const ta = m.addTask(b1, m.mergeTodo(null, m.parseTodo("- [~] 가\n- [ ] 나"), 10, meta), 10);
+const tb = m.addTask(b1, m.mergeTodo(null, m.parseTodo("- [x] 다"), 20, meta), 20);
+check("작업: 번호는 하나씩 늘고, 새 작업은 하는 중, 모든 단계가 끝난 목록은 바로 완료",
+	ta.no === 1 && tb.no === 2 && b1.next === 3 && ta.state === "doing" && tb.state === "done" && tb.closed === 20 && ta.id !== tb.id, b1);
+m.putTask(ta, m.mergeTodo(ta, m.parseTodo("- [x] 가\n- [x] 나"), 30, meta), 30);
+const n1 = { ...ta };
+m.putTask(ta, m.mergeTodo(ta, m.parseTodo("- [x] 가\n- [ ] 나"), 40, meta), 40);
+check("작업 고치기: 번호·id 그대로, 모두 끝나면 완료, 다시 열린 단계가 있으면 다시 하는 중",
+	n1.state === "done" && n1.closed === 30 && n1.no === 1 && ta.state === "doing" && ta.closed === null && ta.id === n1.id, [n1, ta]);
+const b2 = m.emptyBoard();
+for (let i = 0; i < m.BOARD_KEEP + 5; i++) Object.assign(m.addTask(b2, m.mergeTodo(null, m.parseTodo("- [x] a"), i, meta), i), { closed: i });
+m.addTask(b2, m.mergeTodo(null, m.parseTodo("- [ ] 남은 일"), 9999, meta), 9999);
+m.pruneBoard(b2);
+check(`끝난 작업은 최근 ${m.BOARD_KEEP}개만 (진행 중 작업은 모두 남김)`, b2.tasks.filter((t) => !m.isOpen(t)).length === m.BOARD_KEEP && b2.tasks.some((t) => t.items[0].text === "남은 일") && !b2.tasks.some((t) => t.closed === 0));
+const rs = m.resumeText(Object.assign(m.addTask(m.emptyBoard(), m.planTodo(["준비", "실행", "정리"], 1, { ...meta, request: "배포 정리" }), 1), { no: 7 }), "로그도 봐 줘");
+check("이어서 할 때 모델에게: 작업 번호·처음 요청·단계(끝남·하던 중), 남은 단계부터, 계획이면 [N단계 완료], 덧붙인 말",
+	rs.includes("쉬던 작업 #7") && rs.includes("처음 요청: 배포 정리") && rs.includes("1. 준비 (하던 중)") && rs.includes("남은 단계부터") && rs.includes("[N단계 완료]") && rs.endsWith("로그도 봐 줘"), rs);
 check("브라우저로 열기: Windows explorer, macOS open, 화면 있는 Linux xdg-open, 화면 없으면·PI_TODO_OPEN=0 이면 열지 않음",
 	m.openCmd("C:\\a.html", "win32", {})[0] === "explorer.exe" && m.openCmd("/a.html", "darwin", {})[0] === "open" && m.openCmd("/a.html", "linux", { DISPLAY: ":0" })[0] === "xdg-open"
 	&& m.openCmd("/a.html", "linux", {}) === null && m.openCmd("C:\\a.html", "win32", { PI_TODO_OPEN: "0" }) === null);
-// 가짜 pi 로: todo 도구 -> 파일 셋·입력창 위 목록, /todo, 계획 모드에서도 쓸 수 있음, [N단계 완료], 끝난 목록은 다음 요청 때 닫힘
+// 가짜 pi 로: todo 도구 -> 작업판 파일 셋·입력창 위 목록, /todo, 계획 모드, [N단계 완료], 끝난 작업은 다음 요청 때 닫힘
 const TW = mkdtempSync(join(tmpdir(), "modes-todo-"));
 globalThis.__piWorkDir = { remote: false, cwd: TW };
-await cmds.todo.handler("clear", ctx);
+const { existsSync: ex, readFileSync: rd, writeFileSync: wr, mkdirSync: md } = await import("node:fs");
+const tdir = join(AGENT0, "todo");
+// 2026-11-02.1 의 프로젝트별 목록 파일 -> 작업판으로 (한 번)
+const key = m.todoKey(TW, false);
+rmSync(tdir, { recursive: true, force: true }); // 앞 시험의 계획이 남긴 작업판은 지움
+md(tdir, { recursive: true });
+wr(join(tdir, `${key}.json`), JSON.stringify(m.mergeTodo(null, m.parseTodo("- [x] 옛 일 하나\n- [~] 옛 일 둘"), 5, { ...meta, cwd: TW, request: "옛 요청" })));
+for (const f of on.session_start) await f({}, ctx);
+const board = () => JSON.parse(rd(join(tdir, "board.json"), "utf8"));
+const doing = () => board().tasks.filter((t) => t.state === "doing").sort((a, b) => b.updated - a.updated)[0];
+check("pi 를 켜면 2026-11-02.1 의 끝나지 않은 프로젝트 목록을 작업판으로 옮겨 지금 작업으로 (한 번만)",
+	board().tasks.length === 1 && board().tasks[0].request === "옛 요청" && board().imported.includes(key) && widgets.at(-1).v?.[0]?.includes("작업 #1"), [board(), widgets.at(-1)]);
+for (const f of on.session_start) await f({}, ctx);
+check("다시 켜도 다시 옮기지 않음", board().tasks.length === 1);
+await tick(); // 켠 때와 요청을 보낸 때가 같은 ms 이면 같은 요청으로 봄
 await on.input[0]({ text: "학습 파이프라인을 만들어 줘", source: "interactive" }, ctx);
 let res = await tools.todo.execute("t1", { text: "- [~] 데이터 확인\n- [ ] 학습\n  - [ ] 피처\n  - [ ] 학습 돌리기" }, undefined, undefined, ctx);
-const key = m.todoKey(TW, false);
-const { existsSync: ex, readFileSync: rd } = await import("node:fs");
-const tdir = join(AGENT0, "todo");
-const saved = JSON.parse(rd(join(tdir, `${key}.json`), "utf8"));
 w = widgets.at(-1);
-check("todo 도구: 파일 셋(.json·.data.js·.html)을 ~/.pi/agent/todo 에, 입력창 위 목록, 결과에 진행 (요청은 사용자가 보낸 첫 줄)",
-	ex(join(tdir, `${key}.html`)) && ex(join(tdir, `${key}.data.js`)) && saved.items.length === 4 && saved.request === "학습 파이프라인을 만들어 줘"
-	&& w.k === "pi-kit-plan" && w.v[0].includes("── 할 일 0/3 (0%)") && res.content[0].text.includes("끝남 0/3") && res.content[0].text.includes("하는 중: 1 데이터 확인"), [res, w, saved.request]);
+check("새 요청의 겹치지 않는 목록은 새 작업 (#2), 하던 작업(#1)은 쉬는 중으로 작업판에 남고, 결과에 그렇다고 (파일 셋 board.json·.data.js·.html)",
+	ex(join(tdir, "board.html")) && ex(join(tdir, "board.data.js")) && board().tasks.length === 2 && board().tasks[0].state === "paused" && doing().no === 2 && doing().request === "학습 파이프라인을 만들어 줘"
+	&& w.k === "pi-kit-plan" && w.v[0].includes("── 할 일 0/3 (0%)") && w.v[0].includes("작업 #2") && !w.v[0].includes("옛 일") && res.content[0].text.includes("앞 작업 #1 은 쉬는 중"), [res, w, board()]);
+res = await tools.todo.execute("t1b", { text: "- [~] 데이터 확인부터\n- [ ] 모델 학습\n  - [ ] 피처 만들기" }, undefined, undefined, ctx);
+check("같은 요청 안에서 다시 쓴 목록 (겹치는 단계 없음): 새 작업이 아니라 지금 작업(#2)을 바꿔 씀",
+	board().tasks.length === 2 && doing().no === 2 && doing().items[0].text === "데이터 확인부터" && !res.content[0].text.includes("쉬는 중"), [board().tasks.map((t) => [t.no, t.state]), res]);
+await tools.todo.execute("t1c", { text: "- [~] 데이터 확인\n- [ ] 학습\n  - [ ] 피처\n  - [ ] 학습 돌리기" }, undefined, undefined, ctx);
 res = await tools.todo.execute("t2", { text: "그냥 글" }, undefined, undefined, ctx);
-check("todo 도구: 목록이 아니면 형식을 알려 줌 (목록은 그대로)", res.content[0].text.includes("- [ ] 할 일") && JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).items.length === 4);
+check("todo 도구: 목록이 아니면 형식을 알려 줌 (목록은 그대로)", res.content[0].text.includes("- [ ] 할 일") && doing().items.length === 4);
 globalThis.__piMode = "plan";
 await cmds.mode.handler("plan", ctx);
-check("계획 모드에서도 todo 는 막지 않음 (작업 폴더를 바꾸지 않음), /mode 는 todo 로 만든 목록을 닫지 않음",
+check("계획 모드에서도 todo 는 막지 않음 (작업 폴더를 바꾸지 않음), /mode 는 지금 작업을 닫지 않음",
 	!(await blocked("todo", { text: "- [ ] a" })) && widgets.at(-1).v?.[0]?.includes("── 할 일"), widgets.at(-1));
 await cmds.mode.handler("auto", ctx);
 await on.message_end[0]({ message: { role: "assistant", content: "[1단계 완료] 데이터를 확인했습니다" } }, ctx);
-const after = JSON.parse(rd(join(tdir, `${key}.data.js`), "utf8").replace(/^window\.__piTodoData && window\.__piTodoData\(/, "").replace(/\);\s*$/, ""));
-check("[N단계 완료] 는 todo 목록의 맨 위 단계에도 (.data.js 에 바로)", after.items[0].status === "done" && after.items[0].ended !== null, after.items[0]);
+const after = JSON.parse(rd(join(tdir, "board.data.js"), "utf8").replace(/^window\.__piBoard && window\.__piBoard\(/, "").replace(/\);\s*$/, ""));
+check("[N단계 완료] 는 todo 목록의 맨 위 단계에도 (board.data.js 에 바로)", after.tasks.find((t) => t.no === 2).items[0].status === "done", after.tasks.find((t) => t.no === 2)?.items[0]);
 notes.length = 0;
 await cmds.todo.handler("", ctx);
-check("/todo: 진행 요약과 브라우저 파일", notes.at(-1).includes("끝남 1/3") && notes.at(-1).includes(`${key}.html`) && notes.at(-1).includes("/todo open"), notes.at(-1));
+check("/todo: 진행 중 작업 목록 (지금 작업 ▶, 쉬는 중), 명령 안내",
+	notes.at(-1).includes("진행 중 작업 2개") && notes.at(-1).includes("▶ #2 학습 파이프라인을 만들어 줘 — 할 일 1/3 · 지금 작업") && notes.at(-1).includes("#1 옛 요청 — 할 일 1/2 · 쉬는 중") && notes.at(-1).includes("/todo 이어서 N"), notes.at(-1));
 await cmds.todo.handler("open", ctx);
-check("/todo open: 열 수 없으면 (PI_TODO_OPEN=0) 파일 경로를 알려 줌", notes.at(-1).includes("브라우저로 여세요") && notes.at(-1).includes(`${key}.html`), notes.at(-1));
+check("/todo open: 열 수 없으면 (PI_TODO_OPEN=0) 작업판 파일 경로를 알려 줌", notes.at(-1).includes("브라우저로 여세요") && notes.at(-1).includes("board.html"), notes.at(-1));
 // 모델이 남은 단계를 고치지 않고 답을 끝냄 (2026-11-02 실사용 시험): 브라우저가 '진행 중' 으로 시간을 계속 세지 않게 요청이 끝난 시각
 for (const f of on.agent_end) await f({ messages: [{ role: "assistant", content: "끝났습니다", stopReason: "stop" }] }, ctx);
-const st1 = JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).stopped;
-check("요청이 끝났는데 목록이 다 끝나지 않았으면 그 시각을 적음 (입력창 위에도 '요청 끝')", typeof st1 === "number" && widgets.at(-1).v[0].includes("요청 끝 (남은 단계 있음)"), [st1, widgets.at(-1)]);
+const st1 = doing().stopped;
+check("요청이 끝났는데 지금 작업이 다 끝나지 않았으면 그 시각을 적음 (입력창 위에도 '요청 끝')", typeof st1 === "number" && widgets.at(-1).v[0].includes("요청 끝 (남은 단계 있음)"), [st1, widgets.at(-1)]);
 await on.agent_start[0]({}, ctx);
-check("다음 요청이 시작되면 지움", JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).stopped === null && !widgets.at(-1).v[0].includes("요청 끝"), widgets.at(-1));
+check("다음 요청이 시작되면 지움", doing().stopped === null && !widgets.at(-1).v[0].includes("요청 끝"), widgets.at(-1));
 // 목록을 고치지 않고 작업이 이어지면 결과에 안내 (2026-11-02 실사용 시험: 처음에 만들고 끝에만 [x])
 const tr2 = async (toolName) => (await on.tool_result[0]({ toolName, input: {}, content: [{ type: "text", text: "결과" }], isError: false }, ctx))?.content?.at(-1)?.text;
 const seen = [];
@@ -362,14 +426,64 @@ const afterTodo = [await tr2("bash"), await tr2("todo")];
 check(`목록을 고친 뒤 도구 ${m.TODO_NUDGE_AT}번째·${m.TODO_NUDGE_AGAIN}번째 결과에 안내 (지금 하는 중 단계와 함께), 목록을 고치면 다시 셈, todo 결과에는 붙이지 않음`,
 	seen.filter(Boolean).length === 2 && seen[m.TODO_NUDGE_AT - 1]?.includes("todo 로 목록 전체를 고쳐") && seen[m.TODO_NUDGE_AGAIN - 1]?.includes("todo 로 목록 전체를 고쳐")
 	&& afterTodo.every((x) => x === undefined), [seen, afterTodo]);
-await tools.todo.execute("t3", { text: "- [x] 데이터 확인\n- [x] 학습\n  - [x] 피처\n  - [x] 학습 돌리기" }, undefined, undefined, ctx);
-check("모두 끝나면 입력창 위에 '모두 끝남', 끝난 목록에는 안내하지 않음", widgets.at(-1).v[0].includes("모두 끝남") && [await tr2("bash"), await tr2("bash"), await tr2("bash")].every((x) => x === undefined));
+// 쉬던 작업으로 돌아가기 (/todo 이어서 N): 지금 작업은 쉬는 중으로, 모델에게 그 작업의 단계를 보냄
+const nSent0 = sent.length;
+await cmds.todo.handler("이어서 1 로그도 봐 줘", ctx);
+await sentAfter(nSent0);
+check("/todo 이어서 1: #1 이 지금 작업 (입력창 위), #2 는 쉬는 중, 모델에게 #1 의 단계와 덧붙인 말을 보냄 (지금 작업이 끝난 뒤)",
+	doing().no === 1 && board().tasks.find((t) => t.no === 2).state === "paused" && widgets.at(-1).v[0].includes("작업 #1") && sent.at(-1).text.includes("쉬던 작업 #1")
+	&& sent.at(-1).text.includes("옛 일 하나 (끝남)") && sent.at(-1).text.endsWith("로그도 봐 줘") && sent.at(-1).opts?.deliverAs === "followUp", [board().tasks.map((t) => [t.no, t.state]), sent.at(-1)]);
+await cmds.todo.handler("이어서 9", ctx);
+check("/todo 이어서 (없는 번호): 알림만", notes.at(-1).includes("작업 #9") && doing().no === 1, notes.at(-1));
+const other = m.editBoard((b) => void m.addTask(b, m.mergeTodo(null, m.parseTodo("- [ ] 남의 폴더 일"), 50, { ...meta, cwd: "C:/elsewhere", project: "elsewhere" }), 50));
+const otherNo = other.tasks.at(-1).no;
+await cmds.todo.handler(`이어서 ${otherNo}`, ctx);
+check("/todo 이어서 (다른 폴더의 작업): 바꾸지 않고 그 폴더에서 하라고 알림", notes.at(-1).includes("다른 폴더의 작업") && notes.at(-1).includes("C:/elsewhere") && doing().no === 1, notes.at(-1));
+await cmds.todo.handler(`폐기 ${otherNo}`, ctx);
+await cmds.todo.handler("완료 2", ctx);
+const bb = board();
+check("/todo 폐기 N·완료 N: 작업판의 완료 탭으로 (폐기·완료 처리, 끝난 시각), 다른 폴더의 작업도",
+	bb.tasks.find((t) => t.no === otherNo).state === "dropped" && bb.tasks.find((t) => t.no === 2).state === "done" && bb.tasks.find((t) => t.no === 2).manual === true
+	&& typeof bb.tasks.find((t) => t.no === 2).closed === "number" && notes.at(-1).includes("완료로 옮겼습니다") && doing().no === 1, bb.tasks.map((t) => [t.no, t.state]));
+await cmds.todo.handler("이어서 2", ctx);
+await cmds.todo.handler("이어서 1", ctx);
+check("완료·폐기한 작업도 /todo 이어서 N 으로 다시 열 수 있음 (다시 하는 중)", board().tasks.find((t) => t.no === 2).state === "paused" && doing().no === 1, board().tasks.map((t) => [t.no, t.state]));
+await tools.todo.execute("t3", { text: "- [x] 옛 일 하나\n- [x] 옛 일 둘" }, undefined, undefined, ctx);
+check("모두 끝나면 입력창 위에 '모두 끝남', 작업판에서는 바로 완료, 끝난 작업에는 안내하지 않음",
+	widgets.at(-1).v[0].includes("모두 끝남") && board().tasks.find((t) => t.no === 1).state === "done" && [await tr2("bash"), await tr2("bash"), await tr2("bash")].every((x) => x === undefined), widgets.at(-1));
 await on.input[0]({ text: "다음 일", source: "interactive" }, ctx);
-check("끝난 목록은 다음 요청 때 입력창 위에서 닫히고 파일에는 남음", widgets.at(-1).v === undefined && JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).items.length === 4);
+check("끝난 작업은 다음 요청 때 입력창 위에서 닫히고 작업판에는 완료로 남음", widgets.at(-1).v === undefined && board().tasks.find((t) => t.no === 1).state === "done");
+await cmds.todo.handler("이어서 2", ctx);
 await cmds.todo.handler("clear", ctx);
-check("/todo clear: 목록 파일을 비움 (브라우저는 '목록 없음')", rd(join(tdir, `${key}.data.js`), "utf8").includes("window.__piTodoData(null)"));
+check("/todo clear: 지금 작업을 폐기 (작업판 완료 탭에 '폐기')", board().tasks.find((t) => t.no === 2).state === "dropped" && widgets.at(-1).v === undefined, board().tasks.map((t) => [t.no, t.state]));
+// 2026-11-04 실제 Copilot: 급한 일의 목록에 앞 작업의 끝난 단계 하나를 섞어 보냄 -> 겹친다고 같은 작업으로 보면 앞 작업의 목록이 급한 일로 바뀜
+await tick();
+await on.input[0]({ text: "보고서 만들기", source: "interactive" }, ctx);
+await tools.todo.execute("m1", { text: "- [x] 자료 모으기\n- [~] 표 만들기\n- [ ] 글 쓰기" }, undefined, undefined, ctx);
+const repNo = doing().no;
+await tick();
+await on.input[0]({ text: "급한 일: 서버 로그 보기", source: "interactive" }, ctx);
+res = await tools.todo.execute("m2", { text: "- [x] 자료 모으기\n- [~] 서버 로그 열기\n- [ ] 오류 찾기\n- [ ] 보고서 작업 다시 하기" }, undefined, undefined, ctx);
+const rep = board().tasks.find((t) => t.no === repNo);
+check("새 요청의 목록이 앞 작업의 끝난 단계 하나만 겹치고 남은 단계는 없음: 새 작업, 앞 작업의 목록은 그대로 (쉬는 중), 결과에 '이 작업의 단계만'",
+	doing().no === repNo + 1 && doing().items[1].text === "서버 로그 열기" && doing().request === "급한 일: 서버 로그 보기" && rep.state === "paused" && rep.items.map((x) => x.text).join("|") === "자료 모으기|표 만들기|글 쓰기"
+	&& res.content[0].text.includes(`새 작업 #${repNo + 1}`) && res.content[0].text.includes("이 작업의 단계만"), [res, board().tasks.map((t) => [t.no, t.state, t.items.map((x) => x.text).join("|")])]);
+await cmds.todo.handler(`이어서 ${repNo}`, ctx);
+await tick();
+await on.input[0]({ text: "계속", source: "interactive" }, ctx);
+res = await tools.todo.execute("m3", { text: "- [x] 표 만들기\n- [~] 글 쓰기" }, undefined, undefined, ctx);
+check("새 요청 뒤 남은 단계만 다시 보낸 목록: 같은 작업 (새 작업이 아님)", doing().no === repNo && !res.content[0].text.includes("새 작업"), [res, board().tasks.map((t) => [t.no, t.state])]);
+check("남은 단계를 이어 가는지: 남은 맨 위 단계를 반 넘게 담으면 같은 작업 (계획은 앞서 받은 모델의 글로도)",
+	m.keepsTask({ items: m.parseTodo("- [x] a\n- [~] b\n- [ ] c"), alias: [] }, [{ text: "b" }]) && !m.keepsTask({ items: m.parseTodo("- [x] a\n- [~] b\n- [ ] c\n- [ ] d") }, [{ text: "a" }, { text: "b" }, { text: "x" }])
+	&& m.keepsTask({ items: m.parseTodo("- [x] a\n- [ ] b"), lastTop: ["a2", "b2"] }, [{ text: "B2" }]) && m.keepsTask({ items: m.parseTodo("- [x] a") }, []));
+await cmds.todo.handler(`폐기 ${repNo + 1}`, ctx);
+await cmds.todo.handler("clear", ctx);
+wr(join(tdir, "board.json"), "{깨진");
+m.editBoard(() => {});
+const { readdirSync: rdir } = await import("node:fs");
+check("깨진 작업판 파일은 덮어쓰지 않고 옆에 둠 (board.json.bad-…)", rdir(tdir).some((f) => f.startsWith("board.json.bad-")) && board().v === 2, rdir(tdir));
 // 가짜 pi 로: 8단계 계획 진행 -> 1~2단계 끝 -> /plan 으로 다시 계획 모드 -> 다듬기 -> 승인 (2026-11-04 사용자 보고)
-const items = () => JSON.parse(rd(join(tdir, `${key}.json`), "utf8")).items;
+const items = () => doing().items;
 const titles = [];
 const select0 = ctx.ui.select;
 ctx.ui.select = async (t, opts) => (titles.push(t), opts[0]);
@@ -402,17 +516,24 @@ res = await tools.todo.execute("t8b", { text: "- [x] 준비\n- [~] 고치기\n- 
 check("계획 진행 중 todo (단계 수가 다름): 목록은 그대로, 고치는 법을 알림", res.content[0].text === m.todoPlanKeep(8) && items().length === 10 && items()[0].text === "단계1", [res, items().length]);
 check("계획에 맞춰 보기: 맨 위 단계 수가 같을 때만", m.fitPlan(m.planTodo(["가", "나"], 1, meta), m.parseTodo("- [x] a\n  - [ ] a1\n- [ ] b"))?.map((l) => l.text).join("|") === "가|a1|나"
 	&& m.fitPlan(m.planTodo(["가", "나"], 1, meta), m.parseTodo("- a")) === null);
+const p8no = doing().no;
+await tick();
+await on.input[0]({ text: "계속 진행해 줘", source: "interactive" }, ctx);
+res = await tools.todo.execute("t8d", { text: own8 }, undefined, undefined, ctx);
+check("새 요청 뒤에도 모델이 앞서 쓴 글(alias)과 같은 목록이면 같은 계획 (새 작업이 아님, 글은 계획대로)",
+	doing().no === p8no && board().tasks.filter((t) => t.state === "doing" || t.state === "paused").length === 1 && items()[0].text === "단계1" && !res.content[0].text.includes("쉬는 중")
+	&& doing().alias.includes("1단계 내 글로 쓴 단계"), [res, board().tasks.map((t) => [t.no, t.state]), doing().alias]);
 await tools.todo.execute("t8c", { text: S8.map((s, i) => `- [${i === 0 ? "x" : i === 1 ? "~" : " "}] ${s}`).join("\n") }, undefined, undefined, ctx);
 await on.message_end[0]({ message: { role: "assistant", content: "[2단계 완료]" } }, ctx);
 const before8 = items();
 await cmds.plan.handler("", ctx);
 check("/plan 으로 다시 계획 모드: 진행하던 계획 목록을 닫지 않음 (입력창 위·파일 그대로)",
-	globalThis.__piMode === "plan" && widgets.at(-1).v?.[0]?.includes("── 계획 진행 2/8") && items().length === 8, widgets.at(-1));
+	globalThis.__piMode === "plan" && widgets.at(-1).v?.[0]?.includes("── 계획 진행 3/9") && items().length === 10, widgets.at(-1));
 const tr8 = await on.input[0]({ text: "계획 보완해 줘. 3단계에 시험 추가", source: "interactive" }, ctx);
 check("계획 모드의 요청에 지금 목록과 '전체를 다시 적기' 안내가 붙음",
 	tr8?.text.includes("[지금 진행 중인 계획: 8단계 중 2단계 끝남]") && tr8.text.includes("1. 단계1 (끝남)") && tr8.text.endsWith("계획 보완해 줘. 3단계에 시험 추가"), tr8?.text);
 res = await tools.todo.execute("t8", { text: "- [x] 단계1\n- [x] 단계2\n- [~] 계획 보완" }, undefined, undefined, ctx);
-check("계획 모드에서 todo 는 목록을 바꾸지 않고 그렇다고 알림 (승인한 계획이 목록이 됨)", res.content[0].text === m.TODO_PLAN_MODE && items().length === 8, [res, items().length]);
+check("계획 모드에서 todo 는 목록을 바꾸지 않고 그렇다고 알림 (승인한 계획이 목록이 됨)", res.content[0].text === m.TODO_PLAN_MODE && items().length === 10, [res, items().length]);
 await answerPlan(CHANGED);
 const after8 = items();
 check("다듬은 계획을 승인: 전체 계획(8단계)을 골라, 끝난 1~2단계는 끝남·시각 그대로, 3단계부터 진행, 묻는 창과 진행 요청에 알림",
@@ -422,6 +543,40 @@ check("다듬은 계획을 승인: 전체 계획(8단계)을 골라, 끝난 1~2�
 await cmds.mode.handler("ask", ctx);
 check("/mode 도 진행 중인 계획 목록을 닫지 않음", widgets.at(-1).v?.[0]?.includes("── 계획 진행 2/8"), widgets.at(-1));
 await cmds.mode.handler("auto", ctx);
+const planNo = doing().no;
+await tick();
+await on.input[0]({ text: "급한 일부터: 로그 폴더 비우기", source: "interactive" }, ctx);
+res = await tools.todo.execute("t9", { text: "- [~] 로그 폴더 보기\n- [ ] 지우기" }, undefined, undefined, ctx);
+check("계획 진행 중에 새 요청의 다른 목록 (단계 수가 달라도): 새 작업, 하던 계획은 쉬는 중 (같은 단계 수 규칙은 그 계획을 진행하는 요청 안에서만)",
+	doing().no === planNo + 1 && doing().source === "todo" && board().tasks.find((t) => t.no === planNo).state === "paused" && res.content[0].text.includes(`앞 작업 #${planNo} 은 쉬는 중`), [res, board().tasks.map((t) => [t.no, t.state])]);
+await cmds.todo.handler(`폐기 ${planNo + 1}`, ctx);
+await cmds.todo.handler(`이어서 ${planNo}`, ctx);
+await sentAfter(sent.length - 1);
+await cmds.plan.handler("", ctx);
+await on.input[0]({ text: "급한 일: 배포 스크립트 고치기", source: "interactive" }, ctx);
+await answerPlan("1. 배포 스크립트 읽기\n2. 고치기\n3. 시험");
+check("진행 중인 계획과 겹치지 않는 새 계획을 승인: 새 작업 (묻는 창에 알림), 하던 계획은 쉬는 중으로 작업판에, 새 작업 이름은 계획 모드의 첫 요청",
+	titles.at(-1) === `이 계획대로 진행할까요? (3단계 · 새 작업 (지금 작업 #${planNo} 은 쉬는 중으로))` && doing().no === board().next - 1 && doing().request === "급한 일: 배포 스크립트 고치기"
+	&& board().tasks.find((t) => t.no === planNo).state === "paused" && widgets.at(-1).v[0].includes(`작업 #${board().next - 1}`), [titles.at(-1), board().tasks.map((t) => [t.no, t.state, t.request])]);
+await cmds.todo.handler(`폐기 ${planNo}`, ctx);
+// 하위 작업까지 세운 계획을 승인 (2026-11-05 사용자): 묻는 창에 하위 작업 수, 입력창 위·작업판에 하위 단계
+const urgentNo = doing().no;
+await cmds.plan.handler("", ctx);
+await on.input[0]({ text: "세부 작업까지 계획 세워 줘", source: "interactive" }, ctx);
+// 급한 일 계획(배포 스크립트 읽기·고치기·시험)과 '고치기'·'시험' 이 겹쳐 pi 는 고침으로 봄 -> 사용자는 '새 작업으로' 를 고름
+const optsSeen = [];
+ctx.ui.select = async (t, opts) => (titles.push(t), optsSeen.push(opts), opts.find((o) => o.includes("새 작업으로")) || opts[0]);
+await answerPlan(P1);
+w = widgets.at(-1);
+check("하위 작업이 든 계획을 승인: 묻는 창에 '하위 작업 5개', 진행하던 작업이 있으면 pi 가 본 것과 반대로 하는 고르기('새 작업으로'), 고르면 새 작업 (하던 작업은 쉬는 중)",
+	titles.at(-1) === `이 계획대로 진행할까요? (3단계, 그중 1단계는 끝남 · 하위 작업 5개 · 지금 목록 3단계를 이 계획으로 바꿈)` && optsSeen.at(-1).length === 4
+	&& doing().no === board().next - 1 && board().tasks.find((t) => t.no === urgentNo).state === "paused" && board().tasks.find((t) => t.no === urgentNo).items[0].text === "배포 스크립트 읽기", [titles.at(-1), optsSeen.at(-1), board().tasks.map((t) => [t.no, t.state])]);
+check("하위 작업이 든 계획: 목록에 하위 단계 (입력창 위에도 1.1 처럼), 진행 요청의 단계 수와 끝난 단계는 맨 위 단계로",
+	doing().items.length === 8 && doing().items[1].level === 1 && w.v[0].includes("[~] 1.1 파일 읽기") && w.v[0].includes(" [~] 1. 준비") && sent.at(-1).text.includes("모두 3단계") && sent.at(-1).text.includes("이미 끝난 단계(3단계)"),
+	[PKT(doing()), w.v[0], sent.at(-1).text]);
+ctx.ui.select = async (t, opts) => (titles.push(t), opts[0]);
+await cmds.todo.handler(`폐기 ${urgentNo}`, ctx);
+await cmds.todo.handler("clear", ctx);
 ctx.ui.select = select0;
 await cmds.todo.handler("clear", ctx);
 rmSync(TW, { recursive: true, force: true });
