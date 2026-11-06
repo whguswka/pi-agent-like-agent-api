@@ -5,7 +5,7 @@ import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
 
 // typebox 는 pi 처럼 runtime 의 것으로 (kit.ts 의 docs_lookup 도구)
 const jiti = createJiti(import.meta.url, { alias: { typebox: fileURLToPath(new URL("../runtime/node_modules/typebox/build/index.mjs", import.meta.url)) } });
-const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE, KIT_GUIDES, addKitGuides } = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
+const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE, KIT_GUIDES, addKitGuides, promptSections, contextReport } = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
 let fails = 0;
 const check = (name, cond, detail = "") => {
 	console.log((cond ? "OK   " : "FAIL ") + name + (cond ? "" : "  -> " + JSON.stringify(detail)));
@@ -47,6 +47,43 @@ check("작업 습관 줄: 코드는 파일로·자리 표시 없이, 지침이 �
 	&& WAIT_GUIDE.includes("30초마다") && WAIT_GUIDE.includes("-u") && [CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE].every((s) => s.length <= 220) && WAIT_GUIDE.includes("wait_for_run_completion"),
 	[CODE_FILE_GUIDE.length, READ_DOCS_GUIDE.length, WAIT_GUIDE.length]);
 addKitGuides(undefined); // 지침 목록이 없는 pi 이면 그냥 넘어감
+
+// /context (2026-11-05): 다음 요청에 들어가는 것의 글자 수 (pi 0.87 의 시스템 프롬프트: 앞 글 + <이름>…</이름> 덩어리)
+const AGI = "공통 지침 ".repeat(300);
+const SYS = [
+	"You are pi. 기본 안내 글입니다.", "",
+	"<tools>\n- read: 파일 읽기\n</tools>", "",
+	`<project_context>\nProject-specific instructions and guidelines:\n\n<project_instructions path="/home/u/.pi/agent/AGENTS.md">\n${AGI}\n</project_instructions>\n\n<project_instructions path="/w/p/CLAUDE.md">\n짧은 지침\n</project_instructions>\n</project_context>`, "",
+	"<skills>\n<available_skills>\n<skill>\n<name>a</name>\n</skill>\n<skill>\n<name>b</name>\n</skill>\n</available_skills>\n</skills>", "",
+	"<recent_work>\n지난 요청 1\n</recent_work>",
+].join("\n");
+const secs = promptSections(SYS);
+const sec = (n) => secs.find((s) => s.name === n);
+check("/context 지침 나누기: 앞 글·<도구>·지침 파일(파일마다)·스킬(수)·작업 기록, 나눈 합이 거의 전체",
+	sec("preamble")?.chars > 10 && sec("tools") && sec("project_context")?.parts?.length === 2 && sec("project_context").parts[0].chars > 1500 && sec("skills")?.count === 2 && sec("recent_work")?.label.includes("작업 기록")
+	&& Math.abs(secs.reduce((a, s) => a + s.chars, 0) - SYS.length) < 20, secs);
+const msgs = [
+	{ role: "system", content: SYS },
+	{ role: "user", content: "README 고쳐 줘" },
+	{ role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(5000) }, { type: "text", text: "읽겠습니다" }, { type: "toolCall", name: "read", arguments: { path: "README.md" } }] },
+	{ role: "toolResult", toolName: "read", content: [{ type: "text", text: "가".repeat(8000) }, { type: "image", data: "AAAA", mimeType: "image/png" }] },
+	{ role: "compactionSummary", summary: "앞 대화 요약", tokensBefore: 1 },
+];
+const rep = contextReport({ system: SYS, tools: [{ name: "read", description: "파일 읽기", parameters: { type: "object" } }], messages: msgs, usage: { tokens: 12000, contextWindow: 128000, percent: 9.4 }, provider: "inhouse", maxChars: 10000 });
+const R = rep.join("\n");
+check("/context 화면: 지침·지침 파일(큰 것부터)·스킬 수·도구·대화 기록(요청·답·도구 결과·요약, 생각은 빼고 그림은 따로)·큰 도구 결과·토큰·사내AI 한도와 조각 수",
+	R.includes(`지침 (시스템 프롬프트) ${SYS.length.toLocaleString("en-US")}자`) && R.indexOf("/home/u/.pi/agent/AGENTS.md") > 0 && R.indexOf("/home/u/.pi/agent/AGENTS.md") < R.indexOf("/w/p/CLAUDE.md")
+	&& R.includes("(스킬 2개)") && R.includes("도구 설명 1개") && R.includes("메시지 4개, 그림 1개는 글자 수에서 뺌") && R.includes("도구 결과 1개 8,000자") && !R.includes("5,0")
+	&& R.includes("큰 도구 결과: read 8,000자") && R.includes("약 12,000 토큰 / 128,000 (9%)") && R.includes("사내AI: 같은 대화에서는 새로 생긴 메시지만") && R.includes("한 번에 보내는 한도 10,000자")
+	&& /약 2조각 \(넘는 만큼/.test(R) && R.includes("지침 파일이 지침의 절반이 넘습니다"), rep);
+const rep2 = contextReport({ system: "짧은 지침", tools: [], messages: [], usage: { tokens: null, contextWindow: 100, percent: null }, provider: "vllm" }).join("\n");
+check("/context: 다른 제공자는 중계 서버 줄 없음, 토큰을 모르면 그렇다고", !rep2.includes("한 번에 보내는 한도") && rep2.includes("아직 모름") && !rep2.includes("줄이려면"), rep2);
+
+const rep3 = contextReport({ system: SYS, tools: [], messages: [], sent: true, pending: ["안 보여야 함"] }).join("\n");
+const rep4 = contextReport({ system: SYS, tools: [], messages: [], pending: ["노트북 지침 파일 /home/jovyan/p/AGENTS.md 56자", "노트북 실행 환경 안내", "키트 안내"] }).join("\n");
+check("/context: 지난 요청 때 보낸 지침이면 그렇다고, 첫 요청 전이면 요청 때 더하는 것(노트북 지침 파일 경로·글자 수)이 아직 빠졌다고",
+	rep3.includes("(지난 요청 때 실제로 보낸 지침") && !rep3.includes("안 보여야 함") && !rep3.includes("첫 요청 전")
+	&& rep4.includes("첫 요청 전이라 요청 때 더하는 것은 아직 빠짐: 노트북 지침 파일 /home/jovyan/p/AGENTS.md 56자 · 노트북 실행 환경 안내 · 키트 안내") && !rep4.includes("지난 요청 때"), [rep3, rep4]);
 
 console.log(fails ? `RESULT: FAIL (${fails})` : "RESULT: PASS");
 process.exit(fails ? 1 : 0);

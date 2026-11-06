@@ -10,6 +10,8 @@
  *  - write/edit: 작업 폴더 밖의 파일 (임시 폴더는 제외). jupyter 모드에서는 노트북의 작업 폴더 기준
  *  - 읽기 전용 폴더(guard_readonly, 운영 소스 등): 그 안의 파일 쓰기·고치기, 그 안으로 복사·이동·리다이렉트,
  *    그 폴더의 git 저장소 바꾸기, 그 폴더 안에서 보기만 하는 명령이 아닌 것(스크립트 실행 등)
+ *  - 보호 경로 (2026-11-05, Claude Code 의 보호 경로를 보고): git 저장소 안(.git/), 셸 시작 파일(~/.bashrc 등), PowerShell 프로필,
+ *    ~/.ssh, ~/.gitconfig, pi 설정(~/.pi/agent) 에 쓰기·고치기·지우기. 작업 폴더 안이어도, guard_outside_writes 를 꺼도 묻는다 (git 명령 자체는 그대로)
  *  - 사용자가 직접 치는 !명령은 묻지 않는다 (이 확인은 LLM 이 요청한 도구 실행에만 걸림)
  *  - 거부하면 실행하지 않고 작업을 멈춘다. 물을 수 없는 실행 방식(pi -p)이면 막고 LLM 에게 이유를 알린다
  *  - 계획·확인 모드(modes.ts 의 /plan, /mode)에서는 직접 묻지 않고 이유만 넘긴다: 계획 모드는 막고, 확인 모드는 한 번에 묻는다
@@ -20,6 +22,7 @@
  *   "guard_allow": ["정규식", ...]           묻지 않을 명령 (&&·;·| 로 이은 명령은 하나씩 맞춰 봄. 예: "^git push origin feature/")
  *   "guard_outside_writes": false           작업 폴더 밖 파일 쓰기는 묻지 않음
  *   "guard_readonly": ["~/work/app-prod"]   읽기 전용 폴더 (~ 는 명령을 실행하는 곳의 홈: jupyter 모드면 노트북 홈)
+ *   "guard_protected": false                보호 경로는 묻지 않음
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -595,6 +598,85 @@ const XARGS_WRITERS = new Set(["rm", "rmdir", "unlink", "mv", "cp", "tee", "touc
 	"install", "rsync", "sed", "perl", "dd"]);
 
 // ---------------------------------------------------------------------------------------------------------------
+// 보호 경로 (2026-11-05, Claude Code 의 보호 경로를 보고): 망가지면 저장소·셸·접속·pi 자체가 이상해지는 곳.
+// 작업 폴더 안이어도 쓰기·고치기·지우기 전에 묻는다. git 명령(commit 등)이 .git 을 바꾸는 것은 보통 일이라 보지 않고,
+// 파일을 직접 쓰는 것(write·edit, > .git/config, rm -rf .git, sed -i ~/.bashrc 등)만 본다
+// ---------------------------------------------------------------------------------------------------------------
+const SHELL_RC = new Set([".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".inputrc"]);
+/** 보호 경로이면 그 까닭, 아니면 null. abs 는 absPath 의 결과 (실행하는 곳의 절대 경로, / 로 나눔) */
+export function protectedPath(abs: string, wd: WorkDir): string | null {
+	const p = slash(abs);
+	const low = p.toLowerCase();
+	if (/(^|\/)\.git(\/|$)/i.test(p)) return "git 저장소 안(.git)의 파일";
+	const home = slash(wd.remote ? wd.home || "/home/jovyan" : homedir()).toLowerCase();
+	const name = low.slice(low.lastIndexOf("/") + 1);
+	const dir = low.slice(0, Math.max(0, low.lastIndexOf("/")));
+	if (dir === home && SHELL_RC.has(name)) return `셸 시작 파일(~/${name})`;
+	if (low === `${home}/.config/fish/config.fish`) return "셸 시작 파일(~/.config/fish/config.fish)";
+	if (/(^|\/)(windows)?powershell\/([\w.]+_)?profile\.ps1$/.test(low)) return "PowerShell 프로필";
+	if (inside(low, `${home}/.ssh`)) return "SSH 설정·키(~/.ssh)";
+	if (low === `${home}/.gitconfig` || inside(low, `${home}/.config/git`)) return "git 전체 설정(~/.gitconfig)";
+	// pi 설정·확장: PC 의 pi 가 쓰는 것만 (jupyter 모드의 노트북 ~/.pi 는 이 pi 의 것이 아님)
+	if (!wd.remote && inside(low, slash(agentDir).toLowerCase())) return "pi 설정·확장(~/.pi/agent)";
+	return null;
+}
+
+/** bash 명령이 보호 경로에 쓰면 그 까닭, 아니면 null (리다이렉트, cp·mv·tee·rm·sed -i 등의 대상. cd 를 따라 상대 경로를 풂) */
+export function protectedRisk(command: string, wd: WorkDir, depth = 0): string | null {
+	let parsed: ReturnType<typeof parseShell>;
+	try {
+		parsed = parseShell(command);
+	} catch {
+		return null;
+	}
+	let cwd = wd.cwd;
+	const hit = (t: string, how: string) => {
+		const a = absPath(t, wd, cwd);
+		const why = protectedPath(a, wd);
+		return why ? `보호 경로: ${why} (${how} ${a})` : null;
+	};
+	for (const pl of parsed.pipelines)
+		for (const cmd of pl) {
+			for (const r of cmd.redirects) {
+				const w = hit(r, ">");
+				if (w) return w;
+			}
+			const { rest } = strip(cmd.words);
+			if (!rest.length) continue;
+			const name = base(rest[0]);
+			const args = rest.slice(1);
+			if (name === "cd" || name === "pushd") {
+				const t = args.find((a) => !a.startsWith("-"));
+				cwd = t ? absPath(t, wd, cwd) : wd.remote ? wd.home || "/home/jovyan" : slash(homedir());
+				continue;
+			}
+			for (const t of writeTargets(name, args)) {
+				const w = hit(t, name);
+				if (w) return w;
+			}
+			if (SHELLS.has(name) && depth < 3) {
+				const c = args.findIndex((a) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(a));
+				if (c >= 0 && c + 1 < args.length) {
+					const r = protectedRisk(args[c + 1], { ...wd, cwd }, depth + 1);
+					if (r) return r;
+				}
+			}
+		}
+	if (depth < 3) {
+		for (const n of parsed.nested) {
+			const r = protectedRisk(n, { ...wd, cwd }, depth + 1);
+			if (r) return r;
+		}
+		for (const h of parsed.heredocs)
+			if (SHELLS.has(base(strip(h.words).rest[0] || ""))) {
+				const r = protectedRisk(h.body, { ...wd, cwd }, depth + 1);
+				if (r) return r;
+			}
+	}
+	return null;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // 실행하는 셸 스크립트 안: 명령 글에는 bash deploy.sh 만 보이므로 그 파일을 읽어, 되돌릴 수 없는 원격 작업만 본다
 // (git push, kubectl delete·helm uninstall, glab·gh·GitLab API 로 바꾸기). 폴더 지우기 같은 것은 보지 않는다:
 // build/ 를 비우는 빌드 스크립트를 돌릴 때마다 묻게 되면 결국 끄게 된다. 읽을 수 없거나 256KB 넘는 파일은 보지 않음
@@ -694,7 +776,8 @@ export default function (pi: ExtensionAPI) {
 			why = checkCommand(what, cfg);
 			// guard_allow 는 단순 명령마다: 명령 글 전체가 맞는다고 건너뛰면 'git push origin feature/x && cp a ~/work/app-prod/' 의 cp 를 놓침 (릴리스 전 검토)
 			if (!why && !allAllowed(what, regexps(cfg.guard_allow))) {
-				why = readonlyRisk(what, roots, wd);
+				if (cfg.guard_protected !== false) why = protectedRisk(what, wd);
+				if (!why) why = readonlyRisk(what, roots, wd);
 				if (!why) {
 					try {
 						why = await scriptRisk(what, wd, readScript(wd));
@@ -705,7 +788,11 @@ export default function (pi: ExtensionAPI) {
 			const verb = event.toolName === "write" ? "파일 쓰기" : "파일 고치기";
 			const abs = absPath(input.path, wd);
 			const root = roots.find((r) => inside(abs, r));
-			if (root) {
+			const prot = cfg.guard_protected !== false ? protectedPath(abs, wd) : null;
+			if (prot) {
+				what = `${verb}: ${abs}`;
+				why = `보호 경로: ${prot}`;
+			} else if (root) {
 				what = `${verb}: ${abs}`;
 				why = `읽기 전용 폴더(${root})의 파일 (guard_readonly)`;
 			} else if (cfg.guard_outside_writes !== false) {

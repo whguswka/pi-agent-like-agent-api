@@ -8,7 +8,8 @@
  *  - 고친 뒤에 다른 곳에서 다시 바뀐 파일은 덮어쓰지 않고 알린다.
  *  - 셸 명령(bash)으로 바뀐 파일은 기록하지 않으므로 되돌리지 못한다. 5MB 넘는 파일도 기록하지 않는다.
  *  - jupyter 모드에서 노트북 파일을 고친 것도 되돌린다 (중계 서버를 거침).
- *  - 기록은 pi 를 끄면 사라진다. 되돌린 뒤 다음 요청에는 LLM 에게 되돌린 파일을 알려 준다.
+ *  - 기록은 파일에 남는다 (~/.pi/agent/undo/<프로젝트>, 최근 요청 30개·14일): pi 를 다시 켜거나 새 세션이어도 그 폴더의 요청을 되돌린다 (2026-11-05).
+ *    되돌린 뒤 다음 요청에는 LLM 에게 되돌린 파일을 알려 준다.
  *
  * git 기준점 제안: 작업 폴더가 git 저장소가 아니면, pi 가 그 폴더의 파일을 처음 고치기 직전에 한 번 묻는다.
  *  '예' 면 git init 하고 지금 상태를 첫 커밋(기준점)으로 남긴다 (pi 를 끄거나 새 세션을 열어도 git 으로 되돌릴 수 있게).
@@ -24,11 +25,25 @@
  */
 
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { decodeText, readTarget, removeTarget, shown, type Target, target, transformInput, workDir, writeTarget } from "./lib/relay.ts";
+import {
+	decodeText,
+	rawInput,
+	readTarget,
+	removeTarget,
+	shown,
+	type Target,
+	target,
+	transformInput,
+	userAskOf,
+	type WorkDir,
+	workDir,
+	writeTarget,
+} from "./lib/relay.ts";
 
 const MAX_FILE = 5 * 1024 * 1024;
 
@@ -122,24 +137,109 @@ function decline(dir: string) {
 	writeFileSync(offerFile(), `${JSON.stringify(cfg, null, 2)}\n`);
 }
 type Snap = Target & { label: string; before?: Buffer | null; after?: Buffer | null; skip?: string };
-type Checkpoint = { id: number; files: Map<string, Snap> };
+type Checkpoint = { id: string; t: number; req: string; dir: string; files: Map<string, Snap> };
 
 const keyOf = (t: Target) => (t.remote ? "nb:" : "pc:") + t.abs.toLowerCase();
 const same = (a: Buffer | null | undefined, b: Buffer | null | undefined) => (a === null || b === null ? a === b : !!a && !!b && a.equals(b));
 
+// ── 되돌리기 기록을 파일에 (2026-11-05, Claude Code 의 체크포인트(30일 보관)를 보고: pi 를 다시 켜거나 새 세션이어도 /undo) ──
+//  ~/.pi/agent/undo/<프로젝트>/index.json (요청마다 시각·요청·파일마다 고치기 전·후 내용의 id) + 내용 파일 <id>.bin (같은 내용은 하나만).
+//  프로젝트마다 최근 요청 UNDO_KEEP 개, UNDO_DAYS 일까지, 내용 파일은 모두 UNDO_MAX 까지 (넘으면 오래된 요청부터 뺌)
+export const UNDO_KEEP = 30;
+export const UNDO_DAYS = 14;
+export const UNDO_MAX = 200 * 1024 * 1024;
+/** before·after: 내용 파일 id, null 은 '파일이 없었음' (새로 만든 파일·지운 파일), 없으면 기록 못 함 */
+export type SavedSnap = { abs: string; remote: boolean; label: string; before?: string | null; after?: string | null; skip?: string };
+export type SavedCp = { id: string; t: number; req: string; files: SavedSnap[] };
+const agentDirOf = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+/** 프로젝트(작업 폴더, jupyter 모드면 노트북 폴더)마다 기록 폴더: 끝 두 이름 + 경로의 짧은 해시 */
+export function undoDir(wd: WorkDir, root = join(agentDirOf(), "undo")): string {
+	const p = String(wd.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "");
+	const id = (wd.remote ? "nb:" : "pc:") + (!wd.remote && process.platform === "win32" ? p.toLowerCase() : p);
+	const name = p.split("/").filter((x) => x && !/^[A-Za-z]:$/.test(x)).slice(-2).join("-").replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(0, 60) || "home";
+	return join(root, `${wd.remote ? "nb-" : ""}${name}-${createHash("sha256").update(id).digest("hex").slice(0, 8)}`);
+}
+const blobId = (b: Buffer) => createHash("sha1").update(b).digest("hex");
+export function loadCps(dir: string): SavedCp[] {
+	try {
+		const v = JSON.parse(readFileSync(join(dir, "index.json"), "utf8"));
+		return Array.isArray(v?.cps) ? v.cps.filter((c: any) => c && typeof c.id === "string" && Array.isArray(c.files)) : [];
+	} catch {
+		return [];
+	}
+}
+export const readBlob = (dir: string, id: string): Buffer | null => {
+	try {
+		return readFileSync(join(dir, `${id}.bin`));
+	} catch {
+		return null;
+	}
+};
+/** 오래된 요청·넘치는 내용을 빼고, 어디에도 쓰지 않는 내용 파일을 지움 */
+function pruneCps(dir: string, cps: SavedCp[], now: number): SavedCp[] {
+	let keep = cps
+		.filter((c) => c.files.length && now - c.t < UNDO_DAYS * 86400_000)
+		.sort((a, b) => a.t - b.t)
+		.slice(-UNDO_KEEP);
+	const size = (id: string) => {
+		try {
+			return statSync(join(dir, `${id}.bin`)).size;
+		} catch {
+			return 0;
+		}
+	};
+	const ids = (cs: SavedCp[]) => new Set(cs.flatMap((c) => c.files.flatMap((f) => [f.before, f.after].filter((x): x is string => typeof x === "string"))));
+	while (keep.length > 1 && [...ids(keep)].reduce((a, id) => a + size(id), 0) > UNDO_MAX) keep = keep.slice(1);
+	const used = ids(keep);
+	try {
+		for (const f of readdirSync(dir)) if (f.endsWith(".bin") && !used.has(f.slice(0, -4))) unlinkSync(join(dir, f));
+	} catch {}
+	return keep;
+}
+function writeIndex(dir: string, cps: SavedCp[]) {
+	mkdirSync(dir, { recursive: true });
+	const tmp = join(dir, `index.json.${process.pid}.tmp`);
+	writeFileSync(tmp, `${JSON.stringify({ v: 1, cps }, null, 1)}\n`);
+	try {
+		renameSync(tmp, join(dir, "index.json"));
+	} catch {
+		writeFileSync(join(dir, "index.json"), `${JSON.stringify({ v: 1, cps }, null, 1)}\n`);
+	}
+}
+/** 요청 하나의 기록을 파일에 (같은 id 면 바꿈). 내용은 처음 보는 것만 씀. 다른 pi 가 쓴 기록은 그대로 */
+export function saveCp(dir: string, cp: { id: string; t: number; req: string; files: Snap[] }, now = Date.now()) {
+	mkdirSync(dir, { recursive: true });
+	const put = (b: Buffer | null | undefined): string | null | undefined => {
+		if (b === null || b === undefined) return b;
+		const id = blobId(b);
+		if (!existsSync(join(dir, `${id}.bin`))) writeFileSync(join(dir, `${id}.bin`), b);
+		return id;
+	};
+	const files: SavedSnap[] = cp.files.map((s) =>
+		s.skip ? { abs: s.abs, remote: s.remote, label: s.label, skip: s.skip } : { abs: s.abs, remote: s.remote, label: s.label, before: put(s.before), after: put(s.after) },
+	);
+	const cps = loadCps(dir).filter((c) => c.id !== cp.id);
+	cps.push({ id: cp.id, t: cp.t, req: cp.req, files });
+	writeIndex(dir, pruneCps(dir, cps, now));
+}
+/** 되돌린 요청의 기록을 뺌 */
+export function dropCps(dir: string, ids: string[], now = Date.now()) {
+	writeIndex(dir, pruneCps(dir, loadCps(dir).filter((c) => !ids.includes(c.id)), now));
+}
+
 export default function (pi: ExtensionAPI) {
-	// 기록은 확장을 다시 불러와도(/kit share, /reload) 이어 간다. 새 세션(/new, /resume)이면 새로 시작 (pi 를 끄면 사라짐)
-	// note: 다음 요청에 붙일 알림 (되돌린 파일)
+	// 기록은 파일에 (~/.pi/agent/undo/<프로젝트>/): pi 를 다시 켜거나 새 세션(/new, /resume)이어도 그 폴더의 최근 요청을 되돌림 (2026-11-05)
+	// note: 다음 요청에 붙일 알림 (되돌린 파일), req: 지금 요청의 첫 줄 (기록에 남김)
 	// gitChecked: 이 세션에서 git 기준점을 이미 살펴본 작업 폴더
-	const S: { history: Checkpoint[]; seq: number; note: string; gitChecked?: Set<string> } = ((globalThis as any).__piUndo ||= {
-		history: [],
+	const S: { seq: number; note: string; req: string; gitChecked?: Set<string> } = ((globalThis as any).__piUndo ||= {
 		seq: 0,
 		note: "",
+		req: "",
 	});
 	let current: Checkpoint | null = null;
 
 	pi.on("session_start", async (event: any) => {
-		if (event?.reason !== "reload") Object.assign(S, { history: [], note: "", gitChecked: new Set() });
+		if (event?.reason !== "reload") Object.assign(S, { note: "", req: "", gitChecked: new Set() });
 	});
 
 	// 고치기 직전 (아래의 '고치기 직전 내용' 보다 먼저: 기준점은 고치기 전 상태로)
@@ -202,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 			"이 폴더를 git 으로 관리할까요?",
 			[
 				`pi 가 이 폴더의 파일을 처음 고치려고 합니다: ${shown(t)}`,
-				"이 폴더는 git 저장소가 아니라서 /undo 기록은 pi 를 끄거나 새 세션을 열면 사라집니다.",
+				"이 폴더는 git 저장소가 아니라서 /undo 로 되돌릴 수 있는 것은 최근 요청 30개(14일)까지이고, 셸 명령으로 바뀐 파일은 되돌리지 못합니다.",
 				`'예' 면 git init 하고 지금 상태(파일 ${files.n}개)를 첫 커밋(기준점)으로 남겨, 나중에도 git 으로 되돌릴 수 있게 합니다.`,
 				...(ignore.length ? [`${ignore.join("·")} 폴더는 .gitignore 에 넣어 뺍니다.`] : []),
 				...(email ? [] : ["커밋 이름이 설정되어 있지 않아 이 저장소에만 'pi <pi@localhost>' 로 적습니다."]),
@@ -237,10 +337,15 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("agent_start", async () => {
-		current = { id: ++S.seq, files: new Map() };
-		S.history.push(current);
-		if (S.history.length > 30) S.history.shift();
+		const t = Date.now();
+		current = { id: `${t.toString(36)}-${process.pid}-${++S.seq}`, t, req: S.req, dir: undoDir(workDir()), files: new Map() };
 	});
+	/** 지금 요청의 기록을 파일에 (파일을 고칠 때마다: pi 가 도중에 꺼져도 남게) */
+	const persist = (cp: Checkpoint) => {
+		try {
+			saveCp(cp.dir, { id: cp.id, t: cp.t, req: cp.req, files: [...cp.files.values()] });
+		} catch {}
+	};
 
 	// 고치기 직전 내용 (요청마다 파일당 한 번)
 	pi.on("tool_call", async (event: any) => {
@@ -271,9 +376,15 @@ export default function (pi: ExtensionAPI) {
 		}
 		// 바뀐 것이 없으면(실패한 고치기 등) 기록하지 않음: /undo 가 빈 요청을 되돌리느라 한 번을 쓰지 않게
 		if (same(snap.after, snap.before)) current.files.delete(keyOf(snap));
+		persist(current);
 	});
 
 	pi.on("input", async (event: any) => {
+		const said = String(event.text || "");
+		if (said && !said.startsWith("/")) {
+			const req = event.source === "extension" ? userAskOf(said) || "" : rawInput(said);
+			if (req.trim() || event.source !== "extension") S.req = req.trim().split("\n")[0].slice(0, 80);
+		}
 		if (!S.note || !event.text || event.text.startsWith("/")) return;
 		const text = `${S.note}\n\n${event.text}`;
 		S.note = "";
@@ -284,12 +395,24 @@ export default function (pi: ExtensionAPI) {
 		description: "pi 가 고친 파일을 원래대로 (/undo: 마지막 요청, /undo 2: 마지막 두 요청). 셸 명령으로 바뀐 파일은 제외",
 		handler: async (args, ctx) => {
 			const n = Math.max(1, Number.parseInt(String(args || "1"), 10) || 1);
-			const cps = S.history.filter((c) => c.files.size > 0).slice(-n).reverse(); // 최근 것부터
-			if (!cps.length) return ctx.ui.notify("되돌릴 변경이 없습니다 (pi 가 이번 실행에서 write·edit 로 고친 파일만 기록합니다)", "info");
+			const dir = undoDir(workDir());
+			const cps = loadCps(dir)
+				.filter((c) => c.files.length > 0)
+				.sort((a, b) => a.t - b.t)
+				.slice(-n)
+				.reverse(); // 최근 것부터
+			if (!cps.length) return ctx.ui.notify(`되돌릴 변경이 없습니다 (이 작업 폴더에서 pi 가 write·edit 로 고친 파일을 최근 ${UNDO_KEEP}개 요청, ${UNDO_DAYS}일까지 기록합니다)`, "info");
+			const when = (t: number) => {
+				const d = new Date(t);
+				const p = (x: number) => String(x).padStart(2, "0");
+				return `${d.toDateString() === new Date().toDateString() ? "" : `${d.getMonth() + 1}/${d.getDate()} `}${p(d.getHours())}:${p(d.getMinutes())}`;
+			};
 			const plan: string[] = [];
-			for (const cp of cps)
-				for (const s of cp.files.values())
+			for (const cp of cps) {
+				plan.push(`${when(cp.t)}${cp.req ? ` "${cp.req.length > 50 ? `${cp.req.slice(0, 50)}…` : cp.req}"` : ""}`);
+				for (const s of cp.files)
 					plan.push(s.skip ? `  되돌릴 수 없음: ${s.label} (${s.skip})` : `  ${s.before === null ? "지움 (새로 만든 파일)" : "복원"}: ${s.label}`);
+			}
 			const ok = await ctx.ui.confirm(
 				`되돌릴까요? (요청 ${cps.length}개)`,
 				`${plan.join("\n")}\n\n셸 명령(bash)으로 바뀐 파일은 되돌리지 않습니다.`,
@@ -298,27 +421,34 @@ export default function (pi: ExtensionAPI) {
 			const done: string[] = [];
 			const skipped: string[] = [];
 			for (const cp of cps) {
-				for (const s of cp.files.values()) {
-					if (s.skip || s.before === undefined) {
+				for (const s of cp.files) {
+					const before = typeof s.before === "string" ? readBlob(dir, s.before) : s.before;
+					const after = typeof s.after === "string" ? readBlob(dir, s.after) : s.after;
+					if (s.skip || before === undefined || (typeof s.before === "string" && before === null)) {
 						skipped.push(`${s.label} (${s.skip || "기록 없음"})`);
 						continue;
 					}
 					try {
 						const cur = await readTarget(s);
-						if (same(cur, s.before)) continue; // 이미 원래 내용
-						if (s.after === undefined || !same(cur, s.after)) {
+						if (same(cur, before)) continue; // 이미 원래 내용
+						if (after === undefined || (typeof s.after === "string" && after === null) || !same(cur, after)) {
 							skipped.push(`${s.label} (그 뒤에 다른 변경이 있어 덮어쓰지 않음)`);
 							continue;
 						}
-						if (s.before === null) await removeTarget(s);
-						else await writeTarget(s, s.before);
+						if (before === null) await removeTarget(s);
+						else await writeTarget(s, before);
 						done.push(s.label);
 					} catch (e) {
 						skipped.push(`${s.label} (${(e as Error).message})`);
 					}
 				}
 			}
-			S.history = S.history.filter((c) => !cps.includes(c));
+			try {
+				dropCps(
+					dir,
+					cps.map((c) => c.id),
+				);
+			} catch {}
 			if (done.length) S.note = `(사용자가 /undo 로 앞 요청에서 바꾼 파일을 원래대로 돌렸습니다: ${done.join(", ")}. 지금 파일 내용을 기준으로 이어 가세요.)`;
 			const msg = [done.length ? `되돌렸습니다: ${done.join(", ")}` : "되돌린 파일이 없습니다", ...(skipped.length ? [`그대로 둠: ${skipped.join(", ")}`] : [])];
 			ctx.ui.notify(msg.join(" / "), skipped.length ? "warning" : "info");

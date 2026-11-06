@@ -1,7 +1,7 @@
 // 되돌리기(profiles/common/agent-template/extensions/undo.ts) 단위 테스트: git 기준점 제안, HTML 표기 풀기
 // 사용법: node tests/test_undo.mjs   (Node 20.15 이상. 저장소의 runtime/node_modules/jiti 로 .ts 를 불러옴. git 이 없으면 git 부분은 건너뜀)
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
@@ -175,6 +175,81 @@ if (!hasGit) {
 	await emit("session_start", { reason: "new" });
 	await emit("tool_call", { toolName: "write", input: { path: join(proj5, "a.txt") } });
 	check("그래서 다음 세션에는 다시 물음", asked.length === 5, asked.length);
+}
+
+// 되돌리기 기록을 파일에 (2026-11-05): pi 를 다시 켜거나 새 세션이어도 그 폴더의 최근 요청을 /undo
+{
+	process.env.PI_GIT_OFFER = "0";
+	const p6 = join(tmp, "proj6");
+	const A = mk("proj6/a.txt", "v0");
+	const NEW = join(p6, "new.txt");
+	const wd6 = { remote: false, cwd: p6 };
+	globalThis.__piWorkDir = wd6;
+	const D = u.undoDir(wd6);
+	check("기록 폴더: ~/.pi/agent/undo/<끝 두 이름>-<해시>, 폴더마다 다름 (Windows 는 대소문자 무시), 노트북 폴더는 nb-",
+		D.startsWith(join(tmp, "agent", "undo")) && /[\\/]undo[\\/][^\\/]*proj6-[0-9a-f]{8}$/.test(D) && u.undoDir({ remote: false, cwd: join(tmp, "proj7") }) !== D
+		&& (!win || u.undoDir({ remote: false, cwd: p6.toUpperCase() }).toLowerCase() === D.toLowerCase()) && /[\\/]nb-[^\\/]+$/.test(u.undoDir({ remote: true, cwd: "/home/jovyan/proj6" })), D);
+	const req = async (text, edits, o = on) => {
+		const em = async (e, ev = {}) => {
+			for (const f of o[e] || []) await f(ev, ctx);
+		};
+		await em("input", { text, source: "interactive" });
+		await em("agent_start");
+		for (const [p, v] of edits) {
+			await em("tool_call", { toolName: existsSync(p) ? "edit" : "write", input: { path: p } });
+			if (v !== undefined) writeFileSync(p, v);
+			await em("tool_result", { toolName: existsSync(p) ? "edit" : "write", input: { path: p } });
+		}
+	};
+	await emit("session_start", { reason: "startup" });
+	await req("첫 요청: a 고치고 new 만들기", [[A, "v1"], [NEW, "n1"]]);
+	let cps = u.loadCps(D);
+	check("고칠 때마다 파일에 기록: 요청의 첫 줄, 파일마다 고치기 전·후 (새로 만든 파일은 '없었음'), 내용 파일",
+		cps.length === 1 && cps[0].req === "첫 요청: a 고치고 new 만들기" && cps[0].files.length === 2 && cps[0].files[1].before === null
+		&& u.readBlob(D, cps[0].files[0].before)?.toString() === "v0" && u.readBlob(D, cps[0].files[0].after)?.toString() === "v1", cps);
+	await req("둘째 요청", [[A, "v2"], [NEW, undefined]]);
+	cps = u.loadCps(D);
+	check("바뀐 것이 없는 고치기(실패한 고치기 등)는 기록하지 않음", cps.length === 2 && cps[1].files.length === 1 && cps[1].req === "둘째 요청", cps.map((c) => c.files.length));
+	// pi 를 다시 켬: 확장을 새로 (세션 상태 없음)
+	delete globalThis.__piUndo;
+	const on2 = {};
+	const cmds2 = {};
+	u.default({ on: (e, f) => (on2[e] ||= []).push(f), registerCommand: (n, d) => (cmds2[n] = d) });
+	for (const f of on2.session_start || []) await f({ reason: "startup" }, ctx);
+	answer = true;
+	const a0 = asked.length;
+	await cmds2.undo.handler("", ctx);
+	check("다시 켠 뒤 /undo: 파일의 기록으로 마지막 요청을 되돌림 (묻는 창에 시각·요청·파일), 그 기록은 뺌",
+		readFileSync(A, "utf8") === "v1" && existsSync(NEW) && asked.length === a0 + 1 && asked.at(-1)[0] === "되돌릴까요? (요청 1개)"
+		&& asked.at(-1)[1].includes('"둘째 요청"') && asked.at(-1)[1].includes("복원: ") && u.loadCps(D).length === 1 && notes.at(-1)[0].startsWith("되돌렸습니다:"), [asked.at(-1), notes.at(-1)]);
+	let r = null;
+	for (const f of on2.input || []) r = (await f({ text: "다음 요청", source: "interactive" }, ctx)) ?? r;
+	check("다음 요청에 되돌린 파일을 알림", r?.text?.startsWith("(사용자가 /undo 로 앞 요청에서 바꾼 파일을 원래대로 돌렸습니다:") && r.text.endsWith("다음 요청"), r);
+	await cmds2.undo.handler("1", ctx);
+	check("한 번 더: 그 앞 요청 (새로 만든 파일은 지움)", readFileSync(A, "utf8") === "v0" && !existsSync(NEW) && asked.at(-1)[1].includes("지움 (새로 만든 파일)") && u.loadCps(D).length === 0, asked.at(-1));
+	await cmds2.undo.handler("", ctx);
+	check("기록이 없으면 알림", notes.at(-1)[0].startsWith("되돌릴 변경이 없습니다") && notes.at(-1)[0].includes(`${u.UNDO_DAYS}일`), notes.at(-1));
+	await req("셋째", [[A, "v3"]], on2);
+	writeFileSync(A, "사용자가 고침");
+	await cmds2.undo.handler("", ctx);
+	check("그 뒤에 다른 변경이 있으면 덮어쓰지 않음", readFileSync(A, "utf8") === "사용자가 고침" && notes.at(-1)[0].includes("그 뒤에 다른 변경이 있어 덮어쓰지 않음"), notes.at(-1));
+	await req("넷째", [[A, "v4"]], on2);
+	await req("다섯째", [[A, "v5"]], on2);
+	answer = false;
+	await cmds2.undo.handler("2", ctx);
+	check("'아니요' 면 그대로 (기록도 그대로)", readFileSync(A, "utf8") === "v5" && u.loadCps(D).length === 2 && asked.at(-1)[0] === "되돌릴까요? (요청 2개)");
+	answer = true;
+	await cmds2.undo.handler("2", ctx);
+	check("/undo 2: 두 요청을 최근 것부터 차례로", readFileSync(A, "utf8") === "사용자가 고침" && u.loadCps(D).length === 0, readFileSync(A, "utf8"));
+	// 보관: UNDO_DAYS 일이 지난 기록, UNDO_KEEP 개를 넘는 기록은 빼고 쓰지 않는 내용 파일은 지움
+	const snap = (b, a) => ({ abs: A, remote: false, label: "a.txt", before: Buffer.from(b), after: Buffer.from(a) });
+	u.saveCp(D, { id: "old", t: Date.now() - (u.UNDO_DAYS + 1) * 86400_000, req: "옛", files: [snap("옛 전", "옛 후")] });
+	for (let i = 0; i < u.UNDO_KEEP + 2; i++) u.saveCp(D, { id: `k${i}`, t: Date.now() - (100 - i) * 1000, req: `r${i}`, files: [snap(`b${i}`, `a${i}`)] });
+	cps = u.loadCps(D);
+	const bins = readdirSync(D).filter((f) => f.endsWith(".bin")).length;
+	check(`보관: ${u.UNDO_DAYS}일이 지난 기록과 ${u.UNDO_KEEP}개를 넘는 오래된 기록은 빼고, 그 내용 파일도 지움`,
+		cps.length === u.UNDO_KEEP && !cps.some((c) => c.id === "old" || c.id === "k0" || c.id === "k1") && cps.at(-1).id === `k${u.UNDO_KEEP + 1}` && bins === u.UNDO_KEEP * 2, [cps.length, bins]);
+	delete process.env.PI_GIT_OFFER;
 }
 
 if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

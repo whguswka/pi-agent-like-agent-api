@@ -28,6 +28,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	oneDialog,
 	rawInput,
 	readHead,
 	readTarget,
@@ -159,6 +160,35 @@ const isBridge = () => {
 		return false;
 	}
 };
+/** 내 설정 파일(bridge.json)의 값 하나 */
+const userSetting = (key: string): unknown => {
+	try {
+		const p = process.env.PI_COPILOT_USER_CONFIG || join(agentDirOf(), "bridge.json");
+		return (JSON.parse(readFileSync(p, "utf8").replace(/^﻿/, "")) || {})[key];
+	} catch {
+		return undefined;
+	}
+};
+
+// ── 기억 제안 (2026-11-05: Claude Code 의 자동 메모리를 보고. 모델이 스스로 적지 않고, 사용자가 고른 것만 지침에) ──
+// 앞으로도 지키라는 말: '앞으로·다음부터·항상·절대' 같은 말이 든 문장. 묻는 말, 고맙다는 말, 있는 일을 적은 말('항상 이 오류가 나')은 뺌
+const RULE_MARK = /(앞으로(?:는|도)?\s|다음부터(?:는)?\s|이제부터(?:는)?\s|지금부터(?:는)?\s|항상|매번|언제나|절대(?:로)?\s|늘\s|\bfrom now on\b|\balways\b|\bnever\b)/i;
+const NOT_RULE = /(고마워|고맙|감사|좋아|좋았|좋네|미안|수고|잘했|훌륭)|(?:나|난다|나요|납니다|돼요|됐어|됐다|했어|했다|했네|있어|있다|있네|없어|없다|이에요|예요|입니다|었어|았어|였어|더라)\s*[.!。]*$/;
+/** 요청에서 앞으로도 지킬 내용으로 보이는 문장 하나 (없으면 null). 앞의 '앞으로는·다음부터' 는 떼고 돌려줌 */
+export function memoryCandidate(text: string): string | null {
+	const t = String(text || "").replace(/```[\s\S]*?(```|$)/g, " ");
+	if (t.length > 1500) return null; // 붙여 넣은 긴 글은 보지 않음
+	for (const raw of t.split(/(?<=[.!?。])\s+|\n+/)) {
+		const s = raw.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim();
+		if (s.length < 8 || s.length > 200 || !RULE_MARK.test(s) || /[?？]\s*$/.test(s) || NOT_RULE.test(s)) continue;
+		return s
+			.replace(/^(?:앞으로(?:는|도)?|다음부터(?:는)?|이제부터(?:는)?|지금부터(?:는)?)\s+/, "")
+			.replace(/[.。!]+$/, "")
+			.trim();
+	}
+	return null;
+}
+
 // 명령 이름 + 조사: '/new 를', '/resume 을' (읽는 소리의 끝에 맞춤. 2026-10-21 시험에서 '/new 을' 로 보임)
 const cmdObj = (cmd: string) => `/${cmd} ${cmd === "new" ? "를" : "을"}`;
 
@@ -440,7 +470,7 @@ export default function (pi: ExtensionAPI) {
 
 	// /new·/resume: 이 세션에 요청이 여럿이면 다음 세션에 넘길 요약을 남길지 한 번 묻는다 (모델에게 한 번 묻는 것이라)
 	pi.on("session_before_switch", async (event: any, ctx: any) => {
-		if (!recallOn() || W.handoff || W.turns < HANDOFF_MIN || (globalThis as any).__piMode === "plan") return;
+		if (!recallOn() || W.handoff || W.turns < HANDOFF_MIN || (globalThis as any).__piMode === "plan" || (globalThis as any).__piSwitchQuiet) return;
 		try {
 			if (!ctx?.hasUI || !ctx.isIdle()) return;
 		} catch {
@@ -540,39 +570,82 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	/** 기억할 곳: 이 프로젝트(작업 폴더의 AGENTS.md, jupyter 모드면 노트북의 것), 모든 프로젝트(~/.pi/agent/AGENTS.md) */
+	const places = (): [string, Target][] => {
+		const project = target("AGENTS.md", workDir());
+		const global = target(join(agentDirOf(), "AGENTS.md"), { remote: false, cwd: process.cwd() });
+		return [
+			[`이 프로젝트만: ${label(project)}`, project],
+			[`모든 프로젝트: ${label(global)}`, global],
+		];
+	};
+	/** 지침 파일의 "## 기억할 것" 에 한 줄 더하고, 지금 대화에는 다음 요청과 함께 알림 */
+	async function saveMemory(ctx: any, item: string, t: Target) {
+		try {
+			const old = await readTarget(t);
+			const text = old ? old.toString("utf8") : "";
+			// UTF-8 이 아닌 파일(메모장의 ANSI·UTF-16 저장 등)은 다시 쓰면 한글이 깨지므로 고치지 않음
+			if (old && (old.includes(0) || !Buffer.from(text, "utf8").equals(old)))
+				return ctx.ui.notify(`${label(t)} 이 UTF-8 이 아니라 고치지 않았습니다. 편집기에서 UTF-8 로 저장한 뒤 다시 해 주세요`, "error");
+			const next = addMemory(text, item);
+			if (next === null) return ctx.ui.notify(`이미 적혀 있습니다 (${label(t)})`, "info");
+			await writeTarget(t, Buffer.from(next, "utf8"));
+		} catch (e) {
+			return ctx.ui.notify(`적지 못했습니다 (${label(t)}): ${(e as Error).message}`, "error");
+		}
+		S.notes.push(item);
+		ctx.ui.notify(`기억했습니다 → ${label(t)} 의 "${HEAD.slice(3)}". 지금 대화에는 다음 요청과 함께 알려 줍니다 (지우려면 그 파일에서 줄을 지우세요)`, "info");
+	}
+
 	pi.registerCommand("remember", {
 		description: "앞으로도 지킬 내용을 지침(AGENTS.md)에 적어 둠. 예: /remember 커밋 메시지는 한국어로",
 		handler: async (args, ctx) => {
 			const item = String(args || "").replace(/\s+/g, " ").trim();
 			if (!item) return ctx.ui.notify("사용법: /remember <기억할 내용>   예) /remember 테스트는 pytest -q 로 돌린다", "info");
-			const wd = workDir();
-			const project = target("AGENTS.md", wd);
-			const global = target(join(agentDirOf(), "AGENTS.md"), { remote: false, cwd: process.cwd() });
-			let t = project;
+			const opts = places();
+			let t = opts[0][1];
 			if (ctx.hasUI) {
-				const opts: [string, Target][] = [
-					[`이 프로젝트만: ${label(project)}`, project],
-					[`모든 프로젝트: ${label(global)}`, global],
-				];
 				const pick = await ctx.ui.select(`어디에 기억할까요? "${cut(item)}"`, opts.map((o) => o[0]));
 				const found = opts.find((o) => o[0] === pick);
 				if (!found) return;
 				t = found[1];
 			}
-			try {
-				const old = await readTarget(t);
-				const text = old ? old.toString("utf8") : "";
-				// UTF-8 이 아닌 파일(메모장의 ANSI·UTF-16 저장 등)은 다시 쓰면 한글이 깨지므로 고치지 않음
-				if (old && (old.includes(0) || !Buffer.from(text, "utf8").equals(old)))
-					return ctx.ui.notify(`${label(t)} 이 UTF-8 이 아니라 고치지 않았습니다. 편집기에서 UTF-8 로 저장한 뒤 다시 해 주세요`, "error");
-				const next = addMemory(text, item);
-				if (next === null) return ctx.ui.notify(`이미 적혀 있습니다 (${label(t)})`, "info");
-				await writeTarget(t, Buffer.from(next, "utf8"));
-			} catch (e) {
-				return ctx.ui.notify(`적지 못했습니다 (${label(t)}): ${(e as Error).message}`, "error");
-			}
-			S.notes.push(item);
-			ctx.ui.notify(`기억했습니다 → ${label(t)} 의 "${HEAD.slice(3)}". 지금 대화에는 다음 요청과 함께 알려 줍니다 (지우려면 그 파일에서 줄을 지우세요)`, "info");
+			await saveMemory(ctx, item, t);
 		},
+	});
+
+	// 기억 제안: 요청에 앞으로도 지킬 말이 있으면, 요청이 끝난 뒤 지침에 기억할지 한 번 묻는다 (모델에게 묻지 않음).
+	//  같은 말은 세션에 한 번, '이 세션에서는 묻지 않음' 이면 그 세션 동안 끔. 끄기: 내 설정 "remember_offer": false
+	const O: { item: string | null; asked: Set<string>; off: boolean } = ((globalThis as any).__piRememberOffer ||= { item: null, asked: new Set(), off: false });
+	pi.on("session_start", async (event: any) => {
+		if (event?.reason !== "reload") Object.assign(O, { item: null, asked: new Set(), off: false });
+	});
+	pi.on("input", async (event: any) => {
+		const text = String(event.text || "");
+		if (event.source === "extension" || text.startsWith("/") || O.off) return;
+		const item = memoryCandidate(rawInput(text));
+		if (item && !O.asked.has(item)) O.item = item;
+	});
+	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
+		const item = O.item;
+		O.item = null;
+		// 계획 모드(승인 창)·리뷰(고칠지 묻는 창) 뒤에는 묻지 않음: 그 창과 겹침
+		if (!item || O.off || O.asked.has(item) || !ctx?.hasUI || (globalThis as any).__piMode === "plan" || (globalThis as any).__piReview) return;
+		if (userSetting("remember_offer") === false) return;
+		O.asked.add(item);
+		setTimeout(() => {
+			oneDialog(async () => {
+				const opts = places();
+				const no = "기억하지 않음";
+				const quiet = "이 세션에서는 더 묻지 않음";
+				const pick = await ctx.ui.select(
+					`앞으로도 지킬 내용으로 보입니다. 지침(AGENTS.md)에 기억할까요?\n  "${cut(item, 120)}"\n(늘 끄려면 내 설정 파일에 "remember_offer": false)`,
+					[...opts.map((o) => o[0]), no, quiet],
+				);
+				if (pick === quiet) O.off = true;
+				const t = opts.find((o) => o[0] === pick)?.[1];
+				if (t) await saveMemory(ctx, item, t);
+			}).catch(() => {});
+		}, 0);
 	});
 }

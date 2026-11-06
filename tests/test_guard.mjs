@@ -253,6 +253,37 @@ if (process.platform === "win32") {
 	const r9 = await handlers.tool_call({ toolName: "bash", input: { command: "git push origin feature/x" } }, ctx);
 	check("tool_call: guard_allow 에 맞는 명령에 붙인 읽기 전용 폴더 쓰기는 묻고, 맞는 명령만이면 묻지 않음",
 		r8?.block === true && asked.at(-1)?.includes("읽기 전용 폴더에 쓰기") && r9 === undefined, [r8, r9, asked.at(-1)]);
+	// 보호 경로 (2026-11-05): .git 안, 셸 시작 파일, PowerShell 프로필, ~/.ssh, ~/.gitconfig, pi 설정. 작업 폴더 안이어도·guard_outside_writes 를 꺼도 묻기
+	writeFileSync(cfgFile, JSON.stringify({ guard_outside_writes: false }));
+	utimesSync(cfgFile, new Date(), new Date(Date.now() + 10000));
+	const { homedir } = await import("node:os");
+	const H = homedir().replace(/\\/g, "/");
+	const P = (p) => g.protectedPath(g.absPath(p, wd), wd);
+	check("보호 경로: .git 안 (작업 폴더 안이어도), 셸 시작 파일, PowerShell 프로필, ~/.ssh, ~/.gitconfig, pi 설정 / .gitignore·.github·작업 폴더의 .bashrc 는 아님",
+		P(".git/config")?.includes(".git") && P(".git") && P("sub/.git/hooks/pre-commit") && P("~/.bashrc")?.includes("~/.bashrc") && P("~/.zshrc") && P("~/.profile")
+		&& P(`${H}/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1`)?.includes("PowerShell") && P("~/Documents/PowerShell/profile.ps1")
+		&& P("~/.ssh/authorized_keys")?.includes("ssh") && P("~/.gitconfig") && P(join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "settings.json"))?.includes("pi 설정")
+		&& P(".gitignore") === null && P(".github/workflows/ci.yml") === null && P("tools/.bashrc") === null && P("src/a.py") === null && P("~/work/x.txt") === null,
+		[P(".git/config"), P("~/.bashrc"), P(".gitignore"), P("tools/.bashrc")]);
+	const NB = { remote: true, cwd: "/home/jovyan/work/p", home: "/home/jovyan" };
+	check("보호 경로 (노트북): ~ 는 노트북 홈, 노트북의 ~/.pi 는 이 pi 의 설정이 아님",
+		g.protectedPath(g.absPath("~/.bashrc", NB), NB)?.includes(".bashrc") && g.protectedPath(g.absPath(".git/HEAD", NB), NB) && g.protectedPath(g.absPath("~/.pi/agent/x.json", NB), NB) === null);
+	const pr = (c) => g.protectedRisk(c, wd);
+	check("보호 경로 (bash): > .git/config, echo >> ~/.bashrc, sed -i ~/.zshrc, cp 로 ~/.ssh 에, rm -rf .git, cd .git 뒤 tee, bash -c 안 / git 명령·.gitignore 쓰기는 아님",
+		pr("echo x > .git/config")?.startsWith("보호 경로: git 저장소 안") && pr("echo 'export A=1' >> ~/.bashrc")?.includes("셸 시작 파일") && pr("sed -i 's/a/b/' ~/.zshrc")
+		&& pr("cp id_rsa.pub ~/.ssh/authorized_keys")?.includes("SSH") && pr("rm -rf .git") && pr("cd .git && tee config < x") && pr("bash -c 'echo 1 > .git/HEAD'")
+		&& pr("git commit -m x && git push origin dev") === null && pr("echo node_modules >> .gitignore") === null && pr("cat ~/.bashrc") === null,
+		[pr("echo x > .git/config"), pr("rm -rf .git"), pr("echo node_modules >> .gitignore"), pr("cat ~/.bashrc")]);
+	const k = asked.length;
+	const p1 = await handlers.tool_call({ toolName: "edit", input: { path: ".git/hooks/pre-commit", edits: [] } }, ctx);
+	const p2 = await handlers.tool_call({ toolName: "bash", input: { command: "echo 'alias ll=ls' >> ~/.bashrc" } }, ctx);
+	const p3 = await handlers.tool_call({ toolName: "write", input: { path: "src/b.py", content: "" } }, ctx);
+	check("tool_call: 보호 경로 쓰기는 묻고 거부하면 막음 (guard_outside_writes 를 꺼도), 보통 파일은 묻지 않음",
+		p1?.block === true && asked[k]?.includes("보호 경로: git 저장소 안") && p2?.block === true && asked[k + 1]?.includes("셸 시작 파일") && p3 === undefined && asked.length === k + 2, [p1, p2, asked.slice(k)]);
+	writeFileSync(cfgFile, JSON.stringify({ guard_protected: false }));
+	utimesSync(cfgFile, new Date(), new Date(Date.now() + 15000));
+	const p4 = await handlers.tool_call({ toolName: "edit", input: { path: ".git/hooks/pre-commit", edits: [] } }, ctx);
+	check("guard_protected: false 면 보호 경로는 묻지 않음", p4 === undefined && asked.length === k + 2, [p4, asked.slice(k)]);
 	if (savedCfg === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
 	else process.env.PI_COPILOT_USER_CONFIG = savedCfg;
 	globalThis.__piWorkDir = saved;

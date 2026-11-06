@@ -44,7 +44,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { cleanPath, isPlanDoc, isPlanName, projectRel, type WorkDir } from "./lib/paths.ts";
 import { localPython, NB_FIND_PY, runProc } from "./lib/python.ts";
-import { nbRun, readTarget, shown, shq, type Target, target, userAsk } from "./lib/relay.ts";
+import { nbRun, oneDialog, readTarget, shown, shq, type Target, target, userAsk } from "./lib/relay.ts";
 import { rulesOn, writtenText } from "./lib/rules.ts";
 import { base, parseShell, strip, writtenPaths } from "./lib/shell.ts";
 
@@ -372,6 +372,19 @@ export function followUpText(failed: CheckResult[]): string {
 		"고친 파일(만든 도구·스크립트 등)은 고친 뒤 다시 실행해 결과를 보세요. 고치기 전에 돌린 결과로 확인했다고 쓰지 마세요.",
 		"사용자 승인이 필요한 것(운영 반영, 등록, 이번 요청에서 만들지 않은 데이터 지우기 등)은 하지 말고 답에 적어 물으세요. " +
 			"이번 요청에서 만든 임시 파일·기록을 정리하는 것은 고칠 일에 들어갑니다. 이번 요청과 관계없는 항목은 고치지 말고 알리기만 하세요.",
+	].join("\n");
+}
+
+export const GOAL_ASK = "(목표: 고치고 다시 확인)";
+/** /goal 의 명령이 실패했을 때 pi 에게 보내는 요청 */
+export function goalText(run: string, round: number, max: number, r: { code: number | null; out: string }): string {
+	return [
+		`[목표] 사용자가 정한 목표: \`${run}\` 이(가) 성공(종료 코드 0)할 때까지 고치기 (${round}/${max}번째).`,
+		`지금 결과: ${r.code === null ? "시간 초과·실행 못 함" : `종료 코드 ${r.code}`}`,
+		tail(r.out) || "(출력 없음)",
+		"",
+		"실패한 까닭을 찾아 고치고, 같은 명령으로 다시 확인한 뒤 결과를 답하세요.",
+		"시험·점검 자체를 고치거나 건너뛰어 통과시키지는 마세요 (그래야 한다고 보면 고치지 말고 까닭을 답에 적어 물으세요).",
 	].join("\n");
 }
 
@@ -975,10 +988,13 @@ export default function (pi: ExtensionAPI) {
 		if (known[id] === "yes" || known[id] === "no") return known[id] === "yes";
 		const shownFiles = files.slice(0, 5).join(", ") + (files.length > 5 ? ` 외 ${files.length - 5}개` : "");
 		// 고르기 창: 예·아니요는 이 프로젝트에 남기고, 이번만 건너뛰기·Esc 는 남기지 않음 (릴리스 전 검토: 확인 창은 Esc 도 '아니요' 로 영구 저장됐음)
-		const pick = await ctx.ui.select(
-			`완료 점검: 이 프로젝트의 ${CHECKS_FILE} 에 요청이 끝날 때 돌릴 점검이 있습니다.\n\n  ${c.name}\n  명령: ${c.run}\n  (${wd.remote ? "노트북" : "PC"} ${wd.cwd} 에서)\n\n` +
-				`이번 요청에서 바뀐 파일: ${shownFiles}\n실패하면 결과를 pi 에게 한 번 돌려줍니다. (명령이 바뀌면 다시 묻습니다. 끄기: /hooks off checks)\n\n이 명령을 이 프로젝트에서 요청이 끝날 때마다 실행할까요?`,
-			[CONSENT.yes, CONSENT.no, CONSENT.skip],
+		// 기억 제안(memory.ts)도 요청이 끝난 뒤에 묻으므로 창은 하나씩
+		const pick = await oneDialog(() =>
+			ctx.ui.select(
+				`완료 점검: 이 프로젝트의 ${CHECKS_FILE} 에 요청이 끝날 때 돌릴 점검이 있습니다.\n\n  ${c.name}\n  명령: ${c.run}\n  (${wd.remote ? "노트북" : "PC"} ${wd.cwd} 에서)\n\n` +
+					`이번 요청에서 바뀐 파일: ${shownFiles}\n실패하면 결과를 pi 에게 한 번 돌려줍니다. (명령이 바뀌면 다시 묻습니다. 끄기: /hooks off checks)\n\n이 명령을 이 프로젝트에서 요청이 끝날 때마다 실행할까요?`,
+				[CONSENT.yes, CONSENT.no, CONSENT.skip],
+			),
 		);
 		const yes = pick === CONSENT.yes;
 		if (pick !== CONSENT.yes && pick !== CONSENT.no) return false;
@@ -1104,20 +1120,142 @@ export default function (pi: ExtensionAPI) {
 		if (C.busy) return void (C.queued = { round, t0, gen: C.gen, ctx });
 		startCheck(ctx, round, t0, C.gen);
 	});
+	// 완료 점검이 끝나기를 기다리는 것 (목표 확인은 그 뒤에: 둘이 함께 pi 에게 보내지 않게)
+	let checking: Promise<void> = Promise.resolve();
 	function startCheck(ctx: any, round: number, t0: number, gen: number) {
 		C.busy = true;
-		setTimeout(async () => {
-			try {
-				await doneCheck(ctx, round, t0, gen);
-			} catch {
-			} finally {
-				C.busy = false;
-				const q = C.queued;
-				C.queued = null;
-				if (q) startCheck(q.ctx, q.round, q.t0, q.gen);
-			}
-		}, 0);
+		checking = new Promise<void>((done) =>
+			setTimeout(async () => {
+				try {
+					await doneCheck(ctx, round, t0, gen);
+				} catch {
+				} finally {
+					C.busy = false;
+					const q = C.queued;
+					C.queued = null;
+					if (q) startCheck(q.ctx, q.round, q.t0, q.gen);
+					done();
+				}
+			}, 0),
+		);
 	}
+
+	// ── 목표 (/goal <명령>, 2026-11-05: Claude Code 의 /goal 을 보고. 판정 모델 대신 명령의 종료 코드로, 질문을 더 쓰지 않음) ──
+	// 요청이 끝날 때마다 그 명령을 돌려, 실패하면 결과를 pi 에게 보내 고치게 한다 (내 설정 goal_rounds 번까지, 기본 3). 성공하면 목표를 끝냄.
+	// 완료 점검이 같은 때 pi 에게 보냈으면 이번에는 돌리지 않음 (그 요청이 끝나면 다시). Esc·오류로 끝난 요청, 계획 모드, 리뷰 뒤에는 돌리지 않음
+	type Goal = { run: string; timeout: number; max: number; round: number; key: string };
+	// globalThis 에: /reload·/kit share 로 확장을 새로 불러와도 목표는 그대로 (새 세션이면 지움)
+	const GOAL: { goal: Goal | null; busy: boolean; end: string } = ((globalThis as any).__piGoal ||= { goal: null, busy: false, end: "" });
+	const goalKey = (wd: WorkDir) => `${wd.remote ? "nb:" : ""}${wd.cwd}`;
+	const goalStatus = (ctx: any) => {
+		const g = GOAL.goal;
+		try {
+			ctx.ui.setStatus("goal", g ? fg(ctx, "accent", `목표: ${g.run.length > 40 ? `${g.run.slice(0, 40)}…` : g.run} (${g.round}/${g.max})`) : undefined);
+		} catch {}
+	};
+	let goalSent = false; // 이번 확인이 pi 에게 고치게 보냄
+	async function goalCheck(ctx: any) {
+		const g = GOAL.goal;
+		if (!g || GOAL.busy) return;
+		const wd = workDir(ctx);
+		if (goalKey(wd) !== g.key) return ctx.ui.notify(`목표 확인을 건너뜁니다: 목표를 정한 폴더(${g.key})가 아닙니다 (끄기: /goal off)`, "warning");
+		GOAL.busy = true;
+		try {
+			try {
+				ctx.ui.setStatus("goal", fg(ctx, "accent", `목표 확인 중: ${g.run}`));
+			} catch {}
+			const r = await runCheck({ name: "목표", when: [], run: g.run, timeout: g.timeout }, wd);
+			if (GOAL.goal !== g) return; // 그사이 /goal 로 바꾸거나 끔
+			const out = tail(r.out, 600).trim().split("\n").slice(-6).join("\n");
+			const last = out ? `${out}\n` : r.code === null ? "(시간 초과·실행 못 함)\n" : `(출력 없음, 종료 코드 ${r.code})\n`;
+			if (r.code === 0) {
+				GOAL.goal = null;
+				return ctx.ui.notify(`목표 달성: ${g.run} 이(가) 성공했습니다${g.round ? ` (pi 가 ${g.round}번 고침)` : " (이미 성공)"}`, "info");
+			}
+			if (g.round >= g.max) {
+				GOAL.goal = null;
+				return ctx.ui.notify(`목표를 이루지 못했습니다: ${g.run} (pi 가 ${g.max}번 고친 뒤에도 실패)\n${last}다시 하려면 /goal ${g.run}`, "warning");
+			}
+			if (typeof ctx.isIdle === "function" && !ctx.isIdle())
+				return ctx.ui.notify(`목표 확인: 아직 실패합니다 (새 요청 중이라 pi 에게 보내지 않았습니다. 그 요청이 끝나면 다시 확인)\n${last.trimEnd()}`, "warning");
+			g.round++;
+			goalSent = true;
+			ctx.ui.notify(`목표 확인 실패 (${g.round}/${g.max}) → pi 에게 고치고 다시 확인하게 합니다`, "warning");
+			pi.sendUserMessage(userAsk(goalText(g.run, g.round, g.max, r), GOAL_ASK));
+		} finally {
+			GOAL.busy = false;
+			goalStatus(ctx);
+		}
+	}
+	pi.on("session_start", async (event: any, ctx: any) => {
+		if (event?.reason === "reload") return;
+		GOAL.goal = null;
+		goalStatus(ctx);
+	});
+	pi.on("agent_end", async (event: any) => {
+		const msgs: any[] = event.messages || [];
+		const last = msgs[msgs.length - 1];
+		GOAL.end = last?.role === "assistant" ? String(last.stopReason || "") : "unfinished";
+	});
+	let goalRun: Promise<void> = Promise.resolve(); // 목표 확인이 끝나기를 기다리는 것
+	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
+		const end = GOAL.end;
+		GOAL.end = "";
+		if (!GOAL.goal || end !== "stop" || (globalThis as any).__piMode === "plan" || (globalThis as any).__piReview) return;
+		goalRun = new Promise<void>((done) =>
+			setTimeout(async () => {
+				try {
+					await checking;
+					if (C.round === 1) return; // 완료 점검이 pi 에게 고치게 보냄: 그 요청이 끝나면 목표를 확인
+					await goalCheck(ctx);
+				} catch {
+				} finally {
+					done();
+				}
+			}, 0),
+		);
+	});
+	// 완료 점검·목표 확인이 끝난 뒤 할 일 목록 표시 맞추기 (modes.ts): 함께 pi 에게 보내면 뒤의 것이 '이미 처리 중' 이 됨. 앞의 둘이 보냈으면 쉬지 않으므로 그 요청이 끝날 때 다시
+	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
+		setTimeout(async () => {
+			await checking;
+			await goalRun;
+			const sent = goalSent;
+			goalSent = false;
+			if (C.round === 1 || sent) return;
+			try {
+				(globalThis as any).__piTodoBounce?.(ctx);
+			} catch {}
+		}, 0);
+	});
+	pi.registerCommand("goal", {
+		description: "목표: /goal <명령> 그 명령이 성공할 때까지 요청이 끝날 때마다 돌려, 실패하면 pi 에게 고치게 함 (3번까지). /goal 상태 · /goal off",
+		handler: async (args, ctx) => {
+			const a = String(args || "").trim();
+			const usage = "사용법: /goal <명령> (예: /goal python -m pytest -q) · /goal (지금 목표) · /goal off (끄기)";
+			if (!a) {
+				const g = GOAL.goal;
+				return ctx.ui.notify(g ? `목표: ${g.run} (pi 가 고친 횟수 ${g.round}/${g.max}, ${g.key})\n${usage}` : `정한 목표가 없습니다. ${usage}`, "info");
+			}
+			if (/^(off|끄기|clear|지우기)$/i.test(a)) {
+				const had = !!GOAL.goal;
+				GOAL.goal = null;
+				goalStatus(ctx);
+				return ctx.ui.notify(had ? "목표를 껐습니다" : "정한 목표가 없습니다", "info");
+			}
+			const cfg = readJson(userConfigFile());
+			const n = (v: unknown, d: number, lo: number, hi: number) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.min(Math.max(Math.round(Number(v)), lo), hi) : d);
+			const wd = workDir(ctx);
+			GOAL.goal = { run: a, timeout: n(cfg.goal_timeout, 300, 10, 3600), max: n(cfg.goal_rounds, 3, 1, 10), round: 0, key: goalKey(wd) };
+			goalStatus(ctx);
+			ctx.ui.notify(
+				`목표를 정했습니다: ${a}\n요청이 끝날 때마다 이 명령을 ${wd.remote ? "노트북" : "PC"} ${wd.cwd} 에서 돌려, 실패하면 결과를 pi 에게 보내 고치게 합니다 (${GOAL.goal.max}번까지). 성공하면 끝. 끄기: /goal off`,
+				"info",
+			);
+			// 쉬고 있으면 바로 한 번 확인 (이미 성공이면 끝, 실패면 pi 에게)
+			if (ctx.isIdle()) setTimeout(() => goalCheck(ctx).catch(() => {}), 0);
+		},
+	});
 
 	// ── /hooks, 위험 명령 확인 경고 ───────────────────────────────────────────
 	const fg = (ctx: any, c: string, s: string) => (ctx?.ui?.theme?.fg ? ctx.ui.theme.fg(c, s) : s);
@@ -1143,17 +1281,18 @@ export default function (pi: ExtensionAPI) {
 			`  checks ${checksOn() ? "켜짐" : "꺼짐"}  완료 점검: 프로젝트의 ${CHECKS_FILE} 명령을 요청이 끝날 때 돌려, 실패하면 pi 에게 한 번 돌려줌`,
 			`  rules  ${rulesOn() ? "켜짐" : "꺼짐"}  팀 규칙: .github/copilot-instructions.md·.cursor/rules·.pi/rules 등을 지침과 해당 파일·명령의 도구 결과에 (/rules 로 보기)`,
 			`  syntax ${syntaxOn() ? "켜짐" : "꺼짐"}  문법 확인: write·edit 로 고친 .py·.json·.ipynb·.yaml 이 깨졌으면 그 결과에 알림`,
+			`  todo   ${readJson(userConfigFile()).todo_enforce !== false ? "켜짐" : "꺼짐"}  할 일 목록 강제: 오래 고치지 않으면 쓰기·실행을 막고, 요청 끝에 표시가 안 맞으면 한 번 돌려보냄`,
 			`내 훅 (${extDir().replace(/\\/g, "/")}): ${mine.length ? mine.map((h) => `${h.name} ${h.on ? "켜짐" : "꺼짐"}`).join(", ") : "없음"}`,
 			"  /hooks off mine: 내 훅만 모두 끄기 (키트 훅은 그대로)  ·  /hooks on mine: 다시 켜기",
 		].join("\n");
 	};
 	pi.registerCommand("hooks", {
-		description: "훅 목록과 켜고 끄기: /hooks, /hooks off|on <guard|docs|checks|rules|syntax|내 훅 이름|mine> (mine: 내 훅만 모두, 위험 명령 확인은 그대로)",
+		description: "훅 목록과 켜고 끄기: /hooks, /hooks off|on <guard|docs|checks|rules|syntax|todo|내 훅 이름|mine> (mine: 내 훅만 모두, 위험 명령 확인은 그대로)",
 		handler: async (args: string, ctx: any) => {
 			const [verb, ...rest] = (args || "").trim().split(/\s+/).filter(Boolean);
 			const name = rest.join(" ");
 			if (!verb) return ctx.ui.notify(listText(), "info");
-			if ((verb !== "on" && verb !== "off") || !name) return ctx.ui.notify("사용법: /hooks, /hooks off <guard|docs|checks|rules|syntax|이름|mine>, /hooks on <…>", "warning");
+			if ((verb !== "on" && verb !== "off") || !name) return ctx.ui.notify("사용법: /hooks, /hooks off <guard|docs|checks|rules|syntax|todo|이름|mine>, /hooks on <…>", "warning");
 			const on = verb === "on";
 			if (name === "guard") {
 				if (!on) {
@@ -1190,6 +1329,10 @@ export default function (pi: ExtensionAPI) {
 			if (name === "syntax") {
 				saveSetting("syntax_check", on ? undefined : false);
 				return ctx.ui.notify(`문법 확인을 ${on ? "켰습니다" : "껐습니다"} (다음 도구 결과부터)`, "info");
+			}
+			if (name === "todo") {
+				saveSetting("todo_enforce", on ? undefined : false);
+				return ctx.ui.notify(`할 일 목록 강제를 ${on ? "켰습니다" : "껐습니다"} (쓰기·실행 막기와 요청 끝에 돌려보내기. 다음 도구부터)`, "info");
 			}
 			const mine = myHooks();
 			const pick = name === "mine" ? mine : mine.filter((h) => [h.name, h.name.replace(/\.(ts|js)$/, "")].includes(name));

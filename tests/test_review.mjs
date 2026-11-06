@@ -199,6 +199,117 @@ await cmds.review.handler("", ctx);
 check("pi 가 일하는 중이면 거절 (요청이 끝난 뒤 다시)", sent.length === nSent && notes.at(-1)[0].includes("일하는 중"), notes.at(-1));
 idle = true;
 
+// ── 리뷰 뒤: 다시 확인하기, MR 댓글 글로 저장 (2026-11-05) ─────────────────────
+const FOUND = "1. a.py:2 빈 값 처리가 없습니다. 고칠 방법: (x or 0) + 1\n2. new.txt:1 설명이 부족합니다.";
+const mr = m.mrComment(FOUND, { who: "GPT-6", when: new Date(2026, 10, 5, 14, 3), focus: "보안" });
+check("MR 댓글 글: 제목(모델·시각)·볼 점, 번호 줄은 체크 목록, 파일:줄은 코드 표시, 확인 안 했다는 꼬리",
+	mr.startsWith("### 코드 리뷰 (pi /review · GPT-6 · 2026-11-05 14:03)\n볼 점: 보안") && mr.includes("- [ ] `a.py:2` 빈 값 처리") && mr.includes("- [ ] `new.txt:1` 설명")
+	&& mr.includes("틀린 것이 있을 수 있으니") && !mr.includes("다시 확인한 결과"), mr);
+check("MR 댓글 글: 확인 결과가 있으면 따로 (이미 `` 로 감싼 위치는 그대로)",
+	m.mrComment("1. `a.py:2` x", { who: "w", when: new Date(), verified: "1. a.py:2 맞음\n고칠 것: 1" }).includes("#### 다시 확인한 결과\n\n- [ ] `a.py:2` 맞음") && m.mrComment("1. `a.py:2` x", { who: "w", when: new Date() }).includes("- [ ] `a.py:2` x"));
+const real = m.mrComment("`report.py:6`\n문제: SQL 을 직접 조합합니다.\n고칠 방법: ? 자리표시자.\n**inventory.py:23**\n문제: 빈 목록이면 0 으로 나눔.\n\n시험 여부\n문제: 시험이 없습니다.", { who: "w", when: new Date() });
+check("MR 댓글 글: 번호 없이 위치 줄 + 문제·고칠 방법 줄로 쓴 리뷰(실제 Copilot)도 위치마다 체크 목록, 그 아래 줄은 들여 씀",
+	real.includes("- [ ] `report.py:6`\n  문제: SQL 을 직접 조합합니다.\n  고칠 방법: ? 자리표시자.\n- [ ] `inventory.py:23`\n  문제: 빈 목록이면 0 으로 나눔.") && real.includes("\n시험 여부\n문제: 시험이 없습니다."), real);
+const VER_REAL = "1. **report.py:6** - **맞음**: 닫지 않음\n2. **report.py:4-7** - **맞음**: 예외 처리 없음\n3. **시험 범위 부족** - **맞음**: 호출 시험 없음\n고칠 것:\n1\n2\n3";
+const mrV = m.mrComment("1. `report.py:6` x", { who: "w", when: new Date(), verified: VER_REAL });
+check("MR 댓글 글: 확인 답 끝의 '고칠 것:' 번호 목록은 뺌 (실제 Copilot 은 번호를 한 줄씩), 확인 줄은 남김",
+	!mrV.includes("고칠 것") && mrV.includes("- [ ] **report.py:6** - **맞음**: 닫지 않음") && mrV.includes("호출 시험 없음\n\n_pi 가"), mrV);
+check("'고칠 것:' 빼기: 한 줄 목록·'고칠 것 없음'·굵게도 빼고, 뒤에 번호 아닌 글이 있거나 줄 중간이면 그대로",
+	m.dropFixList("1. a 맞음\n고칠 것: 1, 2") === "1. a 맞음" && m.dropFixList("1. a 아님\n고칠 것 없음") === "1. a 아님" && m.dropFixList("1. a 맞음\n**고칠 것:**\n- 1\n") === "1. a 맞음"
+	&& m.dropFixList("1. a 맞음\n고칠 것:\n1\n덧붙임: 시험도 필요") === "1. a 맞음\n고칠 것:\n1\n덧붙임: 시험도 필요" && m.dropFixList("1. a.py:2 고칠 것이 많음") === "1. a.py:2 고칠 것이 많음");
+check("확인 답이 '고칠 것 없음' 인지", m.verifyClean("1. a.py:2 아님\n고칠 것 없음") && m.verifyClean("고칠 것: 없음") && !m.verifyClean("고칠 것:\n1. a.py:2"));
+check("확인 요청 글: [리뷰] 표시(중계 서버가 '이어서' 부탁을 하지 않게), 읽기만, 맞음·아님·모름, 고칠 것",
+	m.REVIEW_VERIFY.startsWith("[리뷰] (확인)") && m.REVIEW_VERIFY.includes(`${m.VERIFY_TOOLS_MAX}번까지`) && m.REVIEW_VERIFY.includes("'맞음'·'아님'·'모름'") && m.REVIEW_VERIFY.includes("'고칠 것:'"));
+const reviewDone = async (answer) => {
+	await fire("agent_start");
+	await cmds.review.handler("", ctx);
+	await fire("agent_start");
+	await fire("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: answer }], stopReason: "stop" }] });
+};
+ctx.model = models["gpt-5.6-sol-think"];
+st = { model_id: "gpt-6", model: "GPT-6", model_ok: true };
+await reviewDone(FOUND);
+picks = [(o) => o.find((x) => x.startsWith("MR 댓글")), (o) => o.find((x) => x.startsWith("다시 확인하기"))];
+ctx.ui.select = async (t, opts) => (asked.push([t, opts]), (picks.shift() || ((o) => o[0]))(opts));
+let nA = asked.length;
+await fire("agent_settled");
+await tick();
+await tick();
+const rdir = join(process.env.PI_CODING_AGENT_DIR, "review");
+const { readdirSync, readFileSync } = await import("node:fs");
+const mrFiles = () => {
+	try {
+		return readdirSync(rdir);
+	} catch {
+		return [];
+	}
+};
+check("리뷰 뒤 고르기: 고치기·다시 확인하기·MR 댓글 글로 저장·그대로 두기",
+	JSON.stringify(asked[nA]?.[1].map((x) => x.split(" ")[0])) === JSON.stringify(["고치기", "다시", "MR", "그대로"]), asked[nA]);
+check("MR 댓글 글로 저장: ~/.pi/agent/review/<프로젝트>-<시각>.md 에 쓰고 알림 (올리지 않음), 그 항목만 빼고 다시 물음",
+	mrFiles().length === 1 && readFileSync(join(rdir, mrFiles()[0]), "utf8").includes("- [ ] `a.py:2`") && notes.some(([t]) => t.startsWith("MR 댓글 글을 저장했습니다:") && t.includes("올리지 않습니다"))
+	&& asked[nA + 1]?.[1].length === 3 && !asked[nA + 1][1].some((x) => x.startsWith("MR")), [mrFiles(), asked.slice(nA)]);
+check("다시 확인하기: 지금 모델로 [리뷰] (확인) 요청 (모델은 바꾸지 않음)", sent.at(-1).text === m.REVIEW_VERIFY && globalThis.__piReview === "running" && notes.some(([t]) => t.includes("다시 확인합니다")), sent.at(-1).text.slice(0, 40));
+const nSets2 = modelSets.length;
+await fire("agent_start");
+check("확인 중: 쓰기는 막고 읽기는 됨", (await call("write", { path: "a.py", content: "" }))?.block && (await call("read", { path: "a.py" })) === undefined);
+for (let i = 0; i < m.VERIFY_TOOLS_MAX - 1; i++) await call("read", { path: "a.py" });
+const over = await call("read", { path: "a.py" });
+check(`확인 중: 도구는 ${m.VERIFY_TOOLS_MAX}번까지`, over?.block && over.reason.includes(`확인에서 도구는 ${m.VERIFY_TOOLS_MAX}번까지`), over);
+await fire("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "1. a.py:2 맞음 (2줄에 None 처리 없음)\n2. new.txt:1 아님\n고칠 것:\n1. a.py:2" }], stopReason: "stop" }] });
+check("확인이 끝나도 모델은 그대로 (바꾸지 않았음)", modelSets.length === nSets2);
+picks = [(o) => o.find((x) => x.startsWith("MR 댓글")), (o) => o[0]];
+nA = asked.length;
+await fire("agent_settled");
+await tick();
+await tick();
+check("확인 뒤 고르기: 다시 확인하기는 없고, MR 글에 확인 결과도, 고치기는 '맞음인 것만'",
+	asked[nA]?.[0].startsWith("확인(gpt-5.6-sol-think) 결과대로 고칠까요?") && !asked[nA][1].some((x) => x.startsWith("다시 확인")) && asked[nA][1][0].includes("맞음인 것만")
+	&& mrFiles().length === 2 && mrFiles().map((f) => readFileSync(join(rdir, f), "utf8")).some((t) => t.includes("#### 다시 확인한 결과") && t.includes("확인 gpt-5.6-sol-think"))
+	&& sent.at(-1).text === m.REVIEW_FIX_VERIFIED, [asked.slice(nA), sent.at(-1).text.slice(0, 40)]);
+await fire("agent_start");
+check("고치는 요청이 시작되면 확인 상태도 지움", globalThis.__piReview === undefined && (await call("write", { path: "a.py", content: "x" })) === undefined);
+// 확인 답이 '고칠 것 없음' 이면 묻지 않고 알림
+await reviewDone(FOUND);
+picks = [(o) => o.find((x) => x.startsWith("다시 확인하기"))];
+await fire("agent_settled");
+await tick();
+await fire("agent_start");
+await fire("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "1. a.py:2 아님\n2. new.txt:1 아님\n고칠 것 없음" }], stopReason: "stop" }] });
+nA = asked.length;
+await fire("agent_settled");
+await tick();
+check("확인 답이 '고칠 것 없음' 이면 묻지 않고 알림", asked.length === nA && notes.at(-1)[0].includes("고칠 것이 없습니다"), notes.at(-1));
+await fire("agent_start");
+
+// ── /review --new: 새 대화에서 리뷰 (새 세션을 열면 pi 가 확장을 새로 불러옴) ─────────
+check("새 대화 리뷰 글: 앞 대화가 없다고, 이 대화에서 요청한 것은 보지 않음",
+	m.reviewPrompt({ nogit: false, status: "M a", stat: "", diff: "+x", fresh: "" }, "w", "", true).startsWith("[리뷰] 리뷰만 하려고 새 대화를 열었습니다")
+	&& !m.reviewPrompt({ nogit: false, status: "M a", stat: "", diff: "+x", fresh: "" }, "w", "", true).includes("이 대화에서 사용자가 요청한"));
+const ns = [];
+const sent2 = [];
+const on2 = {};
+ctx.newSession = async (o) => {
+	ns.push(o);
+	m.default({ on: (e, f) => (on2[e] ||= []).push(f), registerCommand() {}, sendUserMessage() {}, setModel: async (mm) => (modelSets.push(`new:${mm.id}`), true), registerTool() {} });
+	const c2 = { ...ctx, sendUserMessage: async (t) => sent2.push(t) };
+	for (const f of on2.session_start || []) await f({ reason: "new" }, c2);
+	check("새 세션으로 바꾸는 동안은 작업 기록이 '요약을 남길까요' 를 묻지 않게 표시", globalThis.__piSwitchQuiet === true);
+	await o.withSession(c2);
+	return { cancelled: false };
+};
+globalThis.__piWorkDir = { remote: false, cwd: N };
+await cmds.review.handler("--new", ctx);
+check("/review --new: git 으로 바뀐 내용을 모을 수 없으면 새 세션을 열지 않고 알림", ns.length === 0 && notes.at(-1)[0].includes("새 대화 리뷰는 git 으로"), notes.at(-1));
+globalThis.__piWorkDir = { remote: false, cwd: R };
+const nSent2 = sent.length;
+await cmds.review.handler("--new 경계값", ctx);
+check("/review --new <볼 점>: 새 세션의 확장이 리뷰 모델로 바꾸고, 새 대화에 리뷰 요청 (앞 대화 없음, 볼 점 포함), 앞 세션에는 보내지 않음",
+	ns.length === 1 && modelSets.at(-1) === "new:gpt-6" && sent2.length === 1 && sent2[0].startsWith("[리뷰] 리뷰만 하려고 새 대화를 열었습니다") && sent2[0].includes("경계값") && sent2[0].includes("+    return x + 1")
+	&& sent.length === nSent2 && globalThis.__piReview === "running" && globalThis.__piReviewFresh === null && globalThis.__piSwitchQuiet === false, [modelSets.slice(-2), sent2.map((x) => x.slice(0, 60))]);
+delete ctx.newSession;
+globalThis.__piReview = undefined;
+
 srv.close();
 rmSync(T, { recursive: true, force: true });
 console.log(fails ? `RESULT: FAIL (${fails})` : "RESULT: PASS");

@@ -11,7 +11,9 @@
  *  /watch <로그>  오래 걸리는 작업(학습 등)의 로그를 30초마다 확인해 아래 상태 줄에 마지막 줄을 보여 주고, "[pi-done] exit=N" 줄이
  *             생기면 벨과 알림. /watch 지금 상태 · /watch 보내기 [요청] 로그 끝부분을 pi 에게 · /watch 끄기 (작업은 그대로 돎).
  *             bash 결과에 "[pi-watch] <로그>" 줄이 있으면 저절로 시작한다 (kubeflow-notebook 스킬의 실행 방식)
- * /kit·/doctor 는 편집기 위에 띄우고, 다음 요청을 보내거나 같은 명령을 다시 입력하면 닫는다. LLM 에게는 보내지 않는다.
+ *  /context  다음 요청에 들어가는 것(지침의 부분마다, 도구 설명, 대화 기록)이 몇 자인지 (2026-11-05, Claude Code 의 /context 를 보고.
+ *             사내AI 한 번 1만 자 한도·Copilot 이 느릴 때 무엇이 큰지 보려고). 모델에게 묻지 않음
+ * /kit·/doctor·/context 는 편집기 위에 띄우고, 다음 요청을 보내거나 같은 명령을 다시 입력하면 닫는다. LLM 에게는 보내지 않는다.
  *  ask_user 도구  모델이 사용자만 정할 수 있는 것을 고르기 창으로 묻고 답을 받아 이어서 일한다 (한 요청에 두 번까지, Esc 면 묻지 말고 정리)
  */
 
@@ -258,9 +260,9 @@ function helpLines(): string[] {
 	const lines = [
 		`── pi 빠른 도움말 (버전 ${version()}) ── 닫기: /kit 다시 입력 또는 요청 보내기`,
 		" 입력  Enter 보내기 · Shift+Enter 줄바꿈 · Esc 멈추기 · Ctrl+O 도구 출력 펼치기 · !명령 직접 실행 · @ 파일 고르기(내용이 함께 감)",
-		" 모델  /model 또는 Ctrl+L 고르기 · Ctrl+P 다음 모델",
+		" 모델  /model 또는 Ctrl+L 고르기 · Ctrl+P 다음 모델 · /context 다음 요청에 들어가는 글의 크기 (지침·도구·대화)",
 		" 세션  pi -c 이어서 · /resume 고르기 · /new 새로 · /name 이름 붙이기 · 끝내기 /quit(/exit) 또는 Ctrl+C 두 번",
-		" 작업  /plan 계획부터 (승인하면 진행) · /mode 계획·확인·자동 · /review 바뀐 내용을 리뷰 모델로 검토 · /todo 작업판 (이어서 N·완료 N·폐기 N, 브라우저 /todo open) · /undo pi 가 고친 파일 되돌리기",
+		" 작업  /plan 계획부터 (승인하면 진행) · /mode 계획·확인·자동 · /review 바뀐 내용을 리뷰 모델로 검토 · /todo 작업판 (이어서 N·완료 N·폐기 N, 브라우저 /todo open) · /undo pi 가 고친 파일 되돌리기 · /goal <명령> 통과할 때까지 고치게",
 		` 명령  ${prompts.join(" ") || "(없음)"}`,
 		`       내 명령: ${A}/prompts/<이름>.md`,
 		` 스킬  /skill:이름 → ${skills.join(", ") || "(없음)"}`,
@@ -827,6 +829,131 @@ function writeSettings(v: any) {
 }
 const shared = (v: any) => [...(v.skills || []), ...(v.prompts || [])] as string[];
 
+// ── /context: 다음 요청에 들어가는 것 (2026-11-05) ─────────────────────────────
+const SECTION_LABEL: Record<string, string> = {
+	preamble: "pi 기본 안내",
+	tools: "도구 안내",
+	rules: "규칙",
+	docs: "pi 문서 안내",
+	project_context: "지침 파일 (AGENTS.md 등)",
+	skills: "스킬 목록",
+	cwd: "작업 폴더",
+	team_rules: "팀 규칙",
+	recent_work: "작업 기록 (지난 세션)",
+};
+export type CtxSection = { name: string; label: string; chars: number; parts?: { name: string; chars: number }[]; count?: number };
+/** 시스템 프롬프트 -> 부분마다 글자 수 (pi 0.87: 앞 글 + <이름>…</이름> 덩어리. 지침 파일은 파일마다, 스킬은 수도) */
+export function promptSections(system: string): CtxSection[] {
+	const out: CtxSection[] = [];
+	const re = /^<([a-z_]+)>\n([\s\S]*?)\n<\/\1>$/gm;
+	let last = 0;
+	let m: RegExpExecArray | null;
+	const pre: string[] = [];
+	while ((m = re.exec(system))) {
+		pre.push(system.slice(last, m.index));
+		last = m.index + m[0].length;
+		const s: CtxSection = { name: m[1], label: SECTION_LABEL[m[1]] || `<${m[1]}>`, chars: m[0].length };
+		if (m[1] === "project_context")
+			s.parts = [...m[2].matchAll(/<project_instructions path="([^"]+)">\n[\s\S]*?\n<\/project_instructions>/g)].map((x) => ({ name: tilde(x[1]), chars: x[0].length }));
+		if (m[1] === "skills") s.count = (m[2].match(/<skill>/g) || []).length;
+		out.push(s);
+	}
+	pre.push(system.slice(last));
+	const rest = pre.join("").trim().length;
+	if (rest) out.unshift({ name: "preamble", label: SECTION_LABEL.preamble, chars: rest });
+	return out;
+}
+/** 메시지 하나의 글 (글자 수를 셀 것): 그림·생각(thinking)은 빼고, 도구 호출은 이름과 인자 */
+function msgText(m: any): string {
+	const parts = (c: any): string =>
+		typeof c === "string"
+			? c
+			: Array.isArray(c)
+				? c.map((p: any) => (p?.type === "text" ? String(p.text || "") : p?.type === "toolCall" ? `${p.name || ""}${JSON.stringify(p.arguments ?? {})}` : "")).join("")
+				: "";
+	if (m?.role === "bashExecution") return `${m.command || ""}\n${m.output || ""}`;
+	if (m?.role === "compactionSummary" || m?.role === "branchSummary") return String(m.summary || "");
+	return parts(m?.content);
+}
+const imagesOf = (m: any) => (Array.isArray(m?.content) ? m.content.filter((p: any) => p?.type === "image").length : 0);
+export type CtxInput = {
+	system: string;
+	tools: { name: string; description?: string; parameters?: unknown }[];
+	messages: any[];
+	usage?: { tokens: number | null; contextWindow: number; percent: number | null } | null;
+	provider?: string;
+	maxChars?: number; // 중계 서버가 한 번에 보내는 한도 (Copilot·사내AI)
+	sent?: boolean; // system 이 지난 요청 때 실제로 보낸 지침인지 (요청 때 확장이 더한 것까지)
+	pending?: string[]; // 첫 요청 전: 요청 때 더해져 아직 system 에 없는 것 (jupyter 모드의 노트북 지침 파일 등)
+};
+const n0 = (x: number) => x.toLocaleString("en-US");
+/** /context 화면 (줄 목록) */
+export function contextReport(c: CtxInput): string[] {
+	const secs = promptSections(c.system);
+	const toolChars = c.tools.reduce((a, t) => a + JSON.stringify({ name: t.name, description: t.description || "", parameters: t.parameters ?? {} }).length, 0);
+	const groups: Record<string, { n: number; chars: number }> = { 요청: { n: 0, chars: 0 }, 답: { n: 0, chars: 0 }, "도구 결과": { n: 0, chars: 0 }, 요약: { n: 0, chars: 0 } };
+	const big: { name: string; chars: number }[] = [];
+	let images = 0;
+	for (const m of c.messages) {
+		const role = String(m?.role || "");
+		if (role === "system") continue; // 지침은 위에서 따로
+		const g = role === "assistant" ? "답" : role === "toolResult" ? "도구 결과" : /Summary$/.test(role) ? "요약" : "요청";
+		const chars = msgText(m).length;
+		groups[g].n++;
+		groups[g].chars += chars;
+		images += imagesOf(m);
+		if (role === "toolResult") big.push({ name: String(m.toolName || "도구"), chars });
+	}
+	const talk = Object.values(groups).reduce((a, g) => a + g.chars, 0);
+	const total = c.system.length + toolChars + talk;
+	const pct = (x: number) => (total ? ` (${Math.round((x / total) * 100)}%)` : "");
+	const lines = [`── 다음 요청에 들어가는 것 (pi 가 보내는 글, 모두 ${n0(total)}자) ── 닫기: /context 다시 입력 또는 요청 보내기`];
+	lines.push(` 지침 (시스템 프롬프트) ${n0(c.system.length)}자${pct(c.system.length)}`);
+	for (const s of [...secs].sort((a, b) => b.chars - a.chars)) {
+		lines.push(`   ${s.label} ${n0(s.chars)}자${s.count !== undefined ? ` (스킬 ${s.count}개)` : ""}`);
+		for (const p of [...(s.parts || [])].sort((a, b) => b.chars - a.chars).slice(0, 6)) lines.push(`     - ${p.name} ${n0(p.chars)}자`);
+	}
+	if (c.sent) lines.push("   (지난 요청 때 실제로 보낸 지침: 요청 때 확장이 더한 것까지)");
+	else if (c.pending?.length) lines.push(`   첫 요청 전이라 요청 때 더하는 것은 아직 빠짐: ${c.pending.join(" · ")} (첫 요청 뒤 /context 에 보임)`);
+	lines.push(` 도구 설명 ${c.tools.length}개 ${n0(toolChars)}자${pct(toolChars)}`);
+	const msgCount = Object.values(groups).reduce((a, g) => a + g.n, 0);
+	lines.push(` 대화 기록 ${n0(talk)}자${pct(talk)} (메시지 ${msgCount}개${images ? `, 그림 ${images}개는 글자 수에서 뺌` : ""})`);
+	for (const [k, g] of Object.entries(groups)) if (g.n) lines.push(`   ${k} ${g.n}개 ${n0(g.chars)}자`);
+	const top = big.sort((a, b) => b.chars - a.chars).slice(0, 3).filter((b) => b.chars >= 2000);
+	if (top.length) lines.push(`   큰 도구 결과: ${top.map((b) => `${b.name} ${n0(b.chars)}자`).join(" · ")}`);
+	if (c.usage?.contextWindow)
+		lines.push(
+			` 모델 기준 맥락: ${c.usage.tokens == null ? "아직 모름 (요약 직후 등, 다음 답 뒤에 보임)" : `약 ${n0(c.usage.tokens)} 토큰 / ${n0(c.usage.contextWindow)} (${Math.round(c.usage.percent ?? 0)}%)`}. 차면 pi 가 앞 대화를 요약합니다 (/compact 로 직접)`,
+		);
+	if (c.provider === "copilot" || c.provider === "inhouse") {
+		const who = c.provider === "inhouse" ? "사내AI" : "Copilot";
+		lines.push(` ${who}: 같은 대화에서는 새로 생긴 메시지만 보내고, 새 대화를 열 때(새 세션·지침이 바뀜 등)는 지침·도구·대화 기록을 모두 보냅니다`);
+		if (c.maxChars)
+			lines.push(
+				`   한 번에 보내는 한도 ${n0(c.maxChars)}자 (내 설정 max_chars): 새 대화의 첫 메시지는 약 ${Math.max(1, Math.ceil(total / c.maxChars))}조각` +
+					`${total > c.maxChars ? " (넘는 만큼 나눠 보내거나, attach_long_text 면 글 파일로 붙임)" : ""}`,
+			);
+	}
+	const pc = secs.find((s) => s.name === "project_context");
+	if (pc && c.system.length && pc.chars / c.system.length > 0.5) lines.push(" 줄이려면: 지침 파일이 지침의 절반이 넘습니다. 오래된 '## 기억할 것' 줄이나 다른 도구의 지침(CLAUDE.md 등)을 정리하세요 (/rules 로 어떤 파일인지)");
+	if (top.length && talk > c.system.length) lines.push(" 줄이려면: 대화 기록이 큽니다. 하던 일이 끝났으면 /new (작업 기록은 새 세션에 알려 줌), 이어 가려면 /compact");
+	return lines;
+}
+
+/** 중계 서버가 한 번에 보내는 한도 (내 설정 파일, 없으면 기본값: Copilot 60000, 사내AI 10000) */
+function relayMaxChars(provider: string | undefined): number | undefined {
+	const j = (p: string) => {
+		try {
+			return JSON.parse(read(p) || "{}");
+		} catch {
+			return {};
+		}
+	};
+	if (provider === "inhouse") return Number(j(join(agentDir, "inhouse.json")).max_chars) || 10000;
+	if (provider === "copilot") return Number(j(process.env.PI_COPILOT_USER_CONFIG || join(agentDir, "bridge.json")).max_chars) || 60000;
+	return undefined;
+}
+
 export default function (pi: ExtensionAPI) {
 	let shown: string | null = null; // 지금 띄운 것 ("kit" | "doctor")
 	const show = (ctx: any, what: string, lines: string[] | undefined) => {
@@ -1282,6 +1409,43 @@ export default function (pi: ExtensionAPI) {
 			if (shown === "doctor") return show(ctx, "doctor", undefined);
 			ctx.ui.notify("상태를 확인하는 중입니다 (몇 초 걸림)...", "info");
 			show(ctx, "doctor", await doctorLines());
+		},
+	});
+	// 요청 때 실제로 보낸 지침: pi 0.87 은 요청 사이에 ctx.getSystemPrompt() 가 기본 지침만 돌려주고, 확장이 before_agent_start 에서 더한 것
+	//  (키트 안내, jupyter 모드의 노트북 지침 파일·실행 환경 등)은 요청하는 동안만 들어 있다 (2026-11-05 156 시험: /context 에 노트북 AGENTS.md 가 없음).
+	//  새 세션이면 이 확장을 새로 불러오므로 비어서 시작
+	let sentPrompt = "";
+	pi.on("turn_start", async (_event: unknown, ctx: any) => {
+		try {
+			const s = String(ctx.getSystemPrompt?.() || "");
+			if (s) sentPrompt = s;
+		} catch {}
+	});
+	pi.registerCommand("context", {
+		description: "다음 요청에 들어가는 것: 지침(부분마다)·도구 설명·대화 기록이 몇 자인지. 모델에게 묻지 않음",
+		handler: async (_args, ctx: any) => {
+			if (shown === "context") return show(ctx, "context", undefined);
+			const pending: string[] = [];
+			if (!sentPrompt) {
+				const G = globalThis as any;
+				if (G.__piWorkDir?.remote) {
+					const a = G.__piNbAgents as { path: string; chars: number } | null | undefined;
+					pending.push(a ? `노트북 지침 파일 ${a.path} ${n0(a.chars)}자` : "노트북 지침 파일 (있으면)", "노트북 실행 환경 안내");
+				}
+				pending.push("키트 안내");
+			}
+			const active = new Set<string>((pi as any).getActiveTools?.() || []);
+			const tools = ((pi as any).getAllTools?.() || []).filter((t: any) => !active.size || active.has(t.name));
+			let messages: any[] = [];
+			try {
+				messages = ctx.sessionManager?.buildSessionProjection?.().messages || [];
+			} catch {}
+			let usage = null;
+			try {
+				usage = ctx.getContextUsage?.() || null;
+			} catch {}
+			const provider = ctx.model?.provider;
+			show(ctx, "context", contextReport({ system: sentPrompt || String(ctx.getSystemPrompt?.() || ""), tools, messages, usage, provider, maxChars: relayMaxChars(provider), sent: !!sentPrompt, pending }));
 		},
 	});
 	pi.on("agent_start", async (_event: unknown, ctx: any) => {

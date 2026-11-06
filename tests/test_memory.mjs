@@ -257,6 +257,44 @@ await cmds.recall.handler("save", ctx);
 check("/recall save: 계획 모드에서는 하지 않음, /handoff 는 기본 명령(NOTES.md)으로 남겨 둠 (확장 명령으로 가리지 않음)", notes.at(-1)[0].includes("계획 모드") && !cmds.handoff);
 globalThis.__piMode = "auto";
 
+// 기억 제안 (2026-11-05, Claude Code 의 자동 메모리를 보고): 앞으로도 지킬 말이 든 요청이 끝나면 지침에 기억할지 묻는다
+check("기억할 말 찾기: '앞으로·항상·절대' 가 든 문장, 앞의 '앞으로는' 은 뗌, 묻는 말·고맙다는 말·있는 일·코드 블록은 뺌",
+	m.memoryCandidate("앞으로 커밋 메시지는 한국어로 써 줘") === "커밋 메시지는 한국어로 써 줘"
+	&& m.memoryCandidate("로그 고쳐 줘. 테스트는 항상 pytest -q 로 돌려.") === "테스트는 항상 pytest -q 로 돌려"
+	&& m.memoryCandidate("README 고쳐 줘\n절대 main 에 직접 push 하지 마") === "절대 main 에 직접 push 하지 마"
+	&& m.memoryCandidate("항상 고마워 정말로") === null && m.memoryCandidate("앞으로 어떻게 하면 될까?") === null && m.memoryCandidate("README 를 고쳐 줘") === null
+	&& m.memoryCandidate("이 화면은 항상 이 오류가 나") === null && m.memoryCandidate("```\nalways use x here\n```") === null,
+	[m.memoryCandidate("앞으로 커밋 메시지는 한국어로 써 줘"), m.memoryCandidate("로그 고쳐 줘. 테스트는 항상 pytest -q 로 돌려."), m.memoryCandidate("이 화면은 항상 이 오류가 나")]);
+const offers = [];
+const select0m = ctx.ui.select;
+let offerPick = (o) => o[0];
+ctx.ui.select = async (t, o) => (offers.push(t), offerPick(o));
+const waitT = () => new Promise((r) => setTimeout(r, 80));
+await emit("session_start", { reason: "new" });
+await turn("앞으로 커밋 메시지는 한국어로 써 줘");
+await waitT();
+const agents = () => (existsSync(join(proj, "AGENTS.md")) ? readFileSync(join(proj, "AGENTS.md"), "utf8") : "");
+check("요청이 끝나면 기억할지 묻고 '이 프로젝트만' 이면 작업 폴더의 AGENTS.md '## 기억할 것' 에 더함, 다음 요청에 알림",
+	offers.length === 1 && offers[0].includes("커밋 메시지는 한국어로 써 줘") && agents().includes("## 기억할 것\n- 커밋 메시지는 한국어로 써 줘")
+	&& (await emit("input", { text: "다음 일", source: "interactive" }))?.text?.includes("커밋 메시지는 한국어로 써 줘"), [offers, agents()]);
+await turn("앞으로 커밋 메시지는 한국어로 써 줘");
+await waitT();
+check("같은 말은 세션에 한 번만 묻고, 확장이 보낸 요청·명령은 보지 않음", offers.length === 1);
+offerPick = (o) => o.find((x) => x.includes("더 묻지 않음"));
+await turn("절대 운영 서버에 직접 배포하지 마");
+await waitT();
+await turn("항상 타입 힌트를 붙여 줘");
+await waitT();
+check("'이 세션에서는 더 묻지 않음' 이면 그 세션 동안 묻지 않음 (기억하지도 않음)", offers.length === 2 && !agents().includes("운영 서버"), offers);
+globalThis.__piMode = "plan";
+await emit("session_start", { reason: "new" });
+offerPick = (o) => o[0];
+await turn("앞으로 로그는 영어로 남겨 줘");
+await waitT();
+globalThis.__piMode = "auto";
+check("계획 모드에서는 묻지 않음 (승인 창과 겹침)", offers.length === 2);
+ctx.ui.select = select0m;
+
 // 노트북에 아직 연결되지 않았으면 남기지도 알리지도 않음 (연결된 뒤 첫 요청에)
 globalThis.__piWorkDir = { remote: true, cwd: "/" };
 await emit("session_start", { reason: "new" });

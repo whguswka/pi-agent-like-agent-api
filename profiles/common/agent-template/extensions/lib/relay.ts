@@ -288,6 +288,15 @@ export function userAsk(text: string, label = text): string {
 /** input 이벤트의 글이 확장이 대신 보낸 사용자의 요청이면 기록에 남길 글 */
 export const userAskOf = (text: string): string | undefined => ASKS.get(rawInput(text));
 
+/** 요청이 끝난 뒤(agent_settled) 여는 키트의 고르기·확인 창을 하나씩 (2026-11-05). pi 화면은 창을 하나만 보여 주고,
+ *  두 번째 창이 앞 창을 덮으면 앞 창은 답을 받지 못한다 (완료 점검 동의와 기억 제안이 같은 때에 뜰 수 있음) */
+export function oneDialog<T>(fn: () => Promise<T>): Promise<T> {
+	const g = globalThis as any;
+	const run: Promise<T> = (g.__piDialog || Promise.resolve()).then(fn, fn);
+	g.__piDialog = run.catch(() => {});
+	return run;
+}
+
 // ── 개인정보·비밀로 보이는 글 (위키의 작업 방식, 작업 기록) ──────────────
 // 중계 서버(relay.py)의 감추기와 같은 꼴: 이메일, 전화번호, 카드번호, 계좌번호 모양 번호
 // (숫자 묶음을 - _ 로 이은 것이나 이어 쓴 숫자로 합쳐 10~14자리. 너무 길면 끝의 _ 묶음을 떼어 봄), [이메일N]·[번호N]

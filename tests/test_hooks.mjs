@@ -518,6 +518,81 @@ ctx = fakeCtx([]);
 const sentNow = sent.length;
 await doneReq(ctx, { write: "src/j.py", none: true });
 check(".pi/checks.json 이 없으면 아무것도 하지 않음", ctx.log.length === 0 && sent.length === sentNow, ctx.log);
+
+// ── 목표 (/goal <명령>, 2026-11-05): 요청이 끝날 때마다 명령을 돌려, 실패면 pi 에게 고치게 (goal_rounds 번까지) ──
+{
+	const gt = h.goalText("pytest -q", 2, 3, { code: 1, out: "FAILED test_a" });
+	check("목표 요청 글: 명령·몇 번째·종료 코드·출력, 시험을 고쳐 통과시키지 말라는 말",
+		gt.startsWith("[목표]") && gt.includes("`pytest -q`") && gt.includes("(2/3번째)") && gt.includes("종료 코드 1") && gt.includes("FAILED test_a")
+		&& gt.includes("같은 명령으로 다시 확인") && gt.includes("건너뛰어 통과시키지는 마세요") && h.goalText("x", 1, 3, { code: null, out: "" }).includes("시간 초과"), gt);
+	const goal = F.commands.goal.handler;
+	const gctx = () => Object.assign(fakeCtx([]), { isIdle: () => true });
+	const GR = 'test "$(cat flag.txt)" = ok';
+	ctx = gctx();
+	await goal("", ctx);
+	check("/goal (목표 없음): 사용법", ctx.log.some((x) => x.includes("정한 목표가 없습니다") && x.includes("/goal off")), ctx.log);
+	writeFileSync(join(CW, "flag.txt"), "bad");
+	let s0 = sent.length;
+	await goal(GR, ctx);
+	await waitFor(() => sent.length > s0, 15000);
+	check("/goal <명령>: 정하고, 쉬고 있으면 바로 확인 → 실패면 pi 에게 (1/3), 상태 줄",
+		ctx.log.some((x) => x.startsWith("알림:목표를 정했습니다: " + GR)) && sent.length === s0 + 1 && sent[s0].startsWith("[목표]") && sent[s0].includes("(1/3번째)")
+		&& ctx.log.some((x) => x.includes("목표 확인 실패 (1/3)")) && String(ctx.status.goal || "").includes("(1/3)"), [ctx.log, sent.slice(s0), ctx.status]);
+	ctx = gctx();
+	await doneReq(ctx, { flag: "bad" });
+	check("pi 가 고친 요청이 끝났는데 아직 실패: 다시 pi 에게 (2/3)", sent.length === s0 + 2 && sent[s0 + 1].includes("(2/3번째)"), [ctx.log, sent.length - s0]);
+	ctx = gctx();
+	await doneReq(ctx, { flag: "bad", stop: "aborted", none: true });
+	check("Esc 로 멈춘 요청 뒤에는 확인하지 않음", sent.length === s0 + 2 && ctx.log.length === 0, ctx.log);
+	globalThis.__piMode = "plan";
+	ctx = gctx();
+	await doneReq(ctx, { flag: "bad", none: true });
+	globalThis.__piMode = "auto";
+	check("계획 모드에서는 확인하지 않음", sent.length === s0 + 2 && ctx.log.length === 0, ctx.log);
+	ctx = gctx();
+	await goal("", ctx);
+	check("/goal (목표 있음): 명령·고친 횟수", ctx.log.some((x) => x.startsWith(`알림:목표: ${GR} (pi 가 고친 횟수 2/3`)), ctx.log);
+	ctx = gctx();
+	await doneReq(ctx, { flag: "ok" });
+	check("성공하면 목표 달성을 알리고 끝냄 (더 보내지 않음)", ctx.log.some((x) => x.startsWith(`알림:목표 달성: ${GR}`) && x.includes("2번 고침")) && sent.length === s0 + 2 && !ctx.status.goal, [ctx.log, ctx.status]);
+	ctx = gctx();
+	await doneReq(ctx, { flag: "bad", none: true });
+	check("목표를 끝낸 뒤에는 돌리지 않음", sent.length === s0 + 2 && ctx.log.length === 0, ctx.log);
+	h.saveSetting("goal_rounds", 1, join(AGENT, "bridge.json"));
+	s0 = sent.length;
+	ctx = gctx();
+	await goal(GR, ctx);
+	await waitFor(() => sent.length > s0, 15000);
+	ctx = gctx();
+	await doneReq(ctx, { flag: "bad" });
+	check("goal_rounds 번 고친 뒤에도 실패: 이루지 못했다고 알리고 끝냄 (내 설정 goal_rounds 1)",
+		sent.length === s0 + 1 && sent[s0].includes("(1/1번째)") && ctx.log.some((x) => x.startsWith(`알림:목표를 이루지 못했습니다: ${GR} (pi 가 1번 고친 뒤에도 실패)`)), [ctx.log, sent.slice(s0)]);
+	h.saveSetting("goal_rounds", undefined, join(AGENT, "bridge.json"));
+	writeFileSync(join(CW, "flag.txt"), "ok");
+	ctx = gctx();
+	await goal(GR, ctx);
+	await waitFor(() => ctx.log.some((x) => x.includes("목표 달성")), 15000);
+	check("이미 성공하는 명령이면 정하자마자 달성 (이미 성공)", ctx.log.some((x) => x.startsWith(`알림:목표 달성: ${GR} 이(가) 성공했습니다 (이미 성공)`)) && sent.length === s0 + 1, ctx.log);
+	writeFileSync(join(CW, "flag.txt"), "bad");
+	ctx = Object.assign(fakeCtx([]), { isIdle: () => false });
+	await goal(GR, ctx);
+	await goal("off", ctx);
+	await doneReq(ctx, { flag: "bad", none: true });
+	check("/goal off: 끄면 확인하지 않음 (요청 중에 정하면 바로 확인하지 않음)", ctx.log.some((x) => x === "알림:목표를 껐습니다") && sent.length === s0 + 1 && !ctx.status.goal, ctx.log);
+	// 완료 점검이 같은 요청에 pi 에게 보냈으면 목표는 그 요청이 끝난 뒤에
+	writeFileSync(join(CW, ".pi", "checks.json"), JSON.stringify({ checks: [{ name: "점검B", when: ["src/**"], run: 'test "$(cat flag.txt)" = ok', timeout: 30 }] }));
+	ctx = gctx();
+	await goal(GR, ctx);
+	await waitFor(() => sent.length > s0 + 1, 15000);
+	const s1 = sent.length;
+	ctx = Object.assign(fakeCtx([true]), { isIdle: () => true });
+	await doneReq(ctx, { write: "src/g.py", flag: "bad" });
+	await new Promise((ok) => setTimeout(ok, 1500));
+	check("완료 점검이 pi 에게 보낸 요청에는 목표 확인을 보내지 않음 (둘이 한꺼번에 가지 않게)",
+		sent.length === s1 + 1 && sent[s1].includes("[완료 점검]"), [sent.slice(s1).map((x) => x.slice(0, 40)), ctx.log]);
+	await goal("off", ctx);
+	rmSync(join(CW, ".pi", "checks.json"));
+}
 globalThis.__piWorkDir = local;
 
 // ── /hooks, 위험 명령 확인 경고 ───────────────────────────────────────────────
@@ -567,6 +642,13 @@ await cmd("on rules", ctx);
 await cmd("on syntax", ctx);
 cfgNow = JSON.parse(read(join(AGENT, "bridge.json")));
 check("/hooks on rules·syntax: 지움", !("team_rules" in cfgNow) && !("syntax_check" in cfgNow), cfgNow);
+check("/hooks: 할 일 목록 강제도 목록에", ctx.log[0].includes("todo   켜짐"), ctx.log[0]);
+await cmd("off todo", ctx);
+cfgNow = JSON.parse(read(join(AGENT, "bridge.json")));
+check("/hooks off todo: 내 설정 파일에 todo_enforce false", cfgNow.todo_enforce === false, cfgNow);
+await cmd("on todo", ctx);
+cfgNow = JSON.parse(read(join(AGENT, "bridge.json")));
+check("/hooks on todo: 지움", !("todo_enforce" in cfgNow), cfgNow);
 
 // ── 문법 확인 ────────────────────────────────────────────────────────────
 check("문법 확인할 파일: .py·.json·.ipynb·.yaml·.yml (틀 폴더 {{ }} 는 뺌)",
