@@ -128,6 +128,7 @@ pi -p "이 폴더의 파이썬 파일 목록과 역할을 알려줘"     # 한 �
 | 일하는 중에 방향 바꾸기 | 입력하고 `Enter` (지금 단계가 끝나면 반영) |
 | 멈추기 | `Esc` |
 | 계획부터 세우고 승인받아 진행 | `/plan` 을 치고 요청 (또는 `/plan <요청>`). 다시 `/plan` 이면 끔 — 아래 3-5 |
+| 계획이 있으면 그 계획으로, 없으면 계획부터 (갈림길마다 물음) | `/planauto` (또는 `/planauto <요청>`). 다시 `/planauto` 면 끔 — 아래 3-5 |
 | 바꿀 때마다 확인받기 / 다시 자동으로 | `/mode ask` / `/mode auto` (`/mode` 만 치면 고르기) |
 | pi 가 고친 파일 되돌리기 | `/undo` (마지막 요청), `/undo 2` (마지막 두 요청). pi 를 다시 켜거나 새 세션이어도 됨 — 아래 3-6 |
 | 명령이 통과할 때까지 고치게 하기 | `/goal python -m pytest -q` (요청이 끝날 때마다 그 명령을 돌려, 실패하면 pi 에게 고치게 함. 3번까지), `/goal` 지금 목표, `/goal off` 끄기 ([5장](#목표-goal)) |
@@ -238,6 +239,28 @@ pi 는 기본으로 묻지 않고 바로 고치고 실행합니다 (자동 모�
 - 단계 체크는 LLM 이 답에 `[1단계 완료]` 처럼 적어 줄 때 됩니다. 적지 않으면 목록만 그대로 남고 작업에는 영향이 없습니다.
 - pi 를 시작할 때의 모드는 [8장](#8-설정)의 `default_mode` 로 정합니다 (예: 늘 확인 모드로 시작하려면 `"default_mode": "ask"`).
   `pi -p` 처럼 물을 수 없는 실행은 늘 자동 모드로 시작합니다.
+
+**계획 자동 (/planauto)**
+계획을 여러 개 오가며 일할 때 씁니다. 켜 두면 진행 중이거나 대기 중인 계획이 있으면 그 계획으로, 없으면 계획 모드로 계획부터 세우고, 갈림길마다 묻습니다.
+위 세 모드에 얹는 켜기·끄기입니다. 세울 때는 계획 모드, 진행할 때는 승인 창에서 고른 모드이고, 막거나 묻는 규칙은 그대로입니다. 켜져 있으면 상태 줄에 `계획 자동` 이 보입니다.
+
+| 때 | 상황 | 묻는 것 |
+|---|---|---|
+| 켤 때 | 진행 중인 계획이 있음 | 이어서 진행 · 대기 계획으로 바꾸기 · 새 계획 세우기 (지금 계획은 쉬는 중으로) · 끄기 |
+| | 대기 계획이 있음 | 대기 계획 고르기 (최근 것부터) · 새 계획 세우기 · 끄기 |
+| | 둘 다 없음 | 계획 모드로 바꿀지 |
+| 계획이 나왔을 때 | | 위의 승인 창 그대로 |
+| 계획이 끝났을 때 | 대기 계획이 있음 | 다음 계획으로 넘어가기 · 새 계획 세우기 · 끄기 |
+| | 없음 | 새 계획 세우기 · 끄기 |
+| 남은 단계가 있는데 답이 멈췄을 때 | | 이어서 진행 · 쉬는 중으로 두기 · 완료로 처리 · 계획 다듬기 (모델의 말에 답하려면 `Esc` 뒤 입력) |
+| 진행 중인 작업이 없는데 새 요청을 쳤을 때 | 대기 계획이 있음 | 이 요청으로 새 계획 세우기 · 대기 계획에 덧붙여 이어서 · 계획 없이 이 요청만 보내기 (`Esc` 면 입력창으로 되돌림) |
+| | 없음 | 묻지 않고 계획부터 세움 |
+
+- **대기 계획:** 작업판에서 `쉬는 중` 인, 끝나지 않은 승인 계획 가운데 지금 폴더의 것입니다. 모델이 `todo` 로 만든 목록과 다른 폴더의 작업은 넣지 않습니다. 창에는 6개까지 보이고 나머지는 `/todo` 로 봅니다.
+- **`/planauto <요청>`:** 진행 중·대기 중인 계획이 없으면 묻지 않고 그 요청으로 계획부터 세웁니다. 있으면 묻습니다 (그 요청으로 새 계획이 맨 위).
+- **끄기:** `/planauto` 를 다시 치거나 창에서 끄기를 고릅니다. `/new` 로는 꺼지지 않고, pi 를 끄면 꺼집니다.
+- **묻지 않는 때:** `Esc`·오류·사용량 제한으로 끝난 요청, 리뷰, 진행 중인 계획과 상관없는 질문에 답만 한 요청입니다. 창에서 `Esc` 를 누르면 그대로 두고 다음 입력을 기다립니다. 창을 띄우는 것은 모델에게 질문을 보내지 않습니다.
+- **끝났는지는 단계 체크로 봅니다.** 모델이 마지막 단계를 체크하지 않고 끝내면 남은 단계가 있다고 묻습니다. 실제로 끝났다면 `완료로 처리` 를 고르세요.
 
 **작업판 (/todo)**
 pi 는 세 단계가 넘는 작업을 시작할 때 할 일 목록(단계와 하위 단계)을 만들고, 단계를 시작하거나 끝낼 때마다 고칩니다. 계획 모드에서 승인한 계획의 단계도 같은 목록입니다.
@@ -783,7 +806,7 @@ condition: "(?i)\\b(drop|truncate)\\s+table\\b"
 | `install.sh`, `update.sh`, `check-node.sh`, `VERSION` | 설치, 새 버전으로 바꾸기, Node 진단 스크립트, 버전 번호 |
 | `profiles/` | 설정 템플릿과 기본 지침(`jupyter`: Kubeflow 노트북용), 확장(`common`: 위험 명령 확인, 작업 모드 `/plan`·`/mode`, 되돌리기 `/undo`, 기억하기 `/remember`·작업 기록 `/recall`, `@파일`, 작업 끝 알림, `/kit`·`/doctor`, 문서 찾기 `/docs`, 사용자에게 묻기 `ask_user`, LLM 위키 `/wiki`, 문서 규칙·완료 점검·문법 확인·훅 `/hooks`, 팀 규칙 `/rules`) |
 | `prompts/`, `skills/` | 기본 명령 5개, 기본 스킬 9개 (설치할 때 `~/.pi/agent` 에 복사) |
-| `tests/` | 단위 테스트 (`node tests/test_guard.mjs`, `node tests/test_modes.mjs`, `node tests/test_memory.mjs`, `node tests/test_files.mjs`, `node tests/test_merge_config.mjs`, `node tests/test_wiki.mjs`, `node tests/test_kitenv.mjs`, `node tests/test_watch.mjs`, `node tests/test_docs.mjs`, `node tests/test_changelog_notes.mjs`, `node tests/test_hooks.mjs`) |
+| `tests/` | 단위 테스트 (`node tests/test_guard.mjs`, `node tests/test_modes.mjs`, `node tests/test_planauto.mjs`, `node tests/test_memory.mjs`, `node tests/test_files.mjs`, `node tests/test_merge_config.mjs`, `node tests/test_wiki.mjs`, `node tests/test_kitenv.mjs`, `node tests/test_watch.mjs`, `node tests/test_docs.mjs`, `node tests/test_changelog_notes.mjs`, `node tests/test_hooks.mjs`) |
 | `CHANGELOG.md` | 버전마다 바뀐 점과 바꾼 뒤 할 일 |
 | `docs/` | [한 장 요약](docs/빠른시작.md), [API 연결](docs/API-연결.md), [수동 작업 절차](docs/수동-작업-절차.md), [설치 세부](docs/설치.md), [반입 검토 자료](docs/반입-검토-요청서.md), [runtime 파일 해시 목록](docs/runtime-SHA256SUMS.txt) |
 

@@ -1284,6 +1284,56 @@ export function resumeText(t: Task, extra = ""): string {
 		(extra ? `\n\n${extra}` : "")
 	);
 }
+// ── /planauto (2026-11-09 사용자): 진행 중·대기 중인 계획이 없으면 계획 모드로 계획부터, 있으면 그 계획으로 바꿔 진행. 갈림길마다 사용자에게 묻는다 ──
+//  모드가 하나 더 있는 것이 아니라 계획·확인·자동 위에 얹는 켜기/끄기 (세울 때는 계획 모드, 진행은 승인 창에서 고른 모드. 권한 규칙은 그대로)
+export type PlanAutoKind = "start" | "finished" | "stopped" | "request";
+export type PlanAutoPick = { label: string; act: "continue" | "switch" | "new" | "pause" | "done" | "refine" | "plain" | "off"; task?: Task };
+const PLAN_AUTO_MENU_MAX = 6; // 창에 보일 대기 계획 수 (나머지는 /todo)
+/** 대기 중인 계획: 이 폴더에서 쉬는 중인, 끝나지 않은 승인 계획 (최근 것부터). '하는 중' 은 다른 pi 가 진행 중일 수 있어 넣지 않고, 할 일 목록(todo 도구)은 계획이 아니라 넣지 않음 */
+export function waitingPlans(tasks: Task[], isHere: (t: Task) => boolean): Task[] {
+	return tasks.filter((t) => t.source === "plan" && t.state === "paused" && t.items.length > 0 && !todoSummary(t).all && isHere(t)).sort((a, b) => b.updated - a.updated);
+}
+const planName = (t: Task) => {
+	const s = todoSummary(t);
+	return `#${t.no} ${cut(t.request || "(요청 글 없음)", 40)} (${s.done}/${s.total})`;
+};
+/** 갈림길에서 묻는 창의 제목과 고르기. kind: start 켤 때·/planauto <요청>, finished 계획이 끝남, stopped 남은 단계가 있는데 답이 멈춤, request 진행 중인 계획이 없는데 새 요청을 침 */
+export function planAutoMenu(kind: PlanAutoKind, active: Task | null, waiting: Task[], req = ""): { title: string; picks: PlanAutoPick[] } {
+	const top = waiting.slice(0, PLAN_AUTO_MENU_MAX);
+	const more = waiting.length > top.length ? ` (최근 ${top.length}개만 보임, 나머지는 /todo)` : "";
+	const go = (head: string): PlanAutoPick[] => top.map((t) => ({ label: `${head}: ${planName(t)}`, act: "switch", task: t }));
+	const off: PlanAutoPick = { label: "끄기 (계획 자동을 끔)", act: "off" };
+	if (kind === "stopped" && active)
+		return {
+			title: `계획 ${planName(active)} 이 끝나지 않았는데 답이 멈췄습니다. 어떻게 할까요? (모델의 말에 답하려면 Esc 뒤 입력)`,
+			picks: [
+				{ label: "이어서 진행", act: "continue", task: active },
+				{ label: `쉬는 중으로 두기 (다시: /todo 이어서 ${active.no})`, act: "pause", task: active },
+				{ label: "완료로 처리", act: "done", task: active },
+				{ label: "계획 다듬기 (계획 모드로)", act: "refine", task: active },
+			],
+		};
+	if (kind === "finished")
+		return {
+			title: `${active ? `${active.source === "plan" ? "계획" : "작업"} #${active.no} 이 끝났습니다. ` : ""}${top.length ? `다음 계획으로 넘어갈까요?${more}` : "새 계획을 세울까요?"}`,
+			picks: [...go("다음 계획으로"), { label: "새 계획 세우기 (계획 모드로)", act: "new" }, off],
+		};
+	if (kind === "request")
+		return {
+			title: `대기 중인 계획이 ${waiting.length}개 있습니다. 이 요청을 어떻게 할까요?${more}`,
+			picks: [{ label: "이 요청으로 새 계획 세우기", act: "new" }, ...go("이 요청을 덧붙여 이어서"), { label: "계획 없이 이 요청만 보내기", act: "plain" }],
+		};
+	const fresh: PlanAutoPick = { label: `${req ? "이 요청으로 " : ""}새 계획 세우기${active ? ` (#${active.no} 은 쉬는 중으로)` : ""}`, act: "new" };
+	if (active) {
+		const keep: PlanAutoPick[] = [{ label: `이어서 진행${req ? " (이 요청을 덧붙임)" : ""}`, act: "continue", task: active }, ...go(req ? "이 요청을 덧붙여 바꾸기" : "이 계획으로 바꾸기")];
+		return { title: `진행 중인 계획 ${planName(active)} 이 있습니다. 어떻게 할까요?${more}`, picks: [...(req ? [fresh] : []), ...keep, ...(req ? [] : [fresh]), off] };
+	}
+	if (top.length) {
+		const keep = go(req ? "이 요청을 덧붙여 이어서" : "이어서 진행");
+		return { title: `대기 중인 계획이 ${waiting.length}개 있습니다. 어떤 것으로 할까요?${more}`, picks: [...(req ? [fresh] : []), ...keep, ...(req ? [] : [fresh]), off] };
+	}
+	return { title: "진행 중이거나 대기 중인 계획이 없습니다. 계획 모드로 바꿔 새 계획을 세울까요?", picks: [{ label: "계획 모드로 바꾸기", act: "new" }, off] };
+}
 /** pi 가 앞 대화를 요약(compaction)한 뒤 다음 요청이나 도구 결과에 붙이는 지금 작업 (2026-11-05, Claude Code 가 요약 뒤 할 일을 다시 넣는 것을 보고).
  *  요약 글에 단계가 빠지면 모델이 하던 계획을 잊거나 끝난 단계를 다시 함 */
 export function compactNote(t: Task): string {
@@ -1457,6 +1507,11 @@ export function openCmd(file: string, platform: string = process.platform, env: 
 export default function (pi: ExtensionAPI) {
 	let mode: Mode = (globalThis as any).__piMode; // 확장을 다시 불러와도(/kit share 등) 모드 유지
 	let before: Mode = "auto"; // /plan 으로 끌 때 돌아갈 모드
+	let planAuto = !!(globalThis as any).__piPlanAuto; // /planauto 켜짐 (/new·확장을 다시 불러와도 유지, pi 를 끄면 꺼짐)
+	let autoEntered = false; // 지금 계획 모드는 /planauto 가 켰음 (끌 때 되돌림)
+	let autoAsking = false; // /planauto 가 묻는 창을 띄움
+	let autoWaitReq: string | null = null; // 다른 요청 중에 /planauto 를 침: 그 요청이 끝나면 물음
+	let autoDoneId = ""; // 끝났다고 물은 작업 (같은 작업을 두 번 묻지 않음)
 	let lastText = ""; // 이번 요청의 마지막 답 (계획인지 볼 때)
 	let planDoc = ""; // 계획 모드에서 쓴 계획서 (도구가 받은 경로. 답에 단계가 없으면 이 파일의 단계로)
 	let asking = false;
@@ -1598,6 +1653,7 @@ export default function (pi: ExtensionAPI) {
 			if (want && ctx.hasUI) setMode(ctx, want); // pi -p 처럼 물을 수 없는 실행은 늘 자동
 			else setMode(ctx, mode);
 		} else setMode(ctx, mode);
+		showPlanAuto(ctx);
 		// 2026-11-02.1 의 프로젝트별 목록 파일은 한 번 작업판으로 옮김. 이 프로젝트에서 하던 작업은 이어서 (pi 를 다시 켜거나 /new·/reload)
 		const w = todoWhere();
 		if (!(loadBoard().imported || []).includes(w.key)) edit(ctx, (b) => importLegacy(b, w.key, Date.now()));
@@ -1636,6 +1692,24 @@ export default function (pi: ExtensionAPI) {
 		if (event.source !== "extension" && t && !isOpen(t)) {
 			curId = null; // 끝난 작업은 화면에서 닫음 (작업판에는 완료로 남음)
 			showSteps(ctx);
+		}
+		// /planauto: 진행 중인 작업이 없는데 새 요청을 침 -> 대기 계획이 있으면 묻고, 없으면 계획부터. 답을 기다리는 중에 줄 세운 글은 그대로 보냄
+		if (planAuto && event.source !== "extension" && text.trim() && mode !== "plan" && ctx.hasUI && !review && !(globalThis as any).__piReview && ctx.isIdle?.() !== false && !openTodoOf()) {
+			const waiting = waitingPlans(loadBoard().tasks, here);
+			if (waiting.length) {
+				const p = await planAutoPick(ctx, planAutoMenu("request", null, waiting, text));
+				if (!p) {
+					ctx.ui.setEditorText?.(text); // Esc: 보내지 않고 입력창에 돌려줌
+					return { action: "handled" as const };
+				}
+				if (p.act === "switch") {
+					await planAutoDo(ctx, p, text);
+					return { action: "handled" as const };
+				}
+				if (p.act === "plain") return;
+			}
+			enterPlan(ctx);
+			ctx.ui.notify("계획 자동: 이 요청은 계획부터 세웁니다 (/planauto 끄기)", "info");
 		}
 		if (mode !== "plan" || !text.trim() || review?.phase === "running") return; // 리뷰 요청에는 계획 안내를 붙이지 않음 (리뷰는 따로 읽기만)
 		if (!planReq) planReq = cut(text.trim().split("\n")[0], 100);
@@ -1760,6 +1834,140 @@ export default function (pi: ExtensionAPI) {
 		bounced = true;
 		ctx.ui.notify("일을 한 뒤로 할 일 목록이 고쳐지지 않아 표시만 맞추게 합니다 (요청마다 한 번. 끄기: /hooks off todo)", "info");
 		pi.sendUserMessage(userAsk(todoBounceText(t), "(할 일 목록 표시 맞추기)"));
+		return true;
+	};
+
+	/** 작업을 지금 작업으로 되돌려 이어서 보냄 (하던 작업은 쉬는 중으로). /todo 이어서, /planauto */
+	const resumeTask = (ctx: any, t: Task, extra = "") => {
+		const now = Date.now();
+		edit(ctx, (b) => {
+			const x = b.tasks.find((y) => y.id === t.id);
+			if (!x) return false;
+			const old = curId && curId !== x.id ? b.tasks.find((y) => y.id === curId) : undefined;
+			if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped] = ["paused", null];
+			[x.state, x.closed, x.stopped, x.updated] = ["doing", null, null, now];
+			delete x.manual;
+			[curId, curSince] = [x.id, now];
+		});
+		const back = cur();
+		if (!back) return;
+		listUpdated();
+		bounced = false;
+		if (!ctx.isIdle()) ctx.ui.notify(`지금 요청이 끝나면 작업 #${back.no} 을(를) 이어서 보냅니다`, "info");
+		setTimeout(() => pi.sendUserMessage(userAsk(resumeText(back, extra), `(작업 #${back.no} 이어서)`), { deliverAs: "followUp" }), 0);
+	};
+	/** 작업판의 작업을 닫거나 쉬게 함. /todo 완료·폐기, /planauto */
+	const setTaskState = (ctx: any, t: Task, state: "paused" | "done" | "dropped") => {
+		edit(ctx, (b) => {
+			const x = b.tasks.find((y) => y.id === t.id);
+			if (!x) return false;
+			if (state === "paused") [x.state, x.stopped] = ["paused", null];
+			else [x.state, x.closed, x.stopped, x.manual] = [state, Date.now(), null, true];
+			if (x.id === curId) curId = null;
+		});
+	};
+
+	// ── /planauto: 갈림길마다 묻고 고른 대로 ──
+	const showPlanAuto = (ctx: any) => {
+		if (!ctx?.hasUI) return;
+		const fg = (c: string, s: string) => (ctx.ui.theme?.fg ? ctx.ui.theme.fg(c, s) : s);
+		ctx.ui.setStatus("plan-auto", planAuto ? fg("accent", "계획 자동 (/planauto 끄기)") : undefined);
+	};
+	const planAutoOff = (ctx: any) => {
+		[planAuto, autoWaitReq] = [false, null];
+		(globalThis as any).__piPlanAuto = false;
+		showPlanAuto(ctx);
+		if (mode === "plan" && autoEntered) setMode(ctx, before === "plan" ? "auto" : before);
+		autoEntered = false;
+		ctx.ui.notify(`계획 자동을 껐습니다 (지금: ${LABEL[mode]} 모드)`, "info");
+	};
+	const enterPlan = (ctx: any) => {
+		if (mode === "plan") return;
+		before = mode;
+		autoEntered = true;
+		setMode(ctx, "plan");
+	};
+	/** 묻는 창을 띄우고 고른 것을 돌려줌 (Esc 면 없음) */
+	const planAutoPick = async (ctx: any, menu: { title: string; picks: PlanAutoPick[] }): Promise<PlanAutoPick | undefined> => {
+		autoAsking = true;
+		try {
+			const label = await ctx.ui.select(menu.title, menu.picks.map((p) => p.label));
+			return menu.picks.find((p) => p.label === label);
+		} finally {
+			autoAsking = false;
+		}
+	};
+	const planAutoDo = async (ctx: any, p: PlanAutoPick, req = "") => {
+		const t = p.task as Task;
+		if (p.act === "off") return planAutoOff(ctx);
+		if (p.act === "continue" || p.act === "switch") {
+			if (mode === "plan") {
+				setMode(ctx, before === "plan" ? "auto" : before);
+				autoEntered = false;
+				[planDoc, planReq] = ["", ""];
+				await toExecuteModel(ctx);
+			}
+			return resumeTask(ctx, t, req);
+		}
+		if (p.act === "pause") {
+			setTaskState(ctx, t, "paused");
+			return ctx.ui.notify(`작업 #${t.no} 을(를) 쉬는 중으로 두었습니다 (다시: /todo 이어서 ${t.no}). 다음 요청을 보내면 계획 자동이 묻습니다`, "info");
+		}
+		if (p.act === "done") {
+			setTaskState(ctx, t, "done");
+			return planAutoAsk(ctx, "finished", t);
+		}
+		if (p.act === "refine") {
+			enterPlan(ctx);
+			return ctx.ui.notify("계획 모드: 고칠 점을 적어 보내세요. 지금 목록을 함께 보내 고친 계획 전체를 다시 받습니다 (/planauto 끄기)", "info");
+		}
+		if (p.act !== "new") return;
+		// 새 계획: 진행하던 계획을 쉬게 함 (그대로 두면 계획 모드의 요청에 그 목록이 붙어 '다듬기' 가 됨)
+		const now = openTodoOf();
+		if (now) setTaskState(ctx, now, "paused");
+		enterPlan(ctx);
+		[planDoc, planReq] = ["", ""];
+		if (!req) return ctx.ui.notify("계획 모드: 파일을 바꾸지 않고 계획부터 세웁니다. 요청을 적어 보내세요 (/planauto 끄기)", "info");
+		setTimeout(() => pi.sendUserMessage(userAsk(req), { deliverAs: "followUp" }), 0);
+	};
+	const planAutoAsk = async (ctx: any, kind: PlanAutoKind, active: Task | null, req = "") => {
+		const waiting = waitingPlans(loadBoard().tasks, here).filter((t) => t.id !== active?.id);
+		const p = await planAutoPick(ctx, planAutoMenu(kind, active, waiting, req));
+		if (p) return planAutoDo(ctx, p, req);
+		ctx.ui.notify("그대로 둡니다. 다음 요청을 적어 보내세요 (/planauto 끄기)", "info");
+		if (req) ctx.ui.setEditorText?.(req);
+	};
+	/** 켤 때: 진행 중인 계획·대기 중인 계획을 보고 묻는다. 요청을 주었고 둘 다 없으면 묻지 않고 그 요청으로 계획부터 */
+	const planAutoStart = async (ctx: any, req: string) => {
+		const t = openTodoOf();
+		const active = t?.source === "plan" ? t : null;
+		if (req && !active && !waitingPlans(loadBoard().tasks, here).length) return planAutoDo(ctx, { label: "", act: "new" }, req);
+		return planAutoAsk(ctx, "start", active, req);
+	};
+	// 요청이 끝나 쉴 때. 완료 점검·목표 확인·목록 맞추기가 끝나고 아무것도 보내지 않았을 때 hooks.ts 가 부름 (함께 보내면 뒤의 것이 '이미 처리 중' 이 됨).
+	//  Esc·오류·사용량 제한으로 끝난 요청, 계획 모드(거기서는 승인 창이 물음), 리뷰, 화면이 없는 실행에서는 묻지 않음
+	(globalThis as any).__piPlanAutoSettled = (ctx: any) => {
+		if (!planAuto || autoAsking || asking || !ctx?.hasUI || review || (globalThis as any).__piReview) return;
+		if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
+		const notify = (e: unknown) => {
+			try {
+				ctx.ui.notify(`계획 자동이 묻지 못했습니다: ${(e as Error).message}`, "warning");
+			} catch {}
+		};
+		if (autoWaitReq !== null) {
+			const req = autoWaitReq;
+			autoWaitReq = null;
+			return void planAutoStart(ctx, req).catch(notify);
+		}
+		if (mode === "plan" || lastEnd !== "stop") return;
+		const t = cur();
+		if (!t?.items.length || !here(t) || !(listTouched || curSince >= lastInputAt || workSince >= 1)) return;
+		if (todoSummary(t).all) {
+			if (autoDoneId === t.id || (t.source !== "plan" && !waitingPlans(loadBoard().tasks, here).length)) return;
+			autoDoneId = t.id;
+			return void planAutoAsk(ctx, "finished", t).catch(notify);
+		}
+		if (t.source === "plan" && isOpen(t)) return void planAutoAsk(ctx, "stopped", t).catch(notify);
 	};
 
 	pi.on("agent_start", async (_event: unknown, ctx: any) => {
@@ -2035,7 +2243,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (mode === "plan" && !req) {
 				setMode(ctx, before === "plan" ? "auto" : before);
-				return ctx.ui.notify(`계획 모드를 껐습니다 (지금: ${LABEL[mode]} 모드)`, "info");
+				autoEntered = false;
+				return ctx.ui.notify(`계획 모드를 껐습니다 (지금: ${LABEL[mode]} 모드${planAuto ? ". 계획 자동이 켜져 있어 다음 새 요청은 다시 계획부터 세웁니다. /planauto 로 끔" : ""})`, "info");
 			}
 			if (mode !== "plan") {
 				before = mode;
@@ -2048,6 +2257,26 @@ export default function (pi: ExtensionAPI) {
 			// 다른 작업 중이면 그 작업이 끝난 뒤 보내지도록 줄 세움 (그냥 보내면 "이미 처리 중" 오류로 요청이 사라짐. 쉬고 있으면 바로 보냄)
 			if (!ctx.isIdle()) ctx.ui.notify("지금 작업이 끝나면 이 요청을 계획 모드로 이어서 보냅니다", "info");
 			setTimeout(() => pi.sendUserMessage(userAsk(req), { deliverAs: "followUp" }), 0);
+		},
+	});
+
+	pi.registerCommand("planauto", {
+		description: "계획 자동: 진행 중·대기 중인 계획이 있으면 그 계획으로, 없으면 계획부터 세우고 진행 (갈림길마다 물음). 다시 치면 끔. /planauto <요청> 은 그 요청으로",
+		handler: async (args, ctx) => {
+			const req = String(args || "").trim();
+			if (!ctx.hasUI) return ctx.ui.notify("/planauto 는 물어볼 수 있는 화면에서만 씁니다", "warning");
+			if (planAuto && !req) return planAutoOff(ctx);
+			if (!planAuto) ctx.ui.notify("계획 자동을 켰습니다: 진행 중·대기 중인 계획이 있으면 그 계획으로, 없으면 계획부터 세우고, 갈림길마다 묻습니다 (/planauto 로 끔)", "info");
+			planAuto = true;
+			(globalThis as any).__piPlanAuto = true;
+			showPlanAuto(ctx);
+			// / 로 시작하는 명령·템플릿은 대신 보내면 펼쳐지지 않음 (/plan 과 같음)
+			if (req.startsWith("/")) return ctx.ui.notify(`/ 로 시작하는 명령은 대신 보낼 수 없으니 직접 입력해 주세요: ${req}`, "info");
+			if (!ctx.isIdle()) {
+				autoWaitReq = req;
+				return ctx.ui.notify("지금 요청이 끝나면 어떻게 할지 묻습니다", "info");
+			}
+			await planAutoStart(ctx, req);
 		},
 	});
 
@@ -2131,33 +2360,12 @@ export default function (pi: ExtensionAPI) {
 				// clear·지우기: 지금 작업을 폐기 (2026-11-02.1 의 '목록 지우기')
 				const t = sub === "clear" || sub === "지우기" ? cur() : byNo();
 				if (!t) return ctx.ui.notify(sub === "clear" || sub === "지우기" ? "지금 작업이 없습니다 (/todo 로 진행 중 작업)" : `작업 #${n0 || "?"} 이(가) 작업판에 없습니다. ${usage}`, "warning");
-				const now = Date.now();
 				if (sub === "이어서" || sub === "계속" || sub === "resume") {
 					if (!here(t)) return ctx.ui.notify(`작업 #${t.no} 은(는) 다른 폴더의 작업입니다 (${t.project}: ${t.cwd}). 그 폴더에서 pi 를 켜고 /todo 이어서 ${t.no}`, "warning");
-					edit(ctx, (b) => {
-						const x = b.tasks.find((y) => y.id === t.id);
-						if (!x) return false;
-						const old = curId && curId !== x.id ? b.tasks.find((y) => y.id === curId) : undefined;
-						if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped] = ["paused", null];
-						[x.state, x.closed, x.stopped, x.updated] = ["doing", null, null, now];
-						delete x.manual;
-						[curId, curSince] = [x.id, now];
-					});
-					const back = cur();
-					if (!back) return;
-					listUpdated();
-					bounced = false;
-					if (!ctx.isIdle()) ctx.ui.notify(`지금 요청이 끝나면 작업 #${back.no} 을(를) 이어서 보냅니다`, "info");
-					setTimeout(() => pi.sendUserMessage(userAsk(resumeText(back, more.join(" ")), `(작업 #${back.no} 이어서)`), { deliverAs: "followUp" }), 0);
-					return;
+					return resumeTask(ctx, t, more.join(" "));
 				}
 				const drop = sub !== "완료" && sub !== "done";
-				edit(ctx, (b) => {
-					const x = b.tasks.find((y) => y.id === t.id);
-					if (!x) return false;
-					[x.state, x.closed, x.stopped, x.manual] = [drop ? "dropped" : "done", now, null, true];
-					if (x.id === curId) curId = null;
-				});
+				setTaskState(ctx, t, drop ? "dropped" : "done");
 				return ctx.ui.notify(`작업 #${t.no} 을(를) ${drop ? "폐기했습니다" : "완료로 옮겼습니다"} (작업판 완료 탭에 남음. 되돌리려면 /todo 이어서 ${t.no})`, "info");
 			}
 			if (sub && sub !== "목록" && sub !== "list") return ctx.ui.notify(usage, "warning");

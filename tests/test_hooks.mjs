@@ -518,6 +518,23 @@ ctx = fakeCtx([]);
 const sentNow = sent.length;
 await doneReq(ctx, { write: "src/j.py", none: true });
 check(".pi/checks.json 이 없으면 아무것도 하지 않음", ctx.log.length === 0 && sent.length === sentNow, ctx.log);
+// /planauto: 목록 맞추기(modes.ts)가 아무것도 보내지 않았을 때만 다음을 물음 (보냈으면 그 요청이 끝날 때 다시 옴. 함께 보내면 뒤의 것이 '이미 처리 중' 이 됨)
+{
+	const calls = [];
+	const saved = [globalThis.__piTodoBounce, globalThis.__piPlanAutoSettled];
+	globalThis.__piPlanAutoSettled = () => calls.push("auto");
+	globalThis.__piTodoBounce = () => (calls.push("bounce"), true);
+	await F.emit("agent_settled", {}, fakeCtx([]));
+	await waitFor(() => calls.length, 2000);
+	await new Promise((ok) => setTimeout(ok, 50));
+	check("/planauto: 목록 맞추기를 보냈으면 묻지 않음", calls.includes("bounce") && !calls.includes("auto"), calls); // 앞 시험의 기다리던 처리가 한 번 더 올 수 있음
+	calls.length = 0;
+	globalThis.__piTodoBounce = () => (calls.push("bounce"), undefined);
+	await F.emit("agent_settled", {}, fakeCtx([]));
+	await waitFor(() => calls.length >= 2, 2000);
+	check("/planauto: 아무것도 보내지 않았으면 그 뒤에 물음", calls.join() === "bounce,auto", calls);
+	[globalThis.__piTodoBounce, globalThis.__piPlanAutoSettled] = saved;
+}
 
 // ── 목표 (/goal <명령>, 2026-11-05): 요청이 끝날 때마다 명령을 돌려, 실패면 pi 에게 고치게 (goal_rounds 번까지) ──
 {

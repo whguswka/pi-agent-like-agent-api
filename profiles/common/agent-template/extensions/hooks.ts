@@ -1224,7 +1224,8 @@ export default function (pi: ExtensionAPI) {
 			goalSent = false;
 			if (C.round === 1 || sent) return;
 			try {
-				(globalThis as any).__piTodoBounce?.(ctx);
+				// 아무것도 보내지 않았을 때만 /planauto 가 다음을 물음 (보냈으면 그 요청이 끝날 때 다시 옴)
+				if (!(globalThis as any).__piTodoBounce?.(ctx)) (globalThis as any).__piPlanAutoSettled?.(ctx);
 			} catch {}
 		}, 0);
 	});
