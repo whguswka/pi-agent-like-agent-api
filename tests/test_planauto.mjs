@@ -1,6 +1,6 @@
 // /planauto (profiles/common/agent-template/extensions/modes.ts) 단위 테스트: 대기 계획 고르기, 갈림길마다 묻는 창과 고른 뒤의 동작 (가짜 pi)
 // 사용법: node tests/test_planauto.mjs   (저장소의 runtime/node_modules/jiti 로 .ts 를 불러옴)
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -292,6 +292,48 @@ check("새 세션: 계획 자동이 켜진 채 상태 줄을 다시 보임", Str
 await cmds2.planauto.handler("", ctx);
 check("새 세션에서 다시 치면 끔", globalThis.__piPlanAuto === false && !status["plan-auto"], status);
 
+// 14) plan_model: /planauto <요청> 과 입력 처리기의 새 요청 길 모두 요청을 넘기기 전에 바꿈
+const AGENT_MODEL = mkdtempSync(join(tmpdir(), "planauto-model-"));
+process.env.PI_CODING_AGENT_DIR = AGENT_MODEL;
+writeFileSync(join(AGENT_MODEL, "bridge.json"), JSON.stringify({ plan_model: "gpt-6.1-sol", plan_execute_model: "gpt-5.6-sol-think" }));
+globalThis.__piMode = "auto";
+globalThis.__piPlanAuto = false;
+const on3 = {};
+const cmds3 = {};
+const sent3 = [];
+const sets3 = [];
+const answers3 = [];
+const fakePi3 = {
+	on: (e, f) => (on3[e] ||= []).push(f), registerCommand: (n, d) => (cmds3[n] = d), registerTool: () => {},
+	setModel: async (mm) => (sets3.push(mm), true), sendUserMessage: (text, opts) => sent3.push({ text, opts, at: sets3.length }),
+};
+m.default(fakePi3);
+const ctx3 = {
+	hasUI: true, model: { provider: "copilot", id: "gpt-5.6-sol-think" }, modelRegistry: { find: (p, id) => ({ provider: p, id }) }, isIdle: () => true,
+	ui: {
+		notify() {}, setWidget() {}, setStatus() {}, setEditorText() {}, confirm: async () => true,
+		select: async (_title, opts) => answers3.length ? opts.find((o) => o.includes(answers3.shift())) : undefined,
+	},
+};
+await cmds3.planauto.handler("모델 전환 계획", ctx3);
+await until(() => sent3.length);
+check("/planauto <요청>: 새 계획을 보내기 전에 계획 모델로 바꿈", sets3[0]?.id === "gpt-6.1-sol" && sent3[0]?.at === 1 && globalThis.__piMode === "plan", { sets3, sent3, mode: globalThis.__piMode });
+await cmds3.planauto.handler("", ctx3); // 끄며 원래 모델 복원
+check("/planauto 를 꺼 계획 모드를 나오면 원래 모델로 돌아감", sets3[1]?.id === "gpt-5.6-sol-think", sets3);
+
+await cmds3.planauto.handler("", ctx3); // 창에서 Esc: 계획 자동만 켜 둠
+const beforeInputSet = sets3.length;
+const rModelInput = await (async () => {
+	let text = "입력으로 새 계획";
+	for (const f of on3.input || []) {
+		const r = await f({ text, source: "interactive" }, ctx3);
+		if (r?.action === "transform") text = r.text;
+	}
+	return text;
+})();
+check("계획 자동의 새 요청(input) 길도 transform 전에 계획 모델로 바꿈", sets3.length === beforeInputSet + 1 && sets3.at(-1).id === "gpt-6.1-sol" && rModelInput.startsWith("[계획 모드]"), { sets3, rModelInput });
+
 rmSync(AGENT, { recursive: true, force: true });
+rmSync(AGENT_MODEL, { recursive: true, force: true });
 console.log(fails ? `\n실패 ${fails}개` : "\n모두 통과");
 process.exit(fails ? 1 : 0);

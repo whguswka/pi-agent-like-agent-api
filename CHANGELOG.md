@@ -3,6 +3,11 @@
 버전 번호는 `VERSION` 에 있습니다. 새 버전으로 바꾸면(`update.sh`) 끝에 그 버전의 항목을 보여 줍니다.
 버전마다 바탕이 된 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 의 버전을 함께 적습니다.
 
+## 2026-11-11.1
+계획 모델 자동 전환 `plan_model`. 바탕: pi-agent-like-agent 2026-11-11.1. 이 키트에서는 단위 시험과 가짜 모델 서버로 시험했습니다.
+- **계획 모델 자동 전환 (`plan_model`)** ([README 3-5](README.md#3-5-작업-모드-plan-mode)): 내 설정에 계획용 모델을 적으면 `/plan`·`/mode plan`·`/planauto` 로 계획 모드에 들어갈 때 요청을 보내기 전에 그 모델로 바꿉니다. 승인하면 `plan_execute_model` 로 진행하고, 승인 없이 계획 모드를 끄면 원래 모델로 돌아갑니다.
+  - 모델 id 나 `provider/id`, 또는 그 순서 목록(`["큰-모델-id", "다른-모델-id"]`)으로 적습니다. 목록이면 모델 목록에 있는 첫 모델로 바꿉니다.
+
 ## 2026-11-09.1
 계획 자동 `/planauto`. 바탕: pi-agent-like-agent 2026-11-09.1. 이 키트에서는 가짜 모델 서버로 시험했습니다.
 - **계획 자동 `/planauto`** ([README 3-5](README.md#3-5-작업-모드-plan-mode)): 켜 두면 진행 중이거나 대기 중인 계획이 있으면 그 계획으로, 없으면 계획 모드로 계획부터 세우고 승인하면 진행합니다. `/planauto <요청>` 도 됩니다. 다시 치면 끕니다.

@@ -655,6 +655,23 @@ export function executeModel(cfg: any = userConfig(), settings: any = piSettings
 	const [provider, id] = explicit ? [v.slice(0, v.indexOf("/")), v.slice(v.indexOf("/") + 1)] : [String(settings.defaultProvider || ""), v || String(settings.defaultModel || "")];
 	return provider && id ? { provider, id, explicit } : null;
 }
+/** 계획을 세울 모델 목록 {provider, id}: 내 설정 파일의 "plan_model" (모델 id 나 provider/id 의 문자열 또는 순서 목록).
+ *  id 만 적으면 지금 모델과 같은 제공자에서 찾고, 빈 항목은 건너뜀 */
+export function planModels(cur: { provider?: string } | undefined, cfg: any = userConfig()): { provider: string; id: string; explicit: boolean }[] {
+	if (!cur?.provider) return [];
+	const raw = Array.isArray(cfg.plan_model) ? cfg.plan_model : [cfg.plan_model];
+	return raw.flatMap((x: any) => {
+		const v = typeof x === "string" ? x.trim() : "";
+		if (!v) return [];
+		const explicit = v.includes("/");
+		const [provider, id] = explicit ? [v.slice(0, v.indexOf("/")), v.slice(v.indexOf("/") + 1)] : [cur.provider, v];
+		return provider && id ? [{ provider, id, explicit }] : [];
+	});
+}
+/** 예전 문자열 설정과 단위 시험에서 쓰는 첫 계획 모델. 실제 전환은 모델 목록에서 찾을 수 있는 첫 항목을 고른다. */
+export function planModel(cur: { provider?: string } | undefined, cfg: any = userConfig()): { provider: string; id: string; explicit: boolean } | null {
+	return planModels(cur, cfg)[0] || null;
+}
 function piSettings(): any {
 	try {
 		const p = join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "settings.json");
@@ -1521,6 +1538,7 @@ export default function (pi: ExtensionAPI) {
 	let lastInputAt = 0; // 사용자가 마지막으로 요청을 보낸 때
 	let lastReq = ""; // 사용자가 마지막으로 보낸 요청의 첫 줄 (작업 이름)
 	let planReq = ""; // 계획 모드에서 처음 보낸 요청 (승인한 계획 작업의 이름. /plan <요청> 으로 보낸 것도)
+	let planModelPrev: any = null; // plan_model 로 바꾸기 전 모델 (승인 없이 계획 모드를 끄면 되돌림)
 	// '새 대화로 진행' 을 고른 계획 (/plan --new 를 보내면 새 세션에서 진행). n 단계 수, task 작업판에 둘 목록, refine 지금 작업을 고침
 	let fresh: { n: number; refine: boolean; task: TodoState; doc: string; plan: string } | null = null;
 	let saveWarned = false;
@@ -1708,7 +1726,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (p.act === "plain") return;
 			}
-			enterPlan(ctx);
+			await enterPlan(ctx);
 			ctx.ui.notify("계획 자동: 이 요청은 계획부터 세웁니다 (/planauto 끄기)", "info");
 		}
 		if (mode !== "plan" || !text.trim() || review?.phase === "running") return; // 리뷰 요청에는 계획 안내를 붙이지 않음 (리뷰는 따로 읽기만)
@@ -1873,19 +1891,23 @@ export default function (pi: ExtensionAPI) {
 		const fg = (c: string, s: string) => (ctx.ui.theme?.fg ? ctx.ui.theme.fg(c, s) : s);
 		ctx.ui.setStatus("plan-auto", planAuto ? fg("accent", "계획 자동 (/planauto 끄기)") : undefined);
 	};
-	const planAutoOff = (ctx: any) => {
+	const planAutoOff = async (ctx: any) => {
 		[planAuto, autoWaitReq] = [false, null];
 		(globalThis as any).__piPlanAuto = false;
 		showPlanAuto(ctx);
-		if (mode === "plan" && autoEntered) setMode(ctx, before === "plan" ? "auto" : before);
+		if (mode === "plan" && autoEntered) {
+			setMode(ctx, before === "plan" ? "auto" : before);
+			await restorePlanModel(ctx);
+		}
 		autoEntered = false;
 		ctx.ui.notify(`계획 자동을 껐습니다 (지금: ${LABEL[mode]} 모드)`, "info");
 	};
-	const enterPlan = (ctx: any) => {
+	const enterPlan = async (ctx: any) => {
 		if (mode === "plan") return;
 		before = mode;
 		autoEntered = true;
 		setMode(ctx, "plan");
+		await toPlanModel(ctx);
 	};
 	/** 묻는 창을 띄우고 고른 것을 돌려줌 (Esc 면 없음) */
 	const planAutoPick = async (ctx: any, menu: { title: string; picks: PlanAutoPick[] }): Promise<PlanAutoPick | undefined> => {
@@ -1918,14 +1940,14 @@ export default function (pi: ExtensionAPI) {
 			return planAutoAsk(ctx, "finished", t);
 		}
 		if (p.act === "refine") {
-			enterPlan(ctx);
+			await enterPlan(ctx);
 			return ctx.ui.notify("계획 모드: 고칠 점을 적어 보내세요. 지금 목록을 함께 보내 고친 계획 전체를 다시 받습니다 (/planauto 끄기)", "info");
 		}
 		if (p.act !== "new") return;
 		// 새 계획: 진행하던 계획을 쉬게 함 (그대로 두면 계획 모드의 요청에 그 목록이 붙어 '다듬기' 가 됨)
 		const now = openTodoOf();
 		if (now) setTaskState(ctx, now, "paused");
-		enterPlan(ctx);
+		await enterPlan(ctx);
 		[planDoc, planReq] = ["", ""];
 		if (!req) return ctx.ui.notify("계획 모드: 파일을 바꾸지 않고 계획부터 세웁니다. 요청을 적어 보내세요 (/planauto 끄기)", "info");
 		setTimeout(() => pi.sendUserMessage(userAsk(req), { deliverAs: "followUp" }), 0);
@@ -2049,6 +2071,7 @@ export default function (pi: ExtensionAPI) {
 	/** 승인한 계획을 진행할 모델로 바꾼다 (고급 모델로 계획했으면 기본 모델로). 같은 대화에서 모델만 바뀌므로 계획은 그대로 이어 봄.
 	 *  같은 제공자 안에서만 바꾼다 (사내AI 로 계획했는데 기본 모델이 Copilot 이면 그대로: 대화가 다른 중계 서버로 넘어감). provider/id 로 적었으면 그대로 */
 	async function toExecuteModel(ctx: any) {
+		planModelPrev = null; // 계획을 승인했으므로 이후에는 계획 전 모델로 되돌리지 않음
 		const want = executeModel();
 		const cur = ctx.model;
 		if (!want || !cur || (cur.provider === want.provider && cur.id === want.id) || typeof (pi as any).setModel !== "function") return;
@@ -2062,6 +2085,42 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`계획은 ${cur.id} 로 세웠고, 진행은 ${want.id} 로 합니다 (바꾸지 않으려면 내 설정 파일에 "plan_execute_model": "same")`, "info");
 		} catch (e) {
 			ctx.ui.notify(`진행할 모델(${want.id})로 바꾸지 못해 지금 모델(${cur.id})로 진행합니다: ${(e as Error).message}`, "warning");
+		}
+	}
+
+	/** 사용자가 계획 모드로 들어갈 때 설정한 계획 모델로 바꾼다. 실패해도 계획 모드는 그대로 이어 간다. */
+	async function toPlanModel(ctx: any) {
+		const cur = ctx.model;
+		const wants = planModels(cur);
+		if (!wants.length || !cur) return;
+		const order = wants.slice(0, 4).map((x) => x.id).join(" → ") + (wants.length > 4 ? " → …" : "");
+		const found = wants.map((want) => ({ want, model: ctx.modelRegistry?.find?.(want.provider, want.id) })).find((x) => x.model);
+		if (!found) return ctx.ui.notify(`계획 모델 목록(${order})을 모델 목록에서 찾지 못해 지금 모델(${cur.id})로 계획합니다`, "warning");
+		const { want, model: m } = found;
+		if (cur.provider === want.provider && cur.id === want.id) return;
+		if (!want.explicit && cur.provider !== want.provider) return;
+		if (typeof (pi as any).setModel !== "function") return ctx.ui.notify(`계획 모델(${want.id})로 바꾸지 못해 지금 모델(${cur.id})로 계획합니다`, "warning");
+		try {
+			const ok = await (pi as any).setModel(m);
+			if (ok === false) return ctx.ui.notify(`계획 모델(${want.id})로 바꾸지 못해 지금 모델(${cur.id})로 계획합니다 (그 모델의 로그인·인증을 확인하세요)`, "warning");
+			planModelPrev = cur;
+			const run = executeModel()?.id || cur.id;
+			ctx.ui.notify(`계획은 ${want.id} 로 세우고 진행은 ${run} 로 합니다 (순서: ${order}; 끄려면 내 설정에서 plan_model 을 지우세요)`, "info");
+		} catch (e) {
+			ctx.ui.notify(`계획 모델(${want.id})로 바꾸지 못해 지금 모델(${cur.id})로 계획합니다: ${(e as Error).message}`, "warning");
+		}
+	}
+
+	/** 승인하지 않고 계획 모드를 나갈 때, plan_model 로 바꾸기 전 모델로 돌아간다. */
+	async function restorePlanModel(ctx: any) {
+		const prev = planModelPrev;
+		planModelPrev = null;
+		if (!prev || typeof (pi as any).setModel !== "function") return;
+		try {
+			const ok = await (pi as any).setModel(prev);
+			if (ok === false) ctx.ui.notify(`계획 전 모델(${prev.id})로 돌아가지 못했습니다. /model 로 골라 주세요`, "warning");
+		} catch (e) {
+			ctx.ui.notify(`계획 전 모델(${prev.id})로 돌아가지 못했습니다: ${(e as Error).message}`, "warning");
 		}
 	}
 
@@ -2244,11 +2303,13 @@ export default function (pi: ExtensionAPI) {
 			if (mode === "plan" && !req) {
 				setMode(ctx, before === "plan" ? "auto" : before);
 				autoEntered = false;
+				await restorePlanModel(ctx);
 				return ctx.ui.notify(`계획 모드를 껐습니다 (지금: ${LABEL[mode]} 모드${planAuto ? ". 계획 자동이 켜져 있어 다음 새 요청은 다시 계획부터 세웁니다. /planauto 로 끔" : ""})`, "info");
 			}
 			if (mode !== "plan") {
 				before = mode;
 				setMode(ctx, "plan");
+				await toPlanModel(ctx);
 				if (!req) ctx.ui.notify("계획 모드: 파일을 바꾸지 않고 계획부터 세웁니다. 요청을 적어 보내세요 (/plan 으로 끄기)", "info");
 			}
 			if (!req) return;
@@ -2403,8 +2464,11 @@ export default function (pi: ExtensionAPI) {
 				want = opts.find((o) => o[0] === pick)?.[1];
 				if (!want) return;
 			}
-			if (want === "plan" && mode !== "plan") before = mode;
+			const enteringPlan = want === "plan" && mode !== "plan";
+			if (enteringPlan) before = mode;
+			if (mode === "plan" && want !== "plan") await restorePlanModel(ctx);
 			setMode(ctx, want);
+			if (enteringPlan) await toPlanModel(ctx);
 			ctx.ui.notify(`${LABEL[want]} 모드${want === "plan" ? ": 파일을 바꾸지 않고 계획부터 세웁니다" : want === "ask" ? ": 바꾸기 전에 내용을 보여 주고 묻습니다" : ": 묻지 않고 실행합니다 (위험한 명령만 확인)"}`, "info");
 		},
 	});

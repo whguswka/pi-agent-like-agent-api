@@ -191,6 +191,11 @@ check("진행할 모델: 설정이 없으면 pi 의 기본 모델, provider/id·
 	&& JSON.stringify(m.executeModel({ plan_execute_model: "copilot/claude-sonnet-5.5" }, ST)) === JSON.stringify({ provider: "copilot", id: "claude-sonnet-5.5", explicit: true })
 	&& JSON.stringify(m.executeModel({ plan_execute_model: "gpt-5.6-sol-fast" }, ST)) === JSON.stringify({ provider: "copilot", id: "gpt-5.6-sol-fast", explicit: false })
 	&& m.executeModel({ plan_execute_model: "same" }, ST) === null && m.executeModel({}, {}) === null);
+check("계획 모델: 없거나 비면 바꾸지 않고, id 는 지금 제공자·provider/id 는 적은 제공자를 씀",
+	m.planModel({ provider: "copilot" }, {}) === null && m.planModel({ provider: "copilot" }, { plan_model: "  " }) === null
+	&& JSON.stringify(m.planModel({ provider: "copilot" }, { plan_model: "gpt-6.1-sol" })) === JSON.stringify({ provider: "copilot", id: "gpt-6.1-sol", explicit: false })
+	&& JSON.stringify(m.planModel({ provider: "inhouse" }, { plan_model: "copilot/claude-opus-5.5" })) === JSON.stringify({ provider: "copilot", id: "claude-opus-5.5", explicit: true })
+	&& m.planModels({ provider: "copilot" }, { plan_model: ["", "claude-opus-5.5", "gpt-6.1-sol"] }).map((x) => x.id).join(",") === "claude-opus-5.5,gpt-6.1-sol");
 const AG = mkdtempSync(join(tmpdir(), "modes-agent-"));
 writeFileSync(join(AG, "settings.json"), JSON.stringify(ST));
 writeFileSync(join(AG, "bridge.json"), "{}");
@@ -198,7 +203,7 @@ const envBefore = [process.env.PI_CODING_AGENT_DIR, process.env.PI_COPILOT_USER_
 process.env.PI_CODING_AGENT_DIR = AG;
 process.env.PI_COPILOT_USER_CONFIG = join(AG, "bridge.json");
 ctx.model = { provider: "copilot", id: "claude-opus-5.5" };
-ctx.modelRegistry = { find: (p, id) => ({ provider: p, id }) };
+ctx.modelRegistry = { find: (p, id) => id === "없는-모델" ? undefined : ({ provider: p, id }) };
 const approve = async () => {
 	await cmds.plan.handler("", ctx);
 	await on.agent_start[0]({}, ctx);
@@ -238,6 +243,63 @@ await approve();
 setModelResult = true;
 check("setModel 이 false 면 '바꾸지 못해 지금 모델로' 를 알리고 '진행은 … 로' 는 알리지 않음",
 	notes.slice(nNotesSet).some((x) => x.includes("바꾸지 못해")) && !notes.slice(nNotesSet).some((x) => x.includes("진행은 gpt-5.6-sol-think")), notes.slice(nNotesSet));
+
+// 계획 모드에 들어갈 때 plan_model 로 바꾸고, 요청보다 먼저 끝내며, 승인 없이 끄면 원래 모델로 돌아감
+writeFileSync(join(AG, "bridge.json"), JSON.stringify({ plan_model: ["없는-모델", "gpt-6.1-sol", "claude-sonnet-5.5"], plan_execute_model: "gpt-5.6-sol-think" }));
+ctx.model = { provider: "copilot", id: "gpt-5.6-sol-think" };
+ctx.modelRegistry = { find: (p, id) => id === "없는-모델" ? undefined : ({ provider: p, id }) };
+nSet = modelSets.length;
+let nSentModel = sent.length;
+await cmds.plan.handler("상위 모델로 계획", ctx);
+await sentAfter(nSentModel);
+check("plan_model 목록에서 registry 에 있는 첫 모델로 /plan <요청> 전에 바꾸고 순서를 알림",
+	modelSets.length === nSet + 1 && modelSets.at(-1).id === "gpt-6.1-sol" && sent.at(-1).at === nSet + 1
+	&& notes.some((x) => x.includes("계획은 gpt-6.1-sol") && x.includes("없는-모델 → gpt-6.1-sol → claude-sonnet-5.5")),
+	{ sets: modelSets.slice(nSet), sent: sent.at(-1), notes: notes.slice(-3) });
+await cmds.plan.handler("", ctx);
+check("/plan 으로 승인 없이 끄면 계획 모델로 바꾸기 전 모델로 돌아감",
+	modelSets.length === nSet + 2 && modelSets.at(-1).id === "gpt-5.6-sol-think", modelSets.slice(nSet));
+
+ctx.model = { provider: "copilot", id: "gpt-6.1-sol" };
+nSet = modelSets.length;
+await cmds.plan.handler("", ctx);
+check("이미 계획 모델이면 바꾸지 않음", modelSets.length === nSet, modelSets.slice(nSet));
+await cmds.plan.handler("", ctx);
+
+ctx.model = { provider: "copilot", id: "gpt-5.6-sol-think" };
+ctx.modelRegistry = { find: () => undefined };
+nSet = modelSets.length;
+const nNotesMissing = notes.length;
+await cmds.plan.handler("", ctx);
+check("계획 모델을 목록에서 못 찾으면 알리고 지금 모델로 계획", modelSets.length === nSet && notes.slice(nNotesMissing).some((x) => x.includes("찾지 못해 지금 모델")), notes.slice(nNotesMissing));
+await cmds.plan.handler("", ctx);
+
+ctx.modelRegistry = { find: (p, id) => id === "없는-모델" ? undefined : ({ provider: p, id }) };
+setModelResult = false;
+nSet = modelSets.length;
+const nNotesFalse = notes.length;
+await cmds.plan.handler("", ctx);
+setModelResult = true;
+check("계획 모델 setModel 이 false 면 알리고 지금 모델로 계획", modelSets.length === nSet + 1 && notes.slice(nNotesFalse).some((x) => x.includes("바꾸지 못해 지금 모델")), notes.slice(nNotesFalse));
+await cmds.plan.handler("", ctx);
+
+nSet = modelSets.length;
+await cmds.plan.handler("", ctx);
+ctx.model = { provider: "copilot", id: "gpt-6.1-sol" };
+await on.agent_start[0]({}, ctx);
+await on.message_end[0]({ message: { role: "assistant", content: "1. 계획하기\n2. 시험하기" } }, ctx);
+nSentModel = sent.length;
+await on.agent_settled[0]({}, ctx);
+await sentAfter(nSentModel);
+check("계획을 승인하면 원래 모델 복원이 아니라 진행 모델로 바뀜",
+	modelSets.length === nSet + 2 && modelSets[nSet].id === "gpt-6.1-sol" && modelSets[nSet + 1].id === "gpt-5.6-sol-think", modelSets.slice(nSet));
+
+writeFileSync(join(AG, "bridge.json"), "{}");
+ctx.model = { provider: "copilot", id: "gpt-5.6-sol-think" };
+nSet = modelSets.length;
+await cmds.plan.handler("", ctx);
+check("plan_model 이 없으면 계획 모드에 들어가도 setModel 을 부르지 않음", modelSets.length === nSet, modelSets.slice(nSet));
+await cmds.plan.handler("", ctx);
 [process.env.PI_CODING_AGENT_DIR, process.env.PI_COPILOT_USER_CONFIG] = envBefore;
 if (envBefore[0] === undefined) delete process.env.PI_CODING_AGENT_DIR;
 if (envBefore[1] === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
