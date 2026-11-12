@@ -3,6 +3,10 @@
 버전 번호는 `VERSION` 에 있습니다. 새 버전으로 바꾸면(`update.sh`) 끝에 그 버전의 항목을 보여 줍니다.
 버전마다 바탕이 된 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 의 버전을 함께 적습니다.
 
+## 2026-11-12.1
+같은 글 edit 미리 막기. 바탕: pi-agent-like-agent 2026-11-12.1. 단위 시험으로 확인했습니다.
+- **같은 글 edit 미리 막기:** edit 의 바꿀 글과 새 글이 모두 같으면 실행하지 않고, 빠진 기호처럼 실제로 고칠 글자를 `newText` 에 넣었는지 확인하라고 모델에게 알립니다. 같은 요청에서 같은 파일로 되풀이하면 다시 읽은 뒤 고친 파일 전체를 write 로 쓰라고 안내합니다.
+
 ## 2026-11-11.1
 계획 모델 자동 전환 `plan_model`. 바탕: pi-agent-like-agent 2026-11-11.1. 이 키트에서는 단위 시험과 가짜 모델 서버로 시험했습니다.
 - **계획 모델 자동 전환 (`plan_model`)** ([README 3-5](README.md#3-5-작업-모드-plan-mode)): 내 설정에 계획용 모델을 적으면 `/plan`·`/mode plan`·`/planauto` 로 계획 모드에 들어갈 때 요청을 보내기 전에 그 모델로 바꿉니다. 승인하면 `plan_execute_model` 로 진행하고, 승인 없이 계획 모드를 끄면 원래 모델로 돌아갑니다.

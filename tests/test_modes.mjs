@@ -780,6 +780,23 @@ const inputAll = async (text) => {
 	}
 	return cur;
 };
+await inputAll("같은 글 edit 시험");
+const sameToolCall = async (input) => (await on.tool_call[0]({ toolName: "edit", input }, ctx)) || null;
+const same1 = await sameToolCall({ path: "src/one.py", edits: [{ oldText: "x", newText: "x" }] });
+const sameMany = await sameToolCall({ path: "src/many.py", edits: [{ oldText: "a", newText: "a" }, { oldText: "b", newText: "b" }] });
+const partlySame = await sameToolCall({ path: "src/part.py", edits: [{ oldText: "a", newText: "a" }, { oldText: "b", newText: "c" }] });
+const sameLegacy = await sameToolCall({ path: "src/old.py", oldText: "before", newText: "before" });
+check("같은 글 edit: 한 곳·여러 곳·옛 모양은 막고, 여러 곳 중 일부만 같으면 막지 않음",
+	same1?.block === true && sameMany?.block === true && !partlySame?.block && sameLegacy?.block === true
+	&& same1.reason.includes("src/one.py") && same1.reason.includes("바꿀 글과 새 글이 똑같아") && same1.reason.includes("빠진 기호") && same1.reason.includes("newText"),
+	{ same1, sameMany, partlySame, sameLegacy });
+const same2 = await sameToolCall({ path: "src/one.py", edits: [{ oldText: "x", newText: "x" }] });
+check("같은 글 edit: 같은 요청의 같은 경로 두 번째부터 read 뒤 파일 전체를 write 하라고 안내",
+	same2?.reason.includes("read 로 다시 읽고") && same2.reason.includes("파일 전체를 write 로 다시 쓰세요"), same2);
+await inputAll("새 사용자 요청");
+const sameNew = await sameToolCall({ path: "src/one.py", edits: [{ oldText: "x", newText: "x" }] });
+check("같은 글 edit: 새 사용자 요청에서는 경로별 횟수를 다시 셈",
+	sameNew?.block === true && !sameNew.reason.includes("read 로 다시 읽고"), sameNew);
 await inputAll("요약 시험 작업: 세 단계");
 await tools.todo.execute("tc1", { text: "- [x] 요약 단계 하나\n- [~] 요약 단계 둘\n  - [ ] 둘의 하위\n- [ ] 요약 단계 셋" }, undefined, undefined, ctx);
 const cn = m.compactNote(doing());
@@ -864,6 +881,8 @@ await cmds.plan.handler("", ctx);
 await answerWith("write");
 const inPlan = await toolCallOf("write", { path: "b.txt" });
 check("계획 모드에서는 이 막기를 쓰지 않음 (계획 모드 까닭으로만)", inPlan?.block === true && inPlan.reason.startsWith("계획 모드라서"), inPlan);
+const sameInPlan = await sameToolCall({ path: "docs/plans/same.md", edits: [{ oldText: "그대로", newText: "그대로" }] });
+check("계획 모드에서도 같은 글 edit 는 실행 전에 막음", sameInPlan?.block === true && sameInPlan.reason.includes("바꿀 글과 새 글이 똑같아"), sameInPlan);
 await cmds.plan.handler("", ctx);
 
 // 요청 끝에 돌려보내기

@@ -1553,6 +1553,7 @@ export default function (pi: ExtensionAPI) {
 	let gateTries = 0; // 목록을 고치지 않아 막은 답 수
 	let gateOff = false; // TODO_GATE_TRIES 번 막아도 고치지 않음: 이 요청 동안 막지 않음
 	let todoInAnswer = false; // 이번 답에 todo 도 있음 (같은 답의 다른 도구는 막지 않음)
+	const sameEditByPath = new Map<string, number>(); // 사용자 요청마다 같은 글 edit 를 경로별로 센다
 	const todoEnforce = () => userConfig().todo_enforce !== false;
 	const listUpdated = () => {
 		[sinceTodo, workSince, gateTries, gateOff, listTouched] = [0, 0, 0, false, true];
@@ -1705,6 +1706,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.source !== "extension" && text.trim()) {
 			[lastReq, lastInputAt] = [cut(text.trim().split("\n")[0], 100), Date.now()];
 			[workSince, listTouched, bounced, gateTries, gateOff] = [0, false, false, 0, false];
+			sameEditByPath.clear();
 		}
 		const t = cur();
 		if (event.source !== "extension" && t && !isOpen(t)) {
@@ -1745,6 +1747,20 @@ export default function (pi: ExtensionAPI) {
 		}
 		const tool = String(event.toolName || "");
 		const input = event.input || {};
+		if (tool === "edit") {
+			const edits: any[] = Array.isArray(input.edits) ? [...input.edits] : [];
+			if (input.oldText !== undefined || input.newText !== undefined) edits.push({ oldText: input.oldText, newText: input.newText });
+			if (edits.length && edits.every((e) => typeof e?.oldText === "string" && typeof e?.newText === "string" && e.oldText === e.newText)) {
+				const path = String(input.path || input.file_path || "(경로 없음)");
+				const n = (sameEditByPath.get(path) || 0) + 1;
+				sameEditByPath.set(path, n);
+				const again = n >= 2 ? " 같은 요청에서 또 같게 보냈습니다. 그 부분을 read 로 다시 읽고, 고친 파일 전체를 write 로 다시 쓰세요." : "";
+				return {
+					block: true,
+					reason: `${path}: 바꿀 글과 새 글이 똑같아 바뀌는 것이 없습니다. 고치려던 글자(예: 빠진 기호)를 newText 에 넣었는지 확인하세요.${again}`,
+				};
+			}
+		}
 		// 목록을 오래 고치지 않으면 쓰기·실행을 막음 (읽기는 그대로). 알림은 무시할 수 있어 (2026-11-06)
 		if (mode !== "plan" && sinceTodo >= TODO_NUDGE_AGAIN && !todoInAnswer && !gateOff && changesThings(tool, input)) {
 			const t = cur();
