@@ -991,6 +991,117 @@ await cmds.todo.handler("clear", ctx);
 if (cfgOld === null) rmSync(CFG, { force: true });
 else wr(CFG, cfgOld);
 rmSync(TW, { recursive: true, force: true });
+// ── 노트북 작업판 (2026-11-16 사용자: 브리지 jupyter 로 계획·리뷰, API 키트로 개발. 작업판이 둘로 나뉘면 연동이 안 됨) ──
+{
+	const nbFiles = new Map();
+	const runs = [];
+	const BJ = "/home/jovyan/.pi/agent/todo/board.json";
+	const qargs = (cmd) => [...cmd.matchAll(/'((?:[^']|'\\'')*)'/g)].map((x) => x[1].replace(/'\\''/g, "'"));
+	const mock = {
+		readTarget: async (t) => (nbFiles.has(t.abs) ? Buffer.from(nbFiles.get(t.abs)) : null),
+		runHere: async (cmd) => {
+			runs.push(cmd);
+			const a = qargs(cmd);
+			if (cmd.startsWith("python3 -c")) {
+				for (const [p, s] of Object.entries(JSON.parse(Buffer.from(a.at(-1), "base64").toString("utf8")))) nbFiles.set(p, s);
+				return { code: 0, out: "" };
+			}
+			if (cmd.startsWith("mv -- ")) {
+				nbFiles.set(a[1], nbFiles.get(a[0]));
+				nbFiles.delete(a[0]);
+				return { code: 0, out: "" };
+			}
+			return { code: 1, out: "모르는 명령" };
+		},
+	};
+	globalThis.__piRelayMock = mock;
+	const wdNb = { remote: true, cwd: "/home/jovyan/work/proj", home: "/home/jovyan" };
+	const oldKit = process.env.PI_API_KIT;
+	process.env.PI_API_KIT = "1";
+	const apiW = m.todoWhere({ remote: false, cwd: "/home/jovyan/work/proj" });
+	if (oldKit === undefined) delete process.env.PI_API_KIT;
+	else process.env.PI_API_KIT = oldKit;
+	const brW = m.todoWhere(wdNb);
+	const pcW = m.todoWhere({ remote: false, cwd: "C:\\Users\\u\\proj" });
+	check("같은 노트북 폴더: API 키트(PI_API_KIT=1)와 브리지 jupyter 가 같은 작업 위치 ('노트북 …', 같은 key)",
+		apiW.key === brW.key && apiW.remote && brW.remote && apiW.cwd === brW.cwd && apiW.project === "노트북 work/proj" && brW.project === apiW.project && !pcW.remote && !pcW.project.startsWith("노트북"), [apiW, brW, pcW]);
+	check("작업판 위치: jupyter 모드는 노트북 홈의 ~/.pi/agent/todo, PC 는 PC 의 것",
+		m.boardPath(wdNb) === BJ && m.boardPath(wdNb, "board.html") === "/home/jovyan/.pi/agent/todo/board.html" && m.boardPath({ remote: false, cwd: "." }) === m.boardFile(), m.boardPath(wdNb));
+	const meta = { project: brW.project, cwd: brW.cwd, remote: true, request: "시험" };
+	let b = await m.editBoardHere((x) => void m.addTask(x, m.mergeTodo(null, m.parseTodo("- [~] 가\n- [ ] 나"), 1000, { ...meta, source: "todo" }), 1000), 1000, wdNb);
+	const saved = JSON.parse(nbFiles.get(BJ));
+	check("노트북 작업판 쓰기: board.json·board.data.js·board.html 을 명령 한 번으로 (임시 파일 뒤 os.replace)",
+		saved.tasks.length === 1 && saved.tasks[0].remote === true && nbFiles.get("/home/jovyan/.pi/agent/todo/board.data.js")?.includes("__piBoard") && nbFiles.get("/home/jovyan/.pi/agent/todo/board.html")?.includes("board.data.js")
+		&& runs.filter((r) => r.startsWith("python3 -c")).length === 1 && runs[0].includes("os.replace"), [saved, runs.map((r) => r.slice(0, 40))]);
+	// 그 사이에 다른 키트가 작업을 더함 -> 다음 고치기는 다시 읽어서 그것을 지우지 않음
+	saved.tasks.push({ ...saved.tasks[0], id: "other", no: 2 });
+	saved.next = 3;
+	nbFiles.set(BJ, JSON.stringify(saved));
+	b = await m.editBoardHere((x) => void (x.tasks[0].state = "paused"), 2000, wdNb);
+	const again = JSON.parse(nbFiles.get(BJ));
+	check("노트북 작업판 고치기: 고칠 때마다 다시 읽음 (다른 키트가 더한 작업이 남음)", b.tasks.length === 2 && again.tasks.length === 2 && again.tasks[0].state === "paused" && again.tasks[1].id === "other", again.tasks.map((t) => [t.no, t.state]));
+	nbFiles.set(BJ, "{깨진");
+	b = await m.editBoardHere(() => {}, 3000, wdNb);
+	check("깨진 노트북 작업판은 옆에 두고(board.json.bad-…) 새로 시작", nbFiles.get(`${BJ}.bad-3000`) === "{깨진" && b.tasks.length === 0, [...nbFiles.keys()]);
+	mock.runHere = async () => ({ code: 1, out: "탭이 끊김" });
+	let err = "";
+	try {
+		await m.editBoardHere((x) => void (x.next = 9), 4000, wdNb);
+	} catch (e) {
+		err = e.message;
+	}
+	check("노트북 작업판을 쓰지 못하면 오류 (PC 작업판으로 몰래 바꾸지 않음)", err.includes("노트북 작업판을 쓰지 못했습니다") && err.includes("탭이 끊김"), err);
+	const dst = { v: 2, next: 2, updated: 0, tasks: [{ id: "d1", no: 1, remote: true }] };
+	const src = { v: 2, next: 4, updated: 0, tasks: [{ id: "p1", no: 1, remote: true }, { id: "p2", no: 2, remote: false }, { id: "p3", no: 3, remote: true }] };
+	const moved = m.importRemoteTasks(dst, src);
+	check("PC 작업판에서는 노트북 작업만 옮김: 번호가 겹치면 새 번호, 두 번 옮기지 않음",
+		JSON.stringify(moved) === '["p1","p3"]' && dst.tasks.map((t) => t.no).join() === "1,2,3" && dst.next === 4 && m.importRemoteTasks(dst, src).length === 0 && dst.imported.includes("pc-remote-v1"), dst);
+	const old = { v: 2, next: 2, updated: 0, tasks: [{ id: "a", no: 1, remote: false, project: "work/proj" }] };
+	check("노트북 작업판의 예전 API 키트 작업(remote=false)은 노트북 작업으로 (한 번)", m.notebookTasks(old) && old.tasks[0].remote && old.tasks[0].project === "노트북 work/proj" && !m.notebookTasks(old), old);
+	// 가짜 pi: jupyter 모드로 바꾸면 todo 가 노트북 작업판에 쓰고, /todo open 은 노트북 경로를 알림
+	mock.runHere = async (cmd) => {
+		const a = qargs(cmd);
+		if (cmd.startsWith("python3 -c")) for (const [p, s] of Object.entries(JSON.parse(Buffer.from(a.at(-1), "base64").toString("utf8")))) nbFiles.set(p, s);
+		return { code: 0, out: "" };
+	};
+	nbFiles.clear();
+	globalThis.__piWorkDir = wdNb;
+	await cmds.mode.handler("auto", ctx);
+	await on.input[0]({ text: "노트북에서 할 일", source: "interactive" }, ctx);
+	res = await tools.todo.execute("nb1", { text: "- [~] 노트북 가\n- [ ] 노트북 나" }, undefined, undefined, ctx);
+	const nbB = JSON.parse(nbFiles.get(BJ) || "{}");
+	const nt = (nbB.tasks || []).find((t) => t.items?.[0]?.text === "노트북 가");
+	check("jupyter 모드의 todo: 노트북 작업판에 노트북 작업으로 (PC 작업판의 노트북 작업 옮기기 표시도)",
+		!!nt && nt.remote === true && nt.cwd === "/home/jovyan/work/proj" && nt.project === "노트북 work/proj" && (nbB.imported || []).includes("pc-remote-v1") && !board().tasks.some((t) => t.items?.[0]?.text === "노트북 가"), [res, nbB.tasks?.map((t) => [t.no, t.project])]);
+	notes.length = 0;
+	await cmds.todo.handler("open", ctx);
+	check("jupyter 모드 /todo open: 노트북 경로와 code-server 의 API 키트에서 보라는 안내", notes.at(-1)?.includes("/home/jovyan/.pi/agent/todo/board.html") && notes.at(-1).includes("code-server"), notes);
+	globalThis.__piWorkDir = { remote: false, cwd: TW };
+	delete globalThis.__piRelayMock;
+	// 노트북에서 도는 쓰기 명령을 진짜 Python 으로 (Windows 의 python3 는 스토어 껍데기일 수 있어 PI_TEST_PYTHON 로 줌)
+	const { spawnSync } = await import("node:child_process");
+	const PY = [process.env.PI_TEST_PYTHON, "python3"].find((p) => p && spawnSync(p, ["-c", "print(41+1)"], { encoding: "utf8" }).stdout?.trim() === "42");
+	if (!PY) console.log("SKIP 노트북 작업판 쓰기 명령 (python3 없음: PI_TEST_PYTHON=<python> 로 줌)");
+	else {
+		const nbHome = mkdtempSync(join(tmpdir(), "modes-nb-")).replace(/\\/g, "/");
+		const wdR = { remote: true, cwd: `${nbHome}/work/p`, home: nbHome };
+		globalThis.__piRelayMock = {
+			readTarget: async (t) => (ex(t.abs) ? Buffer.from(rd(t.abs)) : null),
+			runHere: async (cmd) => {
+				const a = qargs(cmd);
+				const r = spawnSync(PY, ["-c", a[0], ...a.slice(1)], { encoding: "utf8" });
+				return { code: r.status, out: (r.stdout || "") + (r.stderr || "") };
+			},
+		};
+		await m.editBoardHere((x) => void m.addTask(x, m.mergeTodo(null, m.parseTodo("- [~] 진짜"), 5000, { ...meta, source: "todo" }), 5000), 5000, wdR);
+		const td = `${nbHome}/.pi/agent/todo`;
+		const real = ex(`${td}/board.json`) && JSON.parse(rd(`${td}/board.json`, "utf8"));
+		check("노트북 작업판 쓰기 명령 (진짜 Python): 폴더를 만들고 세 파일을 씀, 임시 파일은 남지 않음",
+			real?.tasks?.[0]?.items?.[0]?.text === "진짜" && rd(`${td}/board.data.js`, "utf8").includes("진짜") && ex(`${td}/board.html`) && !rdir(td).some((f) => f.endsWith(".pi-tmp")), rdir(td));
+		delete globalThis.__piRelayMock;
+		rmSync(nbHome, { recursive: true, force: true });
+	}
+}
 rmSync(AGENT0, { recursive: true, force: true });
 
 console.log(fails ? `\n실패 ${fails}개` : "\n모두 통과");

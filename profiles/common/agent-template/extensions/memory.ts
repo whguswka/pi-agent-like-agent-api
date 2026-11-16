@@ -42,6 +42,7 @@ import {
 	type WorkDir,
 	workDir,
 	writeTarget,
+	notebookTarget,
 } from "./lib/relay.ts";
 
 const HEAD = "## 기억할 것";
@@ -80,6 +81,17 @@ const label = (t: Target) => (t.remote ? `노트북 ${t.abs}` : tildePath(t.abs)
 const cut = (s: string, n = 60) => (s.length > n ? s.slice(0, n) + "…" : s);
 const one = (s: string) => s.replace(/\s+/g, " ").trim();
 const agentDirOf = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+/** 기억할 곳: jupyter 모드면 프로젝트와 공통 지침 모두 노트북, /local·PC 면 둘 다 PC */
+export function memoryPlaces(wd: WorkDir = workDir()): [string, Target][] {
+	const project = target("AGENTS.md", wd);
+	const global = wd.remote
+		? notebookTarget(".pi/agent/AGENTS.md", wd)
+		: target(join(agentDirOf(), "AGENTS.md"), { remote: false, cwd: process.cwd() });
+	return [
+		[`이 프로젝트만: ${label(project)}`, project],
+		[`모든 프로젝트: ${label(global)}`, global],
+	];
+}
 
 // ── 작업 기록 ─────────────────────────────────────────────────
 
@@ -570,15 +582,7 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	/** 기억할 곳: 이 프로젝트(작업 폴더의 AGENTS.md, jupyter 모드면 노트북의 것), 모든 프로젝트(~/.pi/agent/AGENTS.md) */
-	const places = (): [string, Target][] => {
-		const project = target("AGENTS.md", workDir());
-		const global = target(join(agentDirOf(), "AGENTS.md"), { remote: false, cwd: process.cwd() });
-		return [
-			[`이 프로젝트만: ${label(project)}`, project],
-			[`모든 프로젝트: ${label(global)}`, global],
-		];
-	};
+	const places = () => memoryPlaces();
 	/** 지침 파일의 "## 기억할 것" 에 한 줄 더하고, 지금 대화에는 다음 요청과 함께 알림 */
 	async function saveMemory(ctx: any, item: string, t: Target) {
 		try {

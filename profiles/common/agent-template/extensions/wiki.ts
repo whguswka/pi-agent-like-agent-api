@@ -5,7 +5,7 @@
  * Copilot·사내AI 중계 서버는 도구 한 번이 대화 한 번이라 느리고 도구 결과가 6000자로 잘리므로
  *  - 목록·기록 고치기와 기계적 점검(깨진 링크, 고아 페이지, 반영 안 된 원본)은 이 확장의 코드가 하고
  *  - 모델은 짧은 검색 결과(wiki_search)와 여러 페이지를 한 번에 읽고 쓰는 도구(wiki_read, wiki_write)를 쓴다.
- * 위키는 PC 폴더 (jupyter 모드에서도 PC). 링크는 Obsidian 형식 [[페이지 제목]]. 고치기 전 페이지는 .history/ 에 남긴다.
+ * 위키는 실행 위치의 폴더 (jupyter 모드면 노트북). 링크는 Obsidian 형식 [[페이지 제목]]. 고치기 전 페이지는 .history/ 에 남긴다.
  * 있는 페이지는 덧붙이기·고치기(찾아 바꾸기)로 고친다. 읽은 부분만으로 통째로 다시 쓰면 나머지가 지워지므로, 원래 내용이 많이 빠지는 다시 쓰기는 거절한다.
  * wiki_write 마다 무엇을 썼고 무엇을 배웠는지(작업 방식) 대화창에 '[위키]' 항목으로 남긴다 (모델에게는 가지 않음).
  *
@@ -17,13 +17,13 @@
  */
 
 import { createHash } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, statSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, unlinkSync, writeFileSync, appendFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { decodeText, ENC_LABEL, rawInput, readText, secretish, type TextEnc, userAsk } from "./lib/relay.ts";
+import { decodeText, ENC_LABEL, notebookHome, notebookMode, rawInput, readTarget, readText, runHere, secretish, shq, type TextEnc, userAsk, type WorkDir, workDir, writeTarget } from "./lib/relay.ts";
 
 export { decodeText, ENC_LABEL, readText, type TextEnc };
 
@@ -84,6 +84,101 @@ export function readConfig(file = configFile()): Config {
 export function writeConfig(c: Config, file = configFile()) {
 	mkdirSync(dirname(file), { recursive: true });
 	writeFileSync(file, `${JSON.stringify(c, null, 2)}\n`);
+}
+
+/** 현재 실행 위치의 위키 설정. 브리지 jupyter만 비동기 원격 파일이고 API 키트는 노트북에서 로컬 파일이다. */
+export const configPath = (wd: WorkDir = workDir()) => wd.remote ? `${notebookHome(wd)}/.pi/agent/wiki.json` : configFile();
+export const defaultDirHere = (name: string, wd: WorkDir = workDir()) => notebookMode(wd) ? posix.join(notebookHome(wd), "pi-wiki", name) : defaultDir(name);
+export function wikiDirHere(arg: string, wd: WorkDir = workDir()): string {
+	if (!notebookMode(wd)) return wikiDir(arg, wd.cwd);
+	let s = arg.trim().replace(/^["']|["']$/g, "");
+	if (!s) return "";
+	if (s === "~" || s.startsWith("~/")) s = notebookHome(wd) + s.slice(1);
+	return posix.normalize(s.startsWith("/") ? s : posix.join(wd.cwd, s));
+}
+export async function readConfigHere(wd: WorkDir = workDir()): Promise<Config> {
+	if (!wd.remote) return readConfig();
+	try {
+		const raw = await readTarget({ abs: configPath(wd), remote: true });
+		if (!raw) return { wikis: {}, active: "", auto: "write" };
+		const v = JSON.parse(raw.toString("utf8").replace(/^﻿/, ""));
+		const auto: Auto = ["write", "ask", "search", "off"].includes(v.auto) ? v.auto : "write";
+		const wikis = v.wikis && typeof v.wikis === "object" && !Array.isArray(v.wikis) ? v.wikis : {};
+		const lessons: LessonMode | undefined = ["auto", "propose", "off"].includes(v.lessons) ? v.lessons : undefined;
+		return { wikis, active: typeof v.active === "string" ? v.active : "", auto, ...(lessons ? { lessons } : {}) };
+	} catch { return { wikis: {}, active: "", auto: "write" }; }
+}
+export async function writeConfigHere(c: Config, wd: WorkDir = workDir()) {
+	if (!wd.remote) return writeConfig(c);
+	await writeTarget({ abs: configPath(wd), remote: true }, Buffer.from(`${JSON.stringify(c, null, 2)}\n`));
+}
+
+type Runner = (command: string, wd: WorkDir, ms?: number) => Promise<{ code: number | null; out: string }>;
+type Mirror = { root: string; flush: () => Promise<void>; close: () => void };
+const tree = (root: string) => {
+	const out = new Map<string, Buffer>();
+	const walk = (dir: string, rel = "") => {
+		for (const n of readdirSync(dir, { withFileTypes: true })) {
+			const r = rel ? `${rel}/${n.name}` : n.name;
+			if (n.isDirectory()) walk(join(dir, n.name), r);
+			else if (n.isFile()) out.set(r, Buffer.from(readFileSync(join(dir, n.name))));
+		}
+	};
+	if (existsSync(root)) walk(root);
+	return out;
+};
+/** 거울에 내용 없이 이름만 두는 파일 (최대 크기). 고치기 전 기록(.history)·바이너리 원본·큰 파일은 위키 코드가 이름만 본다 */
+export const MIRROR_FILE_MAX = 2 * 1024 * 1024;
+/** 원격 위키를 명령 한 번으로 임시 거울에 읽는다. 검색·목록은 이 거울에서 왕복 없이 처리한다.
+ *  .history/·raw/assets/·바이너리(이름으로)·MIRROR_FILE_MAX 넘는 파일은 빈 파일로만 두고(이름만), 되돌려 쓰지도 지우지도 않는다.
+ *  only 를 주면 remoteRoot 아래 그 이름들(파일·폴더)만 (예: ~/.pi/agent 의 AGENTS.md 와 lessons) */
+export async function mirrorWiki(remoteRoot: string, wd: WorkDir = workDir(), runner: Runner = runHere, only: string[] = []): Promise<Mirror> {
+	if (!wd.remote) return { root: remoteRoot, flush: async () => {}, close: () => {} };
+	const dump = "import base64,json,os,re,sys; r=sys.argv[1]; b=re.compile(sys.argv[2],re.I); mx=int(sys.argv[3]); only=json.loads(sys.argv[4]); o={}; s=[]\n" +
+		"tops=[os.path.join(r,x) for x in only] if only else [r]\n" +
+		"for top in tops:\n" +
+		" ws=[(os.path.dirname(top),[],[os.path.basename(top)])] if os.path.isfile(top) else os.walk(top)\n" +
+		" for d,_,fs in ws:\n" +
+		"  for f in fs:\n" +
+		"   p=os.path.join(d,f); rel=os.path.relpath(p,r).replace(os.sep,'/')\n" +
+		"   if rel.startswith('.history/') or rel.startswith('raw/assets/') or b.search(rel) or os.path.getsize(p)>mx: s.append(rel)\n" +
+		"   else: o[rel]=base64.b64encode(open(p,'rb').read()).decode()\n" +
+		"print(json.dumps({'files':o,'skip':s},separators=(',',':')))";
+	const got = await runner(`python3 -c ${shq(dump)} ${shq(remoteRoot)} ${shq(BINARY.source)} ${MIRROR_FILE_MAX} ${shq(JSON.stringify(only))}`, wd, 60000);
+	if (got.code !== 0) throw new Error(`노트북 위키를 읽지 못했습니다: ${got.out.slice(-300)}`);
+	let obj: { files: Record<string, string>; skip: string[] };
+	try {
+		const x = JSON.parse(got.out.trim() || "{}");
+		obj = { files: x.files || {}, skip: Array.isArray(x.skip) ? x.skip : [] };
+	} catch { throw new Error("노트북 위키 목록을 읽지 못했습니다"); }
+	const tmp = mkdtempSync(join(tmpdir(), "pi-wiki-"));
+	const put0 = (rel: string, data: Buffer) => {
+		const p = join(tmp, rel);
+		mkdirSync(dirname(p), { recursive: true });
+		writeFileSync(p, data);
+	};
+	for (const [rel, data] of Object.entries(obj.files)) put0(rel, Buffer.from(data, "base64"));
+	const skip = new Set(obj.skip);
+	for (const rel of skip) put0(rel, Buffer.alloc(0));
+	const before = tree(tmp);
+	return {
+		root: tmp,
+		flush: async () => {
+			const after = tree(tmp);
+			const put: Record<string, string> = {};
+			const del: string[] = [];
+			for (const [rel, data] of after) if (!skip.has(rel) && !before.get(rel)?.equals(data)) put[rel] = data.toString("base64");
+			for (const rel of before.keys()) if (!skip.has(rel) && !after.has(rel)) del.push(rel);
+			if (!Object.keys(put).length && !del.length) return;
+			const payload = Buffer.from(JSON.stringify({ put, del })).toString("base64");
+			const sync = "import base64,json,os,sys; r=sys.argv[1]; x=json.loads(base64.b64decode(sys.argv[2])); " + (only.length ? "" : "os.makedirs(os.path.join(r,'raw','assets'),exist_ok=True); ") +
+				"[(os.makedirs(os.path.dirname(os.path.join(r,p)),exist_ok=True),open(os.path.join(r,p)+'.pi-tmp','wb').write(base64.b64decode(v)),os.replace(os.path.join(r,p)+'.pi-tmp',os.path.join(r,p))) for p,v in x['put'].items()]; " +
+				"[(os.unlink(os.path.join(r,p)) if os.path.isfile(os.path.join(r,p)) else None) for p in x['del']]";
+			const sent = await runner(`python3 -c ${shq(sync)} ${shq(remoteRoot)} ${shq(payload)}`, wd, 60000);
+			if (sent.code !== 0) throw new Error(`노트북 위키를 쓰지 못했습니다: ${sent.out.slice(-300)}`);
+		},
+		close: () => rmSync(tmp, { recursive: true, force: true }),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,6 +1512,36 @@ export default function (pi: ExtensionAPI) {
 	let lastPrompt = ""; // 사용자가 입력한 그대로 (/wiki save 의 질문. 다른 확장이 앞에 붙인 글은 빼고)
 	let lastAnswer = "";
 	let shown = false;
+	let uiCtx: any = null;
+	let state: { cfg: Config; name: string; root: string } = { cfg: { wikis: {}, active: "", auto: "write" }, name: "", root: "" };
+	const refresh = async () => {
+		const cfg = await readConfigHere();
+		const root0 = cfg.active ? cfg.wikis[cfg.active] : "";
+		const root = workDir().remote ? root0 : root0 && existsSync(root0) ? root0 : "";
+		return (state = { cfg, name: cfg.active, root });
+	};
+	const inWiki = async <T>(root: string, write: boolean, fn: (localRoot: string) => T | Promise<T>): Promise<T> => {
+		const m = await mirrorWiki(root);
+		try {
+			const out = await fn(m.root);
+			if (write) await m.flush();
+			return out;
+		} finally { m.close(); }
+	};
+	/** 작업 방식(내 지침의 '작업 방식', lessons/): jupyter 모드면 노트북 ~/.pi/agent 의 것 (공통 지침을 노트북의 API 키트와 함께 씀) */
+	const inLessons = async <T>(fn: (file: string, dir: string) => T): Promise<{ out: T; file: string; dir: string; label: (p: string) => string }> => {
+		const wd = workDir();
+		if (!wd.remote) return { out: fn(agentsFile(), lessonsDir()), file: agentsFile(), dir: lessonsDir(), label: tilde };
+		const base = `${notebookHome(wd)}/.pi/agent`;
+		const m = await mirrorWiki(base, wd, runHere, ["AGENTS.md", "lessons"]);
+		try {
+			const out = fn(join(m.root, "AGENTS.md"), join(m.root, "lessons"));
+			await m.flush();
+			return { out, file: `${base}/AGENTS.md`, dir: `${base}/lessons`, label: (p: string) => `노트북 ${p}` };
+		} finally {
+			m.close();
+		}
+	};
 	/** 이번 세션에서 wiki_read 로 끝까지 읽은 페이지 (위키 폴더마다. 통째로 다시 쓰기 검사) */
 	const seenBy = new Map<string, Set<string>>();
 	const seenOf = (root: string) => {
@@ -1443,12 +1568,15 @@ export default function (pi: ExtensionAPI) {
 	} = null;
 
 	const current = () => {
-		const cfg = readConfig();
-		const root = cfg.active ? cfg.wikis[cfg.active] : "";
-		return { cfg, name: cfg.active, root: root && existsSync(root) ? root : "" };
+		if (!workDir().remote) {
+			const cfg = readConfig();
+			const root = cfg.active ? cfg.wikis[cfg.active] : "";
+			return (state = { cfg, name: cfg.active, root: root && existsSync(root) ? root : "" });
+		}
+		return state;
 	};
-	const need = () => {
-		const c = current();
+	const need = async () => {
+		const c = await refresh();
 		if (!c.root) throw new Error("켜진 위키가 없습니다. 사용자에게 /wiki init 또는 /wiki use <이름> 을 부탁하세요");
 		return c;
 	};
@@ -1466,6 +1594,16 @@ export default function (pi: ExtensionAPI) {
 			const prog = batch ? ` · 반영 ${batch.i + 1}/${batch.items.length}` : "";
 			if (ctx?.hasUI) ctx.ui.setStatus?.("wiki", root ? ctx.ui.theme.fg("accent", `위키: ${name}${prog}`) : undefined);
 		} catch {}
+	};
+	((globalThis as any).__piOnWorkDir ||= {}).wiki = () => {
+		const wd = workDir();
+		if (wd.remote && wd.cwd === "/" && !wd.home) return;
+		void refresh()
+			.then((c) => {
+				applyTools(!!c.root);
+				status(uiCtx);
+			})
+			.catch(() => {});
 	};
 	const show = (ctx: any, text: string | undefined) => {
 		try {
@@ -1506,7 +1644,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** 위키를 쓸 때 함께 받은 작업 방식·제안: auto 면 내 지침의 '작업 방식' 에, propose 면 제안 모음에.
 	 *  lines 는 모델에게 가는 도구 결과, view 는 사람에게 보이는 '[위키]' 항목 (무엇을 배웠는지) */
-	const learn = (cfg: Config, wiki: string, op: string, lessons: string[], proposals: string[]) => {
+	const learn = async (cfg: Config, wiki: string, op: string, lessons: string[], proposals: string[]) => {
 		const out = { lines: [] as string[], view: [] as ViewLine[], level: "info", handled: false };
 		if (!lessons.length && !proposals.length) return out;
 		out.handled = true;
@@ -1522,7 +1660,8 @@ export default function (pi: ExtensionAPI) {
 			return out;
 		}
 		if (mode === "auto" && lessons.length) {
-			const r = saveLessons(lessons);
+			const L = await inLessons((f, d) => saveLessons(lessons, today(), f, d));
+			const r = L.out;
 			if (r.error) {
 				out.lines.push(`작업 방식: ${r.error}`);
 				out.view.push({ t: `작업 방식: ${r.error}`, s: "err" });
@@ -1534,7 +1673,7 @@ export default function (pi: ExtensionAPI) {
 			if (r.rejected.length) out.lines.push(`작업 방식: 이메일·전화번호·비밀로 보이는 ${r.rejected.length}줄은 남기지 않음`);
 			if (r.skipped.length) out.lines.push(`작업 방식: 한 번에 ${LESSON_PER_WRITE}줄까지라 ${r.skipped.length}줄은 남기지 않음`);
 			if (r.added.length || r.bumped.length || r.dropped.length) {
-				out.view.push({ t: `배운 작업 방식 → 내 지침 ${tilde(agentsFile())} 의 '작업 방식' (다음 세션부터 반영):`, s: "head" });
+				out.view.push({ t: `배운 작업 방식 → 내 지침 ${L.label(L.file)} 의 '작업 방식' (다음 세션부터 반영):`, s: "head" });
 				out.view.push(...r.added.map((t): ViewLine => ({ t: `  + ${t}`, s: "ok" })));
 				out.view.push(...r.bumped.map((t): ViewLine => ({ t: `  = ${t} (이미 있어 횟수만 올림)`, s: "dim" })));
 				out.view.push(...r.dropped.map((t): ViewLine => ({ t: `  - ${t} (한도 ${LESSON_MAX_LINES}줄·${LESSON_MAX_CHARS}자라 뺌 → lessons/archive.md)`, s: "warn" })));
@@ -1546,10 +1685,11 @@ export default function (pi: ExtensionAPI) {
 		// 제안: propose 면 작업 방식 줄도 하나씩 제안으로
 		const props = [...(mode === "propose" ? lessons.map((t) => `지침의 작업 방식에 더하기:\n- ${t}`) : []), ...proposals];
 		if (props.length) {
-			const s = saveProposals(props, wiki);
+			const P = await inLessons((_f, d) => saveProposals(props, wiki, new Date(), d));
+			const s = P.out;
 			if (s.saved) {
 				out.lines.push(`제안: ${s.saved}건을 모음 (사용자가 보고 적용)`);
-				out.view.push({ t: `작업 방식 제안 ${s.saved}건을 모음 → ${tilde(join(lessonsDir(), "proposals.md"))} (사람이 보고 적용 · 보기 /wiki lessons):`, s: "head" });
+				out.view.push({ t: `작업 방식 제안 ${s.saved}건을 모음 → ${P.label(`${P.dir}/proposals.md`)} (사람이 보고 적용 · 보기 /wiki lessons):`, s: "head" });
 				for (const p of props.filter((t) => !secretish(t))) {
 					const ls = p.split("\n").map((l) => l.trim().replace(/^[-*•]\s+/, "")).filter(Boolean);
 					const what = ls[0] === "지침의 작업 방식에 더하기:" ? `(내 지침에) ${ls[1] || ""}` : `${ls[0]}${ls.length > 1 ? ` (+${ls.length - 1}줄)` : ""}`;
@@ -1575,10 +1715,16 @@ export default function (pi: ExtensionAPI) {
 		const all = [...m].map(([d, n]) => `${d} ${n}개`);
 		return `${all.slice(0, 5).join(" · ")}${all.length > 5 ? ` 외 ${all.length - 5}곳` : ""}`;
 	};
-	const sendItem = (ctx: any) => {
+	const sendItem = async (ctx: any) => {
 		if (!batch) return;
 		const rel = batch.items[batch.i];
-		const title = sourceTitle(rel, rawFilesOf(batch.root), loadPages(batch.root));
+		let title = "";
+		try {
+			title = await inWiki(batch.root, false, (localRoot) => sourceTitle(rel, rawFilesOf(localRoot), loadPages(localRoot)));
+		} catch {
+			return finish(ctx, "error");
+		}
+		if (!batch) return;
 		batch.prompt = ingestPrompt(batch.name, rel, title, { i: batch.i + 1, n: batch.items.length });
 		batch.sent = true;
 		lastEnd = "";
@@ -1618,11 +1764,11 @@ export default function (pi: ExtensionAPI) {
 		say(ctx, `위키 반영을 멈췄습니다 (${reason[why] || why}): ${b.ok.length}개 반영${missed}.${cont}`, "warning");
 	};
 	/** 요청 하나가 끝난 뒤: 그 원본이 반영됐는지 보고 다음 원본을 보내거나 끝냄 */
-	const step = (ctx: any) => {
+	const step = async (ctx: any) => {
 		const b = batch;
 		if (!b) return;
 		const rel = b.items[b.i];
-		const done = reflectedRaw(rawFilesOf(b.root), loadPages(b.root)).has(rel);
+		const done = await inWiki(b.root, false, (localRoot) => reflectedRaw(rawFilesOf(localRoot), loadPages(localRoot)).has(rel));
 		if (b.stop) {
 			if (done) b.ok.push(rel); // 멈춘 원본이 반영되지 않았으면 남은 것으로 셈
 			return finish(ctx, b.stop);
@@ -1637,7 +1783,7 @@ export default function (pi: ExtensionAPI) {
 		if (b.streak >= 2) return finish(ctx, "miss");
 		b.i++;
 		if (b.i >= b.items.length) return finish(ctx, "done");
-		sendItem(ctx);
+		await sendItem(ctx);
 	};
 
 	pi.registerEntryRenderer?.(ENTRY, (entry: any, _opts: unknown, theme: any) => renderEntry(entry?.data, theme));
@@ -1651,9 +1797,11 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "최대 개수 (기본 8)" })),
 		}),
 		async execute(_id: string, params: any) {
-			const { root } = need();
-			const pages = loadPages(root);
-			return result(formatSearch(params.query, search(pages, String(params.query || ""), Number(params.limit) || 8), pages.length));
+			const { root } = await need();
+			return inWiki(root, false, (localRoot) => {
+				const pages = loadPages(localRoot);
+				return result(formatSearch(params.query, search(pages, String(params.query || ""), Number(params.limit) || 8), pages.length));
+			});
 		},
 	});
 
@@ -1669,11 +1817,13 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "몇 줄 (path 하나일 때)" })),
 		}),
 		async execute(_id: string, params: any) {
-			const { root } = need();
+			const { root } = await need();
 			const targets = [...(Array.isArray(params.paths) ? params.paths : []), ...(params.path ? [params.path] : [])].map(String);
 			if (!targets.length) throw new Error("path 또는 paths 를 주세요 (예: index.md)");
 			const one = targets.length === 1;
-			return result(readTargets(root, loadPages(root), targets, one ? Number(params.offset) || 1 : 1, one ? Number(params.limit) || 0 : 0, 5500, seenOf(root)));
+			return inWiki(root, false, (localRoot) =>
+				result(readTargets(localRoot, loadPages(localRoot), targets, one ? Number(params.offset) || 1 : 1, one ? Number(params.limit) || 0 : 0, 5500, seenOf(root))),
+			);
 		},
 	});
 
@@ -1696,14 +1846,14 @@ export default function (pi: ExtensionAPI) {
 			title: Type.Optional(Type.String({ description: "기록에 남길 제목" })),
 		}),
 		async execute(_id: string, params: any, _signal?: unknown, _onUpdate?: unknown, ctx?: any) {
-			const { root, name, cfg } = need();
+			const { root, name, cfg } = await need();
 			const op = String(params.op || "note");
 			const sp = splitLessons(String(params.text || ""));
 			const extra = sp.lessons.length + sp.proposals.length > 0;
 			const pagesGiven = splitBundle(sp.pages).length > 0;
 			const r: WriteResult =
 				pagesGiven || !extra
-					? await locked(() => applyWrite(root, name, sp.pages, op, String(params.title || ""), today(), seenOf(root)))
+					? await locked(() => inWiki(root, true, (localRoot) => applyWrite(localRoot, name, sp.pages, op, String(params.title || ""), today(), seenOf(root))))
 					: { written: [], names: [], kinds: [], errors: [], warnings: [] };
 			const learned = await locked(() => learn(cfg, name, op, sp.lessons, sp.proposals));
 			const lines = [
@@ -1727,35 +1877,39 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("wiki", {
 		description: "LLM 위키: /wiki (상태), init [이름] [폴더], use <이름>, off, ingest <raw/ 파일·폴더>, ask <질문>, save [제목], lint, reindex, lessons [on|propose|off|undo] (배운 작업 방식)",
 		handler: async (args: string, ctx: any) => {
+			if (ctx) uiCtx = ctx;
 			const [sub = "", ...rest] = (args || "").trim().split(/\s+/);
 			const arg = rest.join(" ").trim();
-			const cfg = readConfig();
+			const cfg = await readConfigHere();
 			const notify = (m: string, level = "info") => ctx.ui.notify(m, level);
 			// 폴더째 반영 중에 켜진 위키를 바꾸면 남은 원본이 다른 위키에 쓰이므로 막음
 			if (batch && (sub === "init" || sub === "use" || sub === "off"))
 				return notify(`폴더째 반영 중입니다 (${batch.i + 1}/${batch.items.length}). 끝난 뒤에 하거나 Esc 로 멈춘 뒤 다시 입력해 주세요`, "warning");
 			if (sub === "init") {
 				const name = rest[0] || "모델운영";
-				const root = wikiDir(rest.slice(1).join(" ")) || cfg.wikis[name] || defaultDir(name);
-				const made = await locked(() => initWiki(root, name));
+				const root = wikiDirHere(rest.slice(1).join(" ")) || cfg.wikis[name] || defaultDirHere(name);
+				const made = await locked(() => inWiki(root, true, (localRoot) => initWiki(localRoot, name)));
 				cfg.wikis[name] = slash(root);
 				cfg.active = name;
-				writeConfig(cfg);
+				await writeConfigHere(cfg);
+				await refresh();
 				applyTools(true);
 				status(ctx);
-				return notify(`위키 '${name}' 를 켰습니다: ${slash(root)}${made.length ? ` (만듦: ${made.join(", ")})` : ""}. Obsidian 같은 마크다운 편집기로 이 폴더를 열어 보면 됩니다 (Obsidian 은 보관소(vault)로 열기)`);
+				return notify(`위키 '${name}' 를 켰습니다: ${slash(root)}${made.length ? ` (만듦: ${made.join(", ")})` : ""}. ${workDir().remote ? "노트북 폴더입니다: code-server 탐색기에서 열어 보거나 폴더째 받아 마크다운 편집기로 봅니다" : "Obsidian 같은 마크다운 편집기로 이 폴더를 열어 보면 됩니다 (Obsidian 은 보관소(vault)로 열기)"}`);
 			}
 			if (sub === "use") {
 				if (!cfg.wikis[arg]) return notify(`등록되지 않은 위키입니다: ${arg || "(이름 없음)"}. 있는 위키: ${Object.keys(cfg.wikis).join(", ") || "없음"}`, "warning");
 				cfg.active = arg;
-				writeConfig(cfg);
+				await writeConfigHere(cfg);
+				await refresh();
 				applyTools(true);
 				status(ctx);
 				return notify(`위키 '${arg}' 를 켰습니다: ${cfg.wikis[arg]}`);
 			}
 			if (sub === "off") {
 				cfg.active = "";
-				writeConfig(cfg);
+				await writeConfigHere(cfg);
+				await refresh();
 				applyTools(false);
 				status(ctx);
 				return notify("위키를 껐습니다 (위키 도구도 모델에게 보이지 않음). 다시 켜기: /wiki use <이름>");
@@ -1766,51 +1920,64 @@ export default function (pi: ExtensionAPI) {
 				if (want) {
 					const before = lessonMode(cfg);
 					cfg.lessons = want;
-					writeConfig(cfg);
+					await writeConfigHere(cfg);
+					const c = await refresh();
 					if (before === want) return notify(`작업 방식 배우기: 이미 ${lessonLabel(want)}`);
 					// 위키가 켜져 있으면 지침 줄이 바뀌므로 Copilot·사내AI 는 다음 요청이 새 대화로 감
-					const fresh = current().root && isBridge() ? " (지침이 바뀌어 Copilot·사내AI 는 새 대화로 시작)" : "";
+					const fresh = c.root && isBridge() ? " (지침이 바뀌어 Copilot·사내AI 는 새 대화로 시작)" : "";
 					return notify(`작업 방식 배우기: ${lessonLabel(want)}. 다음 요청부터 반영합니다${fresh}`);
 				}
 				if (arg === "undo") {
-					if (!ctx.hasUI) return notify(undoLessons().message);
+					if (!ctx.hasUI) return notify((await inLessons((f, d) => undoLessons(f, d))).out.message);
 					if (!(await ctx.ui.confirm("작업 방식 되돌리기", "내 지침(AGENTS.md)을 마지막 자동 고침 전으로 되돌릴까요?"))) return;
-					const u = undoLessons();
+					const u = (await inLessons((f, d) => undoLessons(f, d))).out;
 					return notify(u.message, u.ok ? "info" : "warning");
 				}
 				if (arg) return notify("사용법: /wiki lessons (보기) · on (켜기) · propose (제안만) · off (끄기) · undo (마지막 자동 고침 되돌리기)", "warning");
-				const lines = readLessons();
-				const n = proposalCount();
+				const V = await inLessons((f, d) => ({ lines: readLessons(f), n: proposalCount(d) }));
+				const { lines, n } = V.out;
 				return show(
 					ctx,
 					[
 						`── 배운 작업 방식: ${lessonLabel(lessonMode(cfg))} (바꾸기 /wiki lessons on·propose·off · 닫기: /wiki) ──`,
-						` 지침  ${slash(agentsFile())} 의 '작업 방식' ${lines.length}줄`,
+						` 지침  ${V.label(slash(V.file))} 의 '작업 방식' ${lines.length}줄`,
 						...(lines.length ? lines.map((l) => `   ${l}`) : ["   (아직 없음: 위키를 쓸 때 pi 가 남깁니다)"]),
-						` 제안  ${n}건${n ? ` · ${slash(join(lessonsDir(), "proposals.md"))} (적용은 pi 에게 부탁)` : ""}`,
-						` 되돌리기 /wiki lessons undo (마지막 자동 고침) · 뺀 줄 ${slash(join(lessonsDir(), "archive.md"))}`,
+						` 제안  ${n}건${n ? ` · ${V.label(slash(`${V.dir}/proposals.md`))} (적용은 pi 에게 부탁)` : ""}`,
+						` 되돌리기 /wiki lessons undo (마지막 자동 고침) · 뺀 줄 ${V.label(slash(`${V.dir}/archive.md`))}`,
 					].join("\n"),
 				);
 			}
-			const c = current();
+			const c = await refresh();
 			if (!c.root) return notify(`켜진 위키가 없습니다. /wiki init [이름] [폴더] 로 만들거나 /wiki use <이름> (있는 위키: ${Object.keys(cfg.wikis).join(", ") || "없음"})`, "warning");
 			if (sub === "ingest") {
 				if (!arg) return notify("/wiki ingest <raw/ 안의 파일·폴더> (예: /wiki ingest 회의록.md, /wiki ingest 회의록). raw/ 전체는 /wiki ingest raw", "warning");
 				if (batch) return notify(`폴더째 반영 중입니다 (${batch.i + 1}/${batch.items.length}). 멈추려면 Esc`, "warning");
 				if ((globalThis as any).__piMode === "plan") return notify("계획 모드에서는 위키에 쓰지 못합니다 (wiki_write 가 막힘). /plan 으로 끈 뒤 다시 입력해 주세요", "warning");
-				const t = rawTarget(c.root, arg);
+				const info = await inWiki(c.root, false, (localRoot) => {
+					const t = rawTarget(localRoot, arg);
+					if (t.many || !t.rel) return { t, kind: "text" as const, chars: 0, title: "", plan: null as IngestPlan | null };
+					const pages = loadPages(localRoot);
+					if (!t.dir) {
+						const kind = rawKind(localRoot, t.rel);
+						let chars = 0;
+						if (kind !== "binary") {
+							try {
+								chars = readText(join(localRoot, t.rel)).length;
+							} catch {}
+						}
+						return { t, kind, chars, title: sourceTitle(t.rel, rawFilesOf(localRoot), pages), plan: null };
+					}
+					return { t, kind: "text" as const, chars: 0, title: "", plan: planIngest(localRoot, t.rel, pages) };
+				});
+				const { t } = info;
 				if (t.many)
 					return notify(`'${arg}' 에 맞는 원본이 여러 개입니다. 경로를 적어 주세요: ${t.many.slice(0, 6).map((r) => r.slice(4)).join(", ")}${t.many.length > 6 ? ` 외 ${t.many.length - 6}개` : ""}`, "warning");
 				if (!t.rel) return notify(`raw/ 에서 찾지 못했습니다: ${arg}. 원본은 위키의 raw/ 폴더(${slash(c.root)}/raw)에 넣고, raw/ 안의 경로나 이름을 적으세요`, "warning");
-				const pages = loadPages(c.root);
 				if (!t.dir) {
-					if (rawKind(c.root, t.rel) === "binary") return notify(`${t.rel} 은 글(텍스트)이 아니라 반영하지 못합니다. 문서는 텍스트(.md·.txt)로 바꿔 raw/ 에 넣으세요`, "warning");
+					if (info.kind === "binary") return notify(`${t.rel} 은 글(텍스트)이 아니라 반영하지 못합니다. 문서는 텍스트(.md·.txt)로 바꿔 raw/ 에 넣으세요`, "warning");
 					// Copilot·사내AI 는 wiki_read 한 번에 5500자라 큰 원본은 읽는 데만 여러 번 오감 (사내AI 는 하루 질문 수에 들어감): 미리 묻기
 					if (ctx.hasUI && isBridge()) {
-						let chars = 0;
-						try {
-							chars = readText(join(c.root, t.rel)).length;
-						} catch {}
+						const chars = info.chars;
 						const reads = Math.ceil(chars / 5500);
 						if (chars > BIG_INGEST_CHARS) {
 							const ok = await ctx.ui.confirm(
@@ -1820,12 +1987,12 @@ export default function (pi: ExtensionAPI) {
 							if (!ok) return notify("위키 반영을 하지 않았습니다", "info");
 						}
 					}
-					return send(ctx, ingestPrompt(c.name, t.rel, sourceTitle(t.rel, rawFilesOf(c.root), pages)));
+					return send(ctx, ingestPrompt(c.name, t.rel, info.title));
 				}
 				// 폴더째: 원본 하나를 요청 하나로 차례로 (한 요청에 몰면 대화가 길어지고, 끊기면 어디까지 했는지 알기 어려움)
 				if (!ctx.hasUI) return notify("폴더째 반영은 pi 화면에서 합니다 (물어볼 수 없는 실행 방식)", "warning");
 				if (!ctx.isIdle()) return notify("지금 하는 작업이 끝난 뒤 다시 입력해 주세요", "warning");
-				const plan = planIngest(c.root, t.rel, pages);
+				const plan = info.plan!;
 				const where = t.rel === "raw" ? "raw/ 전체" : `${t.rel.slice(4)} 폴더`;
 				const skipped = [
 					plan.done.length ? `이미 반영함 ${plan.done.length}개` : "",
@@ -1839,7 +2006,7 @@ export default function (pi: ExtensionAPI) {
 				if (isBridge()) lines.push("Copilot·사내AI 는 원본 하나에 4~12번 오갑니다. 사용량 제한이 있는 계정이면 내 설정 파일의 max_questions_per_minute 를 2 정도로 두세요.");
 				if (!(await ctx.ui.confirm(`${where}의 원본 ${plan.items.length}개를 위키에 반영할까요?`, lines.join("\n")))) return notify("위키 반영을 하지 않았습니다", "info");
 				batch = { name: c.name, root: c.root, dir: t.rel, items: plan.items, i: 0, ok: [], missed: [], streak: 0, stop: "", later: plan.later.length, prompt: "", sent: false };
-				return sendItem(ctx);
+				return await sendItem(ctx);
 			}
 			if (sub === "ask") {
 				if (!arg) return notify("/wiki ask <질문>", "warning");
@@ -1854,26 +2021,29 @@ export default function (pi: ExtensionAPI) {
 				const body = `---\ntitle: ${t}\nsummary: ${summary.replace(/^[-#>*\s]+/, "")}\ntype: answer\nsources: []\n---\n# ${t}\n\n**질문:** ${lastPrompt.trim()}\n\n${lastAnswer.trim()}\n`;
 				// 같은 제목의 답 페이지가 있으면 사용자가 고른 덮어쓰기라 '끝까지 읽지 않음' 검사는 하지 않음 (많이 빠지면 막는 것은 그대로)
 				const rel = `pages/answer/${t}.md`;
-				const r = await locked(() => applyWrite(c.root, c.name, `=== ${rel}\n${body}`, "query", t, today(), new Set([rel])));
+				const r = await locked(() => inWiki(c.root, true, (localRoot) => applyWrite(localRoot, c.name, `=== ${rel}\n${body}`, "query", t, today(), new Set([rel]))));
 				return r.written.length ? notify(`저장했습니다: [[${r.names[0]}]] (${r.written[0]})`) : notify(r.errors.join("\n"), "error");
 			}
 			if (sub === "lint") {
-				const text = formatLint(lint(c.root, c.name));
+				const text = await inWiki(c.root, false, (localRoot) => formatLint(lint(localRoot, c.name)));
 				show(ctx, text);
 				return notify(text.split("\n")[0]);
 			}
 			if (sub === "reindex") {
-				const changed = await locked(() => reindex(c.root, c.name));
+				const changed = await locked(() => inWiki(c.root, true, (localRoot) => reindex(localRoot, c.name)));
 				return notify(changed ? "목록(index.md)을 다시 만들었습니다" : "목록(index.md)이 이미 페이지와 같습니다");
 			}
 			// 상태
 			if (shown) return show(ctx, undefined);
-			const pages = loadPages(c.root);
-			const r = lint(c.root, c.name, pages);
-			let recent: string[] = [];
-			try {
-				recent = readFileSync(join(c.root, "log.md"), "utf8").split(/\r?\n/).filter((l) => l.startsWith("## [")).slice(-3);
-			} catch {}
+			const { pages, r, recent } = await inWiki(c.root, false, (localRoot) => {
+				const pages = loadPages(localRoot);
+				const r = lint(localRoot, c.name, pages);
+				let recent: string[] = [];
+				try {
+					recent = readFileSync(join(localRoot, "log.md"), "utf8").split(/\r?\n/).filter((l) => l.startsWith("## [")).slice(-3);
+				} catch {}
+				return { pages, r, recent };
+			});
 			show(
 				ctx,
 				[
@@ -1889,9 +2059,11 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event: unknown, ctx: any) => {
+		uiCtx = ctx;
 		batch = null; // 새 세션에서는 폴더째 반영을 이어 가지 않음 (같은 명령으로 남은 것부터)
 		seenBy.clear();
-		applyTools(!!current().root);
+		const c = await refresh();
+		applyTools(!!c.root);
 		status(ctx);
 	});
 	// 세션이 끝나면(/new·/resume·/reload·끝내기) 폴더째 반영도 끝: 그 세션의 ctx 로 다음 원본을 보내지 않게
@@ -1926,20 +2098,25 @@ export default function (pi: ExtensionAPI) {
 		lastEnd = "";
 		// 다른 확장의 '끝남' 처리가 늦어지지 않게 따로. 타이머 안의 오류는 pi 를 멈추게 하므로 내보내지 않음
 		setTimeout(() => {
-			try {
-				step(ctx);
-			} catch {
+			step(ctx).catch(() => {
 				batch = null;
-			}
+			});
 		}, 0);
 	});
 
 	pi.on("before_agent_start", async (event: any) => {
-		const { cfg, name, root } = current();
+		const { cfg, name, root } = await refresh();
+		applyTools(!!root);
 		if (!root) return;
 		const g = event.systemPromptOptions?.promptGuidelines;
 		if (!Array.isArray(g)) return;
-		for (const line of guideLines(name, root, cfg.auto, readTopic(wikiMd(root), name), lessonMode(cfg))) if (!g.includes(line)) g.push(line);
+		let md = "";
+		if (workDir().remote) {
+			try {
+				md = (await readTarget({ abs: `${root}/WIKI.md`, remote: true }))?.toString("utf8") || "";
+			} catch {}
+		} else md = wikiMd(root);
+		for (const line of guideLines(name, root, cfg.auto, readTopic(md, name), lessonMode(cfg))) if (!g.includes(line)) g.push(line);
 	});
 
 	pi.on("message_end", async (event: any) => {

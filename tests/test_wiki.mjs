@@ -520,6 +520,96 @@ lr = w.lint(big, "큰위키", bp);
 const tLint = Date.now() - t0;
 check(`500쪽: 읽기+검색 ${tSearch}ms, 점검 ${tLint}ms (각 2초 안)`, bp.length === 501 && hits.length === 8 && tSearch < 2000 && tLint < 2000);
 
+// ── jupyter 모드: 위키·설정·작업 방식이 노트북에 (2026-11-16 사용자: 노트북의 API 키트와 함께 써야 연동) ──
+{
+	const nbW = { remote: true, cwd: "/home/jovyan/work/p", home: "/home/jovyan" };
+	check("jupyter 모드 위키 폴더: 기본은 노트북 ~/pi-wiki/<이름>, ~ 는 노트북 홈, 상대 경로는 노트북 작업 폴더",
+		w.defaultDirHere("모델운영", nbW) === "/home/jovyan/pi-wiki/모델운영" && w.wikiDirHere("~/w1", nbW) === "/home/jovyan/w1" && w.wikiDirHere("docs/w", nbW) === "/home/jovyan/work/p/docs/w"
+		&& w.configPath(nbW) === "/home/jovyan/.pi/agent/wiki.json" && w.configPath({ remote: false, cwd: "." }) === w.configFile(), [w.defaultDirHere("모델운영", nbW), w.wikiDirHere("docs/w", nbW)]);
+	const files = new Map();
+	globalThis.__piRelayMock = {
+		readTarget: async (t) => (files.has(t.abs) ? Buffer.from(files.get(t.abs)) : null),
+		writeTarget: async (t, d) => void files.set(t.abs, d.toString("utf8")),
+	};
+	await w.writeConfigHere({ wikis: { 운영: "/home/jovyan/pi-wiki/운영" }, active: "운영", auto: "ask" }, nbW);
+	const cfgNb = await w.readConfigHere(nbW);
+	check("jupyter 모드 위키 설정: 노트북 ~/.pi/agent/wiki.json 에 쓰고 읽음", cfgNb.active === "운영" && cfgNb.auto === "ask" && JSON.parse(files.get("/home/jovyan/.pi/agent/wiki.json")).wikis.운영 === "/home/jovyan/pi-wiki/운영", [cfgNb, [...files.keys()]]);
+	delete globalThis.__piRelayMock;
+	// 노트북 명령을 진짜 Python 으로 (노트북에서 도는 그대로). Windows 의 python3 는 스토어 껍데기일 수 있어 PI_TEST_PYTHON 로 줌
+	const { spawnSync } = await import("node:child_process");
+	const PY = [process.env.PI_TEST_PYTHON, "python3"].find((p) => p && spawnSync(p, ["-c", "print(41+1)"], { encoding: "utf8" }).stdout?.trim() === "42");
+	const words = (cmd) => {
+		const out = [];
+		let i = 0;
+		while (i < cmd.length) {
+			while (cmd[i] === " ") i++;
+			if (i >= cmd.length) break;
+			let x = "";
+			while (i < cmd.length && cmd[i] !== " ") {
+				if (cmd[i] === "'") {
+					const j = cmd.indexOf("'", i + 1);
+					x += cmd.slice(i + 1, j);
+					i = j + 1;
+				} else if (cmd[i] === "\\") {
+					x += cmd[i + 1];
+					i += 2;
+				} else x += cmd[i++];
+			}
+			out.push(x);
+		}
+		return out;
+	};
+	const ran = [];
+	const realRun = async (cmd) => {
+		ran.push(cmd);
+		const a = words(cmd);
+		const r = spawnSync(PY, a.slice(1), { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+		return { code: r.status, out: (r.stdout || "") + (r.stderr || "") };
+	};
+	if (!PY) console.log("SKIP 노트북 위키 거울 (python3 없음: PI_TEST_PYTHON=<python> 로 줌)");
+	else {
+		const nb = mkdtempSync(join(tmpdir(), "wiki-nb-")).replace(/\\/g, "/");
+		const rw = `${nb}/pi-wiki/운영`;
+		const put = (rel, data) => (mkdirSync(dirname(join(rw, rel)), { recursive: true }), writeFileSync(join(rw, rel), data));
+		put("pages/a.md", "# 가\n원래\n");
+		put("pages/c.md", "# 다\n");
+		put("raw/note.md", "원본 글\n");
+		put("raw/doc.pdf", Buffer.from([0x25, 0x50, 0x44, 0x46, 0, 1, 2]));
+		put(".history/2026-11-16/pages/a.md", "# 가\n예전\n");
+		put("raw/big.txt", "x".repeat(w.MIRROR_FILE_MAX + 10));
+		const wd = { remote: true, cwd: nb, home: nb };
+		const mi = await w.mirrorWiki(rw, wd, realRun);
+		const L = (rel) => readFileSync(join(mi.root, rel), "utf8");
+		check("노트북 위키 거울: 명령 한 번으로 읽음, 글은 내용째, .history·바이너리·큰 파일은 이름만 (빈 파일)",
+			ran.length === 1 && L("pages/a.md") === "# 가\n원래\n" && L("raw/note.md") === "원본 글\n" && L("raw/doc.pdf") === "" && L(".history/2026-11-16/pages/a.md") === "" && L("raw/big.txt") === ""
+			&& w.rawKind(mi.root, "raw/doc.pdf") === "binary" && w.rawFilesOf(mi.root).includes("raw/big.txt"), ran.map((c) => c.slice(0, 60)));
+		writeFileSync(join(mi.root, "pages/a.md"), "# 가\n새 글\n");
+		writeFileSync(join(mi.root, "pages/b.md"), "# 나\n");
+		rmSync(join(mi.root, "pages/c.md"));
+		await mi.flush();
+		mi.close();
+		const R = (rel) => readFileSync(join(rw, rel), "utf8");
+		check("노트북 위키 거울 되돌려 쓰기: 바뀐·새 파일만 쓰고 지운 것은 지움, 이름만 받은 파일은 그대로 (내용 지켜짐), 임시 거울은 지움",
+			ran.length === 2 && R("pages/a.md") === "# 가\n새 글\n" && R("pages/b.md") === "# 나\n" && !existsSync(join(rw, "pages/c.md"))
+			&& readFileSync(join(rw, "raw/doc.pdf")).length === 7 && R(".history/2026-11-16/pages/a.md") === "# 가\n예전\n" && R("raw/big.txt").length === w.MIRROR_FILE_MAX + 10 && !existsSync(mi.root),
+			readdirSync(join(rw, "pages")));
+		// 작업 방식(내 지침): 노트북 ~/.pi/agent 에서 AGENTS.md 와 lessons/ 만 (세션 기록 등은 받지 않음)
+		const ad = `${nb}/.pi/agent`;
+		mkdirSync(`${ad}/sessions`, { recursive: true });
+		mkdirSync(`${ad}/lessons`, { recursive: true });
+		writeFileSync(`${ad}/AGENTS.md`, "# 내 지침\n");
+		writeFileSync(`${ad}/sessions/s.jsonl`, "{}\n");
+		const ma = await w.mirrorWiki(ad, wd, realRun, ["AGENTS.md", "lessons"]);
+		const got = existsSync(join(ma.root, "AGENTS.md")) && !existsSync(join(ma.root, "sessions"));
+		const sv = w.saveLessons(["시험은 pytest -q 로"], "2026-11-16", join(ma.root, "AGENTS.md"), join(ma.root, "lessons"));
+		await ma.flush();
+		ma.close();
+		check("작업 방식 거울(only): AGENTS.md·lessons/ 만 받고, 배운 줄은 노트북 내 지침에 (raw/assets 폴더를 만들지 않음)",
+			got && sv.added.length === 1 && readFileSync(`${ad}/AGENTS.md`, "utf8").includes("시험은 pytest -q 로") && !existsSync(`${ad}/raw`), [got, sv, readdirSync(ad)]);
+		rmSync(nb, { recursive: true, force: true });
+	}
+}
+
 rmSync(tmp, { recursive: true, force: true });
 console.log(fails ? `RESULT: FAIL (${fails})` : "RESULT: PASS");
 process.exit(fails ? 1 : 0);

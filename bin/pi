@@ -11,7 +11,7 @@ NODE="$(pi_find_node)" || {
   exit 1
 }
 [ -n "$PI_DEBUG" ] && echo "[pi] node: $NODE ($("$NODE" -v))" >&2
-export PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1
+export PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_API_KIT=1
 # pi 확장(kit.ts: /kit, /doctor)이 버전 번호·문서·진단 도구를 찾을 pi 폴더
 export PI_KIT_HOME="$PI_HOME"
 CLI="$PI_HOME/runtime/dist/bundle/cli.js"

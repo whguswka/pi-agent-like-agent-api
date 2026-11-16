@@ -37,7 +37,7 @@ import { delimiter, join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPlanDoc, projectRel } from "./lib/paths.ts";
-import { readTarget, runHere, SESSION, shown, target, transformInput, userAsk, workDir } from "./lib/relay.ts";
+import { notebookHome, notebookMode, readTarget, runHere, SESSION, shq, shown, target, transformInput, userAsk, workDir, type WorkDir } from "./lib/relay.ts";
 import { base, parseShell, strip } from "./lib/shell.ts";
 
 export type Mode = "plan" | "ask" | "auto";
@@ -1146,6 +1146,14 @@ export function todoKey(cwd: string, remote: boolean): string {
 			.slice(0, 60) || "home";
 	return `${remote ? "nb-" : ""}${name}-${createHash("sha256").update(id).digest("hex").slice(0, 8)}`;
 }
+/** 지금 작업 위치와 프로젝트 표시 (브리지 jupyter 와 API 키트는 같은 노트북 폴더면 둘 다 remote=true, "노트북 …") */
+export function todoWhere(w: WorkDir = workDir()) {
+	const raw = String(w.cwd || process.cwd());
+	const notebook = notebookMode(w);
+	const cwd = notebook ? raw.replace(/\\/g, "/").replace(/\/+$/, "") || "/" : raw;
+	const name = raw.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean).slice(-2).join("/") || cwd;
+	return { cwd, remote: notebook, key: todoKey(cwd, notebook), project: `${notebook ? "노트북 " : ""}${name}` };
+}
 const safeJson = (x: unknown) => JSON.stringify(x).replace(/</g, "\\u003c");
 
 // ── 작업판 (2026-11-04 사용자: 할 일 목록이 작업 하나에만 쓰여, 급한 일로 바꾸고 나면 하던 일을 잊음) ──
@@ -1176,6 +1184,9 @@ export function keepsTask(t: Task, lines: { text: string }[]): boolean {
 export type Board = { v: 2; next: number; updated: number; tasks: Task[]; imported?: string[] };
 export const BOARD_KEEP = 200; // 끝난(완료·폐기) 작업은 최근 것만 남김
 export const boardFile = (name = "board.json") => join(todoDir(), name);
+/** 현재 실행 위치의 작업판. 브리지 jupyter는 노트북 홈, API 키트와 PC는 그 실행 환경의 agentDir. */
+export const boardPath = (wd: WorkDir = workDir(), name = "board.json") =>
+	wd.remote ? `${notebookHome(wd)}/.pi/agent/todo/${name}` : boardFile(name);
 export const emptyBoard = (): Board => ({ v: 2, next: 1, updated: 0, tasks: [] });
 const isBoard = (b: any): b is Board => !!b && b.v === 2 && Array.isArray(b.tasks) && typeof b.next === "number";
 export const isOpen = (t: Task) => t.state === "doing" || t.state === "paused";
@@ -1259,12 +1270,112 @@ export function editBoard(fn: (b: Board) => boolean | void, now = Date.now()): B
 	saveBoard(b, now);
 	return b;
 }
+const remoteBoards = new Map<string, Board>();
+const activeBoard = () => workDir().remote ? remoteBoards.get(boardPath()) || emptyBoard() : loadBoard();
+/** 원격 작업판 읽기. 바꿀 때는 editBoardHere가 반드시 다시 읽는다. */
+export async function loadBoardHere(wd: WorkDir = workDir()): Promise<Board> {
+	if (!wd.remote) return loadBoard();
+	const f = boardPath(wd);
+	try {
+		const raw = await readTarget({ abs: f, remote: true });
+		const b = raw ? JSON.parse(raw.toString("utf8")) : emptyBoard();
+		if (!isBoard(b)) throw new Error("작업판 모양이 아님");
+		remoteBoards.set(f, b);
+		return b;
+	} catch (e) {
+		if (e instanceof SyntaxError || (e as Error).message === "작업판 모양이 아님") return emptyBoard();
+		throw e;
+	}
+}
+/** 원격 파일 셋을 명령 한 번으로 임시 파일+rename. 탭이 끊기면 PC 작업판으로 바꾸지 않고 오류를 올린다. */
+export async function saveBoardHere(b: Board, now = Date.now(), wd: WorkDir = workDir()): Promise<string> {
+	if (!wd.remote) return saveBoard(b, now);
+	pruneBoard(b);
+	b.updated = now;
+	const files: Record<string, string> = {
+		[boardPath(wd)]: `${JSON.stringify(b, null, 1)}\n`,
+		[boardPath(wd, "board.data.js")]: boardDataJs(b),
+		[boardPath(wd, "board.html")]: boardHtml(b, "board.data.js"),
+	};
+	const payload = Buffer.from(JSON.stringify(files), "utf8").toString("base64");
+	const py = "import base64,json,os,sys; fs=json.loads(base64.b64decode(sys.argv[1])); " +
+		"[(os.makedirs(os.path.dirname(p),exist_ok=True),open(p+'.pi-tmp','w',encoding='utf-8').write(s),os.replace(p+'.pi-tmp',p)) for p,s in fs.items()]";
+	const r = await runHere(`python3 -c ${shq(py)} ${shq(payload)}`, wd, 30000);
+	if (r.code !== 0) throw new Error(`노트북 작업판을 쓰지 못했습니다: ${r.out.slice(-300)}`);
+	remoteBoards.set(boardPath(wd), b);
+	return boardPath(wd, "board.html");
+}
+export async function editBoardHere(fn: (b: Board) => boolean | void | Promise<boolean | void>, now = Date.now(), wd: WorkDir = workDir()): Promise<Board> {
+	if (!wd.remote) {
+		let out = emptyBoard();
+		editBoard((b) => { out = b; return false; }, now); // 고치기 직전의 파일을 새로 읽음
+		if (await fn(out) !== false) saveBoard(out, now);
+		return out;
+	}
+	let b = emptyBoard();
+	const raw = await readTarget({ abs: boardPath(wd), remote: true }); // 고칠 때마다 새로 읽음
+	if (raw) {
+		try {
+			const x = JSON.parse(raw.toString("utf8"));
+			if (!isBoard(x)) throw new Error("작업판 모양이 아님");
+			b = x;
+		} catch {
+			const r = await runHere(`mv -- ${shq(boardPath(wd))} ${shq(`${boardPath(wd)}.bad-${now}`)}`, wd, 10000);
+			if (r.code !== 0) throw new Error(`깨진 노트북 작업판을 보관하지 못했습니다: ${r.out.slice(-200)}`);
+			b = emptyBoard();
+		}
+	}
+	if (await fn(b) !== false) await saveBoardHere(b, now, wd);
+	else remoteBoards.set(boardPath(wd), b);
+	return b;
+}
+/** 노트북 작업판의 작업은 모두 노트북 작업: 예전 API 키트가 remote=false 로 남긴 작업을 브리지 jupyter 작업과 같게 (바뀌었으면 true) */
+export function notebookTasks(b: Board): boolean {
+	let changed = false;
+	for (const t of b.tasks) {
+		if (t.remote) continue;
+		t.remote = true;
+		if (!String(t.project || "").startsWith("노트북 ")) t.project = `노트북 ${t.project || ""}`.trim();
+		changed = true;
+	}
+	return changed;
+}
+/** 예전 PC 작업판의 remote 작업을 노트북 작업판으로 한 번 옮김. 번호가 겹치면 노트북 next 번호를 새로 준다. */
+export function importRemoteTasks(dst: Board, src: Board, marker = "pc-remote-v1"): string[] {
+	if ((dst.imported ||= []).includes(marker)) return [];
+	dst.imported.push(marker);
+	dst.next = Math.max(1, dst.next || 1, ...dst.tasks.map((t) => t.no + 1));
+	const used = new Set(dst.tasks.map((t) => t.no));
+	const moved: string[] = [];
+	for (const old of src.tasks.filter((t) => t.remote)) {
+		const t = structuredClone(old);
+		if (used.has(t.no)) {
+			while (used.has(dst.next)) dst.next++;
+			t.no = dst.next++;
+		} else dst.next = Math.max(dst.next, t.no + 1);
+		used.add(t.no);
+		dst.tasks.push(t);
+		moved.push(old.id);
+	}
+	return moved;
+}
 /** 2026-11-02.1 의 프로젝트별 목록 파일(<key>.json)에서 끝나지 않은 목록을 작업판으로 (프로젝트마다 한 번). 작업판이 바뀌면 true */
 export function importLegacy(b: Board, key: string, now: number): boolean {
 	if ((b.imported ||= []).includes(key)) return false;
 	b.imported.push(key);
 	try {
 		const s = JSON.parse(readFileSync(join(todoDir(), `${key}.json`), "utf8"));
+		if (s?.v === 1 && Array.isArray(s.items) && s.items.length && !todoSummary(s).all) addTask(b, s, now);
+	} catch {}
+	return true;
+}
+export async function importLegacyHere(b: Board, key: string, now: number, wd: WorkDir = workDir()): Promise<boolean> {
+	if (!wd.remote) return importLegacy(b, key, now);
+	if ((b.imported ||= []).includes(key)) return false;
+	b.imported.push(key);
+	try {
+		const raw = await readTarget({ abs: `${notebookHome(wd)}/.pi/agent/todo/${key}.json`, remote: true });
+		const s = raw && JSON.parse(raw.toString("utf8"));
 		if (s?.v === 1 && Array.isArray(s.items) && s.items.length && !todoSummary(s).all) addTask(b, s, now);
 	} catch {}
 	return true;
@@ -1616,7 +1727,7 @@ export default function (pi: ExtensionAPI) {
 	};
 	/** 지금 작업 (다른 pi 가 쉬게 하거나 폐기·완료 처리했으면 없음. 모든 단계가 끝난 작업은 다음 요청 때까지 그대로) */
 	const cur = (): Task | null => {
-		const t = curId ? loadBoard().tasks.find((x) => x.id === curId) : undefined;
+		const t = curId ? activeBoard().tasks.find((x) => x.id === curId) : undefined;
 		return t && (t.state === "doing" || (t.state === "done" && !t.manual)) ? t : null;
 	};
 	// 한 글로 넘김: pi 화면은 목록의 항목을 10개까지만 보여 주고 나머지는 "... (widget truncated)" 로 자름 (줄바꿈은 그대로 보임)
@@ -1625,27 +1736,77 @@ export default function (pi: ExtensionAPI) {
 		const t = cur();
 		ctx.ui.setWidget("pi-kit-plan", t?.items.length ? [todoWidget(t)] : undefined);
 	};
-	const todoWhere = () => {
-		const w = workDir();
-		const cwd = String(w.cwd || process.cwd());
-		const name = cwd.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean).slice(-2).join("/") || cwd;
-		return { cwd, remote: !!w.remote, key: todoKey(cwd, !!w.remote), project: `${w.remote ? "노트북 " : ""}${name}` };
-	};
 	const here = (t: Task | null) => {
 		const w = todoWhere();
 		return !!t && t.cwd === w.cwd && t.remote === w.remote;
 	};
-	const todoFile = () => boardFile("board.html");
+	const todoFile = () => boardPath(workDir(), "board.html");
 	/** 작업판을 고치고 입력창 위 목록을 다시 그림 (쓰지 못하면 한 번 알림) */
-	const edit = (ctx: any, fn: (b: Board) => boolean | void) => {
+	const edit = async (ctx: any, fn: (b: Board) => boolean | void | Promise<boolean | void>) => {
 		try {
-			editBoard(fn);
+			await editBoardHere(fn);
 			saveWarned = false;
 		} catch (e) {
 			if (!saveWarned) ctx?.ui?.notify?.(`작업판 파일을 쓰지 못했습니다: ${(e as Error).message}`, "warning");
 			saveWarned = true;
 		}
 		showSteps(ctx);
+	};
+	let lastWhereKey = "";
+	let lastCtx: any = null;
+	/** 작업판을 지금 실행 위치(jupyter 모드면 노트북, 아니면 PC)에 맞추고, 처음 쓰는 노트북 작업판이면 예전 PC 의 remote 작업과 프로젝트별 목록을 한 번 옮김 */
+	const syncBoard = async (ctx: any = lastCtx, reload = false): Promise<boolean> => {
+		if (ctx) lastCtx = ctx;
+		const wd = workDir();
+		const w = todoWhere(wd);
+		const switched = lastWhereKey !== w.key;
+		if (wd.remote && (reload || switched || !remoteBoards.has(boardPath(wd)))) {
+			try {
+				await loadBoardHere(wd);
+				saveWarned = false;
+			} catch (e) {
+				if (!saveWarned) ctx?.ui?.notify?.(`작업판 파일을 읽지 못했습니다: ${(e as Error).message}`, "warning");
+				saveWarned = true;
+				return false;
+			}
+		}
+		// 옮기기·맞추기는 세션 시작과 위치를 바꿀 때만 (요청마다 하면 작업판이 새로 만들어진 뒤 그 요청 안에서 예전 목록을 다시 가져옴)
+		const nb = notebookMode(wd);
+		const needRemote = switched && wd.remote && !(activeBoard().imported || []).includes("pc-remote-v1");
+		const needLegacy = switched && !(activeBoard().imported || []).includes(w.key);
+		const needNb = switched && nb && activeBoard().tasks.some((t) => !t.remote);
+		if (needRemote || needLegacy || needNb) {
+			const pc = needRemote ? loadBoard() : null;
+			let moved: string[] = [];
+			await edit(ctx, async (b) => {
+				let changed = false;
+				if (pc && !(b.imported || []).includes("pc-remote-v1")) {
+					moved = importRemoteTasks(b, pc);
+					changed = true;
+				}
+				if (needLegacy && (await importLegacyHere(b, w.key, Date.now(), wd))) changed = true;
+				if (nb && notebookTasks(b)) changed = true;
+				return changed;
+			});
+			if (moved.length) editBoard((b) => void (b.tasks = b.tasks.filter((t) => !moved.includes(t.id))));
+		}
+		if (switched || !cur() || !here(cur())) {
+			const t = activeBoard()
+				.tasks.filter((x) => x.state === "doing" && here(x) && !todoSummary(x).all)
+				.sort((a, b) => b.updated - a.updated)[0];
+			// 세션 중에 다른 pi(같은 노트북의 다른 키트)가 바꾼 작업을 지금 작업으로 잡을 때는 시작 시각을 0 으로:
+			//  지금 요청이 그 작업을 연 요청이 아니므로 새 요청의 규칙(keepsTask)으로 같은 작업인지 가린다
+			const since = switched ? Date.now() : t && t.id === curId ? curSince : 0;
+			[curId, curSince] = [t?.id ?? null, since];
+		}
+		lastWhereKey = w.key;
+		if (switched) showSteps(ctx);
+		return true;
+	};
+	((globalThis as any).__piOnWorkDir ||= {}).modes = () => {
+		const wd = workDir();
+		if (wd.remote && wd.cwd === "/" && !wd.home) return;
+		void syncBoard(lastCtx, true);
 	};
 	/** 작업판을 연다. 여는 방법이 없으면 null, 있으면 { kind: 여는 방법, done: 열린 뒤 결과(ok) }를 줌.
 	 *  브라우저 창(explorer·open·xdg-open)은 전처럼 바로 ok=true (띄운 뒤의 오류는 막지 않음).
@@ -1683,33 +1844,33 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 	/** 새 작업을 지금 작업으로 (하던 작업은 쉬는 중으로 작업판에 남음). 쉬게 한 작업을 돌려준다 */
-	const newTask = (ctx: any, s: TodoState): Task | null => {
+	const newTask = async (ctx: any, s: TodoState): Promise<Task | null> => {
 		const now = Date.now();
 		let paused: Task | null = null;
-		edit(ctx, (b) => {
+		await edit(ctx, (b) => {
 			const old = curId ? b.tasks.find((t) => t.id === curId) : undefined;
 			if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped, paused] = ["paused", null, old];
 			[curId, curSince] = [addTask(b, s, now).id, now];
 		});
 		// 내 설정 "todo_open": true 면 새 작업이 생길 때 (세션에 한 번) 작업판을 연다 (화면이 있으면 브라우저 창, code-server 터미널에서는 편집기 탭).
 		//  저절로 열 때는 알림 없음: 창·탭이 저절로 열리는 것이 이미 표시이고, 실패해도 전처럼 창이 안 열리는 뿐이므로 조용히 넘긴다 (필요하면 언제든 /todo open)
-		if (ctx?.hasUI && !autoOpened && userConfig().todo_open === true) {
+		if (!workDir().remote && ctx?.hasUI && !autoOpened && userConfig().todo_open === true) {
 			const opened = openTodo(todoFile()); // 저절로 열 때는 결과가 어떻게 끝나든 알림을 내지 않는다 (Promise 결과는 버림)
 			if (opened) autoOpened = true; // 여는 방법이 있었으면 한 번 연 셈 (성패와 무관하게 세션에 한 번만 시도)
 		}
 		return paused;
 	};
 	/** 지금 작업의 목록을 바꿈 (작업판에서 없어졌으면 새 작업으로) */
-	const updateTask = (ctx: any, s: TodoState, alias: string[] = []) => {
+	const updateTask = async (ctx: any, s: TodoState, alias: string[] = []) => {
 		let found = false;
-		edit(ctx, (b) => {
+		await edit(ctx, (b) => {
 			const t = curId ? b.tasks.find((x) => x.id === curId) : undefined;
 			if (!t) return false;
 			found = true;
 			putTask(t, s, Date.now());
 			if (alias.length) [t.alias, t.lastTop] = [[...new Set([...(t.alias || []), ...alias.map(textKey)])].slice(-60), alias.map(textKey)];
 		});
-		if (!found) newTask(ctx, s);
+		if (!found) await newTask(ctx, s);
 	};
 	// /plan·/mode 는 목록을 닫지 않음: 진행하던 계획을 계획 모드에서 다듬으면 그 목록에 이어 붙임 (replanTodo). 끝난 목록은 다음 요청 때 닫힘.
 	//  2026-11-04 전에는 승인한 계획의 목록을 닫아서, 다듬은 계획을 승인하면 끝난 단계까지 처음부터 다시 셈
@@ -1726,15 +1887,9 @@ export default function (pi: ExtensionAPI) {
 			else setMode(ctx, mode);
 		} else setMode(ctx, mode);
 		showPlanAuto(ctx);
-		// 2026-11-02.1 의 프로젝트별 목록 파일은 한 번 작업판으로 옮김. 이 프로젝트에서 하던 작업은 이어서 (pi 를 다시 켜거나 /new·/reload)
-		const w = todoWhere();
-		if (!(loadBoard().imported || []).includes(w.key)) edit(ctx, (b) => importLegacy(b, w.key, Date.now()));
-		if (!cur() || !here(cur())) {
-			const t = loadBoard()
-				.tasks.filter((x) => x.state === "doing" && here(x) && !todoSummary(x).all)
-				.sort((a, b) => b.updated - a.updated)[0];
-			[curId, curSince] = [t?.id ?? null, Date.now()];
-		}
+		// 2026-11-02.1 의 프로젝트별 목록 파일과 예전 PC 작업판의 remote 작업은 한 번 작업판으로 옮김. 이 프로젝트에서 하던 작업은 이어서 (pi 를 다시 켜거나 /new·/reload)
+		lastWhereKey = "";
+		await syncBoard(ctx, true);
 		// /plan --new 로 넘긴 계획 (앞 세션의 확장이 globalThis 에 둠): 새 세션을 열면 pi 가 확장을 새로 불러오므로 모드·작업판은 여기(새 확장)에서 정하고,
 		//  보낼 글은 withSession 이 새 세션으로 보냄 (2026-11-05 실제 pi: 앞 확장에서 정한 자동 모드가 새 확장에 가지 않아 진행 요청이 계획 모드로 감)
 		const g = globalThis as any;
@@ -1742,8 +1897,8 @@ export default function (pi: ExtensionAPI) {
 		if (hand && (_event as any)?.reason === "new" && Date.now() - hand.t < 120_000) {
 			g.__piPlanFresh = null;
 			setMode(ctx, "auto");
-			if (hand.refine) updateTask(ctx, hand.task);
-			else newTask(ctx, hand.task);
+			if (hand.refine) await updateTask(ctx, hand.task);
+			else await newTask(ctx, hand.task);
 			const done = (cur()?.items || []).filter((it) => it.level === 0).flatMap((it, i) => (it.status === "done" ? [i + 1] : []));
 			[planDoc, planReq] = ["", ""];
 			await toExecuteModel(ctx);
@@ -1756,6 +1911,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event: any, ctx: any) => {
 		const text = String(event.text || "");
 		if (text.startsWith("/")) return;
+		if (lastWhereKey !== todoWhere().key) await syncBoard(ctx);
 		if (event.source !== "extension" && text.trim()) {
 			[lastReq, lastInputAt] = [cut(text.trim().split("\n")[0], 100), Date.now()];
 			[workSince, listTouched, bounced, gateTries, gateOff] = [0, false, false, 0, false];
@@ -1768,7 +1924,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		// /planauto: 진행 중인 작업이 없는데 새 요청을 침 -> 대기 계획이 있으면 묻고, 없으면 계획부터. 답을 기다리는 중에 줄 세운 글은 그대로 보냄
 		if (planAuto && event.source !== "extension" && text.trim() && mode !== "plan" && ctx.hasUI && !review && !(globalThis as any).__piReview && ctx.isIdle?.() !== false && !openTodoOf()) {
-			const waiting = waitingPlans(loadBoard().tasks, here);
+			const waiting = waitingPlans(activeBoard().tasks, here);
 			if (waiting.length) {
 				const p = await planAutoPick(ctx, planAutoMenu("request", null, waiting, text));
 				if (!p) {
@@ -1905,7 +2061,7 @@ export default function (pi: ExtensionAPI) {
 		lastEnd = lastMsg?.role === "assistant" ? String(lastMsg.stopReason || "") : "unfinished";
 		const t = cur();
 		if (!t?.items.length || !isOpen(t) || todoSummary(t).all || review) return;
-		edit(ctx, (b) => {
+		await edit(ctx, (b) => {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
 			x.stopped = Date.now();
@@ -1925,9 +2081,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** 작업을 지금 작업으로 되돌려 이어서 보냄 (하던 작업은 쉬는 중으로). /todo 이어서, /planauto */
-	const resumeTask = (ctx: any, t: Task, extra = "") => {
+	const resumeTask = async (ctx: any, t: Task, extra = "") => {
 		const now = Date.now();
-		edit(ctx, (b) => {
+		await edit(ctx, (b) => {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
 			const old = curId && curId !== x.id ? b.tasks.find((y) => y.id === curId) : undefined;
@@ -1944,8 +2100,8 @@ export default function (pi: ExtensionAPI) {
 		setTimeout(() => pi.sendUserMessage(userAsk(resumeText(back, extra), `(작업 #${back.no} 이어서)`), { deliverAs: "followUp" }), 0);
 	};
 	/** 작업판의 작업을 닫거나 쉬게 함. /todo 완료·폐기, /planauto */
-	const setTaskState = (ctx: any, t: Task, state: "paused" | "done" | "dropped") => {
-		edit(ctx, (b) => {
+	const setTaskState = async (ctx: any, t: Task, state: "paused" | "done" | "dropped") => {
+		await edit(ctx, (b) => {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
 			if (state === "paused") [x.state, x.stopped] = ["paused", null];
@@ -1998,14 +2154,14 @@ export default function (pi: ExtensionAPI) {
 				[planDoc, planReq] = ["", ""];
 				await toExecuteModel(ctx);
 			}
-			return resumeTask(ctx, t, req);
+			return await resumeTask(ctx, t, req);
 		}
 		if (p.act === "pause") {
-			setTaskState(ctx, t, "paused");
+			await setTaskState(ctx, t, "paused");
 			return ctx.ui.notify(`작업 #${t.no} 을(를) 쉬는 중으로 두었습니다 (다시: /todo 이어서 ${t.no}). 다음 요청을 보내면 계획 자동이 묻습니다`, "info");
 		}
 		if (p.act === "done") {
-			setTaskState(ctx, t, "done");
+			await setTaskState(ctx, t, "done");
 			return planAutoAsk(ctx, "finished", t);
 		}
 		if (p.act === "refine") {
@@ -2015,14 +2171,14 @@ export default function (pi: ExtensionAPI) {
 		if (p.act !== "new") return;
 		// 새 계획: 진행하던 계획을 쉬게 함 (그대로 두면 계획 모드의 요청에 그 목록이 붙어 '다듬기' 가 됨)
 		const now = openTodoOf();
-		if (now) setTaskState(ctx, now, "paused");
+		if (now) await setTaskState(ctx, now, "paused");
 		await enterPlan(ctx);
 		[planDoc, planReq] = ["", ""];
 		if (!req) return ctx.ui.notify("계획 모드: 파일을 바꾸지 않고 계획부터 세웁니다. 요청을 적어 보내세요 (/planauto 끄기)", "info");
 		setTimeout(() => pi.sendUserMessage(userAsk(req), { deliverAs: "followUp" }), 0);
 	};
 	const planAutoAsk = async (ctx: any, kind: PlanAutoKind, active: Task | null, req = "") => {
-		const waiting = waitingPlans(loadBoard().tasks, here).filter((t) => t.id !== active?.id);
+		const waiting = waitingPlans(activeBoard().tasks, here).filter((t) => t.id !== active?.id);
 		const p = await planAutoPick(ctx, planAutoMenu(kind, active, waiting, req));
 		if (p) return planAutoDo(ctx, p, req);
 		ctx.ui.notify("그대로 둡니다. 다음 요청을 적어 보내세요 (/planauto 끄기)", "info");
@@ -2032,7 +2188,7 @@ export default function (pi: ExtensionAPI) {
 	const planAutoStart = async (ctx: any, req: string) => {
 		const t = openTodoOf();
 		const active = t?.source === "plan" ? t : null;
-		if (req && !active && !waitingPlans(loadBoard().tasks, here).length) return planAutoDo(ctx, { label: "", act: "new" }, req);
+		if (req && !active && !waitingPlans(activeBoard().tasks, here).length) return planAutoDo(ctx, { label: "", act: "new" }, req);
 		return planAutoAsk(ctx, "start", active, req);
 	};
 	// 요청이 끝나 쉴 때. 완료 점검·목표 확인·목록 맞추기가 끝나고 아무것도 보내지 않았을 때 hooks.ts 가 부름 (함께 보내면 뒤의 것이 '이미 처리 중' 이 됨).
@@ -2054,7 +2210,7 @@ export default function (pi: ExtensionAPI) {
 		const t = cur();
 		if (!t?.items.length || !here(t) || !(listTouched || curSince >= lastInputAt || workSince >= 1)) return;
 		if (todoSummary(t).all) {
-			if (autoDoneId === t.id || (t.source !== "plan" && !waitingPlans(loadBoard().tasks, here).length)) return;
+			if (autoDoneId === t.id || (t.source !== "plan" && !waitingPlans(activeBoard().tasks, here).length)) return;
 			autoDoneId = t.id;
 			return void planAutoAsk(ctx, "finished", t).catch(notify);
 		}
@@ -2062,9 +2218,10 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("agent_start", async (_event: unknown, ctx: any) => {
+		await syncBoard(ctx, true);
 		const t = cur();
 		if (t?.stopped)
-			edit(ctx, (b) => {
+			await edit(ctx, (b) => {
 				const x = b.tasks.find((y) => y.id === t.id);
 				if (!x) return false;
 				x.stopped = null;
@@ -2126,7 +2283,7 @@ export default function (pi: ExtensionAPI) {
 		const marks = [...text.matchAll(/(\d{1,2})\s*단계\s*(?:완료|끝)/g)].map((x) => Number(x[1]));
 		if (!t?.items.length || !isOpen(t) || !marks.length) return;
 		let changed = false;
-		edit(ctx, (b) => {
+		await edit(ctx, (b) => {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
 			const now = Date.now();
@@ -2267,8 +2424,8 @@ export default function (pi: ExtensionAPI) {
 					return ctx.ui.notify("새 대화로 진행: 입력창의 /plan --new 를 Enter 로 보내면 새 세션(새 대화)에서 이 계획만 넘겨 진행합니다 (그만두려면 지우고 다른 요청)", "info");
 				}
 				setMode(ctx, next);
-				if (refine) updateTask(ctx, task);
-				else newTask(ctx, task);
+				if (refine) await updateTask(ctx, task);
+				else await newTask(ctx, task);
 				const done = (cur()?.items || []).filter((it) => it.level === 0).flatMap((it, i) => (it.status === "done" ? [i + 1] : []));
 				[planDoc, planReq] = ["", ""];
 				await toExecuteModel(ctx);
@@ -2406,6 +2563,7 @@ export default function (pi: ExtensionAPI) {
 				autoWaitReq = req;
 				return ctx.ui.notify("지금 요청이 끝나면 어떻게 할지 묻습니다", "info");
 			}
+			await syncBoard(ctx);
 			await planAutoStart(ctx, req);
 		},
 	});
@@ -2428,6 +2586,7 @@ export default function (pi: ExtensionAPI) {
 			const read = readTodo(params?.text);
 			let lines = read.lines;
 			if (!lines.length) return reply(TODO_HELP);
+			await syncBoard(ctx);
 			const w = todoWhere();
 			const t0 = cur();
 			const prev = here(t0) ? t0 : null;
@@ -2455,10 +2614,10 @@ export default function (pi: ExtensionAPI) {
 			let paused: Task | null = null;
 			let mixed = false;
 			const sameTask = !!prev && (sameReq || (next.updates > 1 && keeps));
-			if (sameTask) updateTask(ctx, next, alias);
+			if (sameTask) await updateTask(ctx, next, alias);
 			else {
 				mixed = !!prev && next.updates > 1; // 앞 작업의 단계를 섞어 보냄
-				paused = newTask(ctx, mergeTodo(null, lines, Date.now(), { ...meta, source: "todo" }));
+				paused = await newTask(ctx, mergeTodo(null, lines, Date.now(), { ...meta, source: "todo" }));
 			}
 			listUpdated();
 			const s = todoSummary(cur());
@@ -2477,10 +2636,11 @@ export default function (pi: ExtensionAPI) {
 			const [w0, n0, ...more] = String(args || "").trim().split(/\s+/);
 			const sub = (w0 || "").toLowerCase();
 			const no = Number(String(n0 || "").replace(/^#/, ""));
-			const byNo = () => (Number.isInteger(no) && no > 0 ? loadBoard().tasks.find((t) => t.no === no) : undefined);
+			const byNo = () => (Number.isInteger(no) && no > 0 ? activeBoard().tasks.find((t) => t.no === no) : undefined);
 			const usage = "사용법: /todo (진행 중 작업) · /todo 이어서 N · /todo 완료 N · /todo 폐기 N · /todo open (브라우저로 보기)";
 			if (sub === "open" || sub === "열기") {
-				if (!existsSync(todoFile())) edit(ctx, () => {});
+				if (workDir().remote) return ctx.ui.notify(`jupyter 모드의 작업판은 노트북에 있습니다: ${todoFile()}\ncode-server 의 API 키트에서 /todo open 으로 보세요`, "info");
+				if (!existsSync(todoFile())) await edit(ctx, () => {});
 				const file = todoFile();
 				const opened = openTodo(file);
 				if (!opened) return ctx.ui.notify(`여기서는 브라우저를 열 수 없습니다. 이 파일을 브라우저로 여세요: ${file}`, "warning");
@@ -2490,21 +2650,22 @@ export default function (pi: ExtensionAPI) {
 				if (r.ok) return ctx.ui.notify(`작업판을 브라우저로 엽니다 (창을 열어 두면 3초마다 새로 읽음): ${file}`, "info");
 				return ctx.ui.notify(`여기서는 브라우저를 열 수 없습니다. 이 파일을 브라우저로 여세요: ${file}`, "warning");
 			}
+			if (!(await syncBoard(ctx, true))) return;
 			if (["이어서", "계속", "resume", "완료", "done", "폐기", "drop", "clear", "지우기"].includes(sub)) {
 				// clear·지우기: 지금 작업을 폐기 (2026-11-02.1 의 '목록 지우기')
 				const t = sub === "clear" || sub === "지우기" ? cur() : byNo();
 				if (!t) return ctx.ui.notify(sub === "clear" || sub === "지우기" ? "지금 작업이 없습니다 (/todo 로 진행 중 작업)" : `작업 #${n0 || "?"} 이(가) 작업판에 없습니다. ${usage}`, "warning");
 				if (sub === "이어서" || sub === "계속" || sub === "resume") {
 					if (!here(t)) return ctx.ui.notify(`작업 #${t.no} 은(는) 다른 폴더의 작업입니다 (${t.project}: ${t.cwd}). 그 폴더에서 pi 를 켜고 /todo 이어서 ${t.no}`, "warning");
-					return resumeTask(ctx, t, more.join(" "));
+					return await resumeTask(ctx, t, more.join(" "));
 				}
 				const drop = sub !== "완료" && sub !== "done";
-				setTaskState(ctx, t, drop ? "dropped" : "done");
+				await setTaskState(ctx, t, drop ? "dropped" : "done");
 				return ctx.ui.notify(`작업 #${t.no} 을(를) ${drop ? "폐기했습니다" : "완료로 옮겼습니다"} (작업판 완료 탭에 남음. 되돌리려면 /todo 이어서 ${t.no})`, "info");
 			}
 			if (sub && sub !== "목록" && sub !== "list") return ctx.ui.notify(usage, "warning");
 			showSteps(ctx);
-			const open = loadBoard()
+			const open = activeBoard()
 				.tasks.filter(isOpen)
 				.sort((a, b) => Number(b.id === curId) - Number(a.id === curId) || b.updated - a.updated);
 			const line = (t: Task) => {

@@ -43,8 +43,23 @@ export async function call(path: string, body?: unknown): Promise<any> {
 	return data;
 }
 
+export type RelayOps = {
+	readTarget?: typeof readTarget;
+	readHead?: typeof readHead;
+	writeTarget?: typeof writeTarget;
+	removeTarget?: typeof removeTarget;
+	runHere?: typeof runHere;
+	nbRun?: typeof nbRun;
+};
+const relayMock = (): RelayOps | undefined => (globalThis as any).__piRelayMock;
+/** 시험용: 원격 파일·명령 함수(readTarget, writeTarget, runHere 등)를 가짜 함수로 바꿈 (인자 없이 부르면 원래대로) */
+export function setRelayMock(mock?: RelayOps | null) {
+	(globalThis as any).__piRelayMock = mock || undefined;
+}
+
 /** 노트북에서 명령 실행 (끝날 때까지) */
 export async function nbRun(command: string, cwd: string): Promise<{ code: number | null; out: string }> {
+	if (relayMock()?.nbRun) return relayMock()!.nbRun!(command, cwd);
 	const { id } = await call("/jupyter/exec", { cwd, command, timeout: 600 });
 	const chunks: Buffer[] = [];
 	let offset = 0;
@@ -62,6 +77,15 @@ export async function nbRun(command: string, cwd: string): Promise<{ code: numbe
 export const shq = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
 export type WorkDir = { remote: boolean; cwd: string; home?: string };
 export const workDir = (): WorkDir => (globalThis as any).__piWorkDir || { remote: false, cwd: process.cwd() };
+/** 같은 PVC를 쓰는 노트북 실행인지. 브리지는 remote, API 키트는 실행기가 PI_API_KIT=1 로 밝힌다. */
+export const notebookMode = (wd: WorkDir = workDir()) => !!wd.remote || process.env.PI_API_KIT === "1";
+export const notebookHome = (wd: WorkDir = workDir()) => wd.remote ? wd.home || "/home/jovyan" : homedir().split("\\").join("/");
+/** pi 설정 안에서도 두 키트가 함께 써야 하는 파일. 일반 target()은 jupyter의 설정 경로를 PC로 보내므로 이 용도에는 이 함수를 쓴다. */
+export function notebookTarget(path: string, wd: WorkDir = workDir()): Target {
+	const home = notebookHome(wd);
+	const abs = path === "~" || path.startsWith("~/") ? home + path.slice(1) : posix.resolve(home, path);
+	return { abs, remote: !!wd.remote };
+}
 
 /** pi 의 bash 도구와 같은 셸 (Windows 에서 cmd·PowerShell 로 pi.cmd 를 켜면 PATH 의 bash 가 WSL 의 것일 수 있어 pi 가 고른 것으로) */
 export async function piShell(): Promise<{ shell: string; args: string[]; stdin: boolean }> {
@@ -74,6 +98,7 @@ export async function piShell(): Promise<{ shell: string; args: string[]; stdin:
 }
 /** 지금 실행 위치(jupyter 모드면 노트북, 아니면 PC 의 작업 폴더)에서 셸 명령. 표준 출력과 오류를 합쳐 돌려줌, ms 가 지나면 멈춤 (code null) */
 export async function runHere(command: string, wd: WorkDir = workDir(), ms = 60000): Promise<{ code: number | null; out: string }> {
+	if (relayMock()?.runHere) return relayMock()!.runHere!(command, wd, ms);
 	const sec = Math.max(1, Math.ceil(ms / 1000));
 	if (wd.remote) return nbRun(`timeout ${sec} bash -c ${shq(command)} 2>&1`, wd.cwd || wd.home || "/");
 	const sh = await piShell();
@@ -132,6 +157,7 @@ export function target(path: string, wd: WorkDir = workDir()): Target {
 
 /** 파일 내용 (없으면 null) */
 export async function readTarget(t: Target): Promise<Buffer | null> {
+	if (relayMock()?.readTarget) return relayMock()!.readTarget!(t);
 	if (t.remote) {
 		try {
 			return Buffer.from((await call("/jupyter/fs", { op: "read", path: t.abs })).data || "", "base64");
@@ -150,6 +176,7 @@ export async function readTarget(t: Target): Promise<Buffer | null> {
 
 /** 파일 앞부분(최대 n 바이트)과 전체 크기. 없거나 폴더면 null (큰 파일을 통째로 읽지 않으려고) */
 export async function readHead(t: Target, n: number): Promise<{ data: Buffer; size: number } | null> {
+	if (relayMock()?.readHead) return relayMock()!.readHead!(t, n);
 	if (t.remote) {
 		let st: any;
 		try {
@@ -197,12 +224,14 @@ export async function readHead(t: Target, n: number): Promise<{ data: Buffer; si
 }
 
 export async function writeTarget(t: Target, data: Buffer): Promise<void> {
+	if (relayMock()?.writeTarget) return relayMock()!.writeTarget!(t, data);
 	if (t.remote) return void (await call("/jupyter/fs", { op: "write", path: t.abs, data: data.toString("base64") }));
 	await fsp.mkdir(dirname(t.abs), { recursive: true });
 	await fsp.writeFile(t.abs, data);
 }
 
 export async function removeTarget(t: Target): Promise<void> {
+	if (relayMock()?.removeTarget) return relayMock()!.removeTarget!(t);
 	if (t.remote) {
 		const r = await nbRun(`rm -f -- ${shq(t.abs)}`, workDir().home || "/");
 		if (r.code !== 0) throw new Error(`노트북에서 지우지 못했습니다: ${r.out.slice(-200)}`);

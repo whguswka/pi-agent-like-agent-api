@@ -3,6 +3,11 @@
 버전 번호는 `VERSION` 에 있습니다. 새 버전으로 바꾸면(`update.sh`) 끝에 그 버전의 항목을 보여 줍니다.
 버전마다 바탕이 된 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 의 버전을 함께 적습니다.
 
+## 2026-11-17.1
+원래 키트와 같은 작업판·위키·공통 지침. 바탕: pi-agent-like-agent 2026-11-17.1. 단위 시험과 개발용 노트북(JupyterLab, vLLM)에서 확인했습니다.
+- **원래 키트와 함께 쓰기:** 업무 PC 의 원래 키트(pi-agent-like-agent)가 같은 노트북에 붙어 명령을 실행할 때, 두 키트가 같은 작업판(`~/.pi/agent/todo/`)·위키(`~/pi-wiki/`)·공통 지침(`~/.pi/agent/AGENTS.md`)을 씁니다. 원래 키트로 계획·리뷰하고 이 키트로 개발할 때, 같은 폴더의 작업은 양쪽에서 `/todo 이어서 N` 으로 이어 갑니다.
+  - 작업판의 작업은 '노트북 …' 으로 적습니다. 예전 버전이 남긴 작업도 처음 한 번 맞춥니다. 원래 키트도 2026-11-17.1 이어야 같은 작업으로 봅니다.
+
 ## 2026-11-16.1
 작업판을 code-server 편집기 탭에. 바탕: pi-agent-like-agent 2026-11-16.1. 단위 시험과 code-server 4.121 노트북(Live Preview 0.4.20)에서 확인했습니다. code-server 4.93.1 과 그곳의 Live Preview, 노트북의 실제 pi 에서는 아직 시험하지 못했습니다.
 - **`/todo open` 을 편집기 탭에** ([README 3-5](README.md#3-5-작업-모드-plan-mode)): code-server 터미널에서 `/todo open` 을 치면 작업판(`~/.pi/agent/todo/board.html`)을 그 창의 편집기 탭에 엽니다. 전에는 파일 경로만 알려 주었습니다.

@@ -301,6 +301,15 @@ await emit("session_start", { reason: "new" });
 await turn("연결 전 요청", { tools: [["edit", { path: "x.py" }]] });
 check("jupyter 모드 연결 전: 기록·알림 없음", (await prompt()) === undefined);
 
+// /remember 의 기억할 곳 (2026-11-16 사용자: jupyter 모드의 '모든 프로젝트' 는 노트북의 공통 지침, API 키트와 함께 씀)
+{
+	const nbP = m.memoryPlaces({ remote: true, cwd: "/home/jovyan/work/p", home: "/home/jovyan" });
+	const pcP = m.memoryPlaces({ remote: false, cwd: tmp });
+	check("/remember jupyter 모드: 이 프로젝트는 노트북 작업 폴더, 모든 프로젝트는 노트북 ~/.pi/agent/AGENTS.md (선택지에 노트북 경로)",
+		nbP[0][1].remote && nbP[0][1].abs === "/home/jovyan/work/p/AGENTS.md" && nbP[1][1].remote && nbP[1][1].abs === "/home/jovyan/.pi/agent/AGENTS.md" && nbP[1][0].includes("노트북 /home/jovyan/.pi/agent/AGENTS.md"), nbP);
+	check("/remember PC: 모든 프로젝트는 PC 의 ~/.pi/agent/AGENTS.md (그대로)", !pcP[1][1].remote && pcP[1][1].abs.replace(/\\/g, "/").endsWith("/AGENTS.md") && !pcP[1][0].includes("노트북"), pcP);
+}
+
 if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 rmSync(tmp, { recursive: true, force: true });
