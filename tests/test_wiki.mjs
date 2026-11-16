@@ -526,6 +526,13 @@ check(`500쪽: 읽기+검색 ${tSearch}ms, 점검 ${tLint}ms (각 2초 안)`, bp
 	check("jupyter 모드 위키 폴더: 기본은 노트북 ~/pi-wiki/<이름>, ~ 는 노트북 홈, 상대 경로는 노트북 작업 폴더",
 		w.defaultDirHere("모델운영", nbW) === "/home/jovyan/pi-wiki/모델운영" && w.wikiDirHere("~/w1", nbW) === "/home/jovyan/w1" && w.wikiDirHere("docs/w", nbW) === "/home/jovyan/work/p/docs/w"
 		&& w.configPath(nbW) === "/home/jovyan/.pi/agent/wiki.json" && w.configPath({ remote: false, cwd: "." }) === w.configFile(), [w.defaultDirHere("모델운영", nbW), w.wikiDirHere("docs/w", nbW)]);
+	// API 키트(PI_API_KIT=1)는 자기 기계에서 돎: 위키 경로는 그 기계의 규칙 그대로 (2026-11-17 시험에서 Windows 경로가 작업 폴더 뒤에 붙어 /wiki init 실패)
+	const oldKit = process.env.PI_API_KIT;
+	process.env.PI_API_KIT = "1";
+	const abs = join(tmp, "api-wiki", "이름");
+	check("API 키트(자기 기계): 위키 폴더는 그 기계의 경로 규칙 (절대 경로 그대로, 기본은 홈의 pi-wiki)", w.wikiDirHere(abs, { remote: false, cwd: tmp }) === w.wikiDir(abs, tmp) && w.wikiDirHere("sub/w", { remote: false, cwd: tmp }) === w.wikiDir("sub/w", tmp) && w.defaultDirHere("이름", { remote: false, cwd: tmp }) === w.defaultDir("이름"), [w.wikiDirHere(abs, { remote: false, cwd: tmp }), w.wikiDir(abs, tmp)]);
+	if (oldKit === undefined) delete process.env.PI_API_KIT;
+	else process.env.PI_API_KIT = oldKit;
 	const files = new Map();
 	globalThis.__piRelayMock = {
 		readTarget: async (t) => (files.has(t.abs) ? Buffer.from(files.get(t.abs)) : null),
@@ -563,7 +570,7 @@ check(`500쪽: 읽기+검색 ${tSearch}ms, 점검 ${tLint}ms (각 2초 안)`, bp
 	const realRun = async (cmd) => {
 		ran.push(cmd);
 		const a = words(cmd);
-		const r = spawnSync(PY, a.slice(1), { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+		const r = spawnSync(PY, a.slice(a.indexOf("-c")), { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 		return { code: r.status, out: (r.stdout || "") + (r.stderr || "") };
 	};
 	if (!PY) console.log("SKIP 노트북 위키 거울 (python3 없음: PI_TEST_PYTHON=<python> 로 줌)");
@@ -578,6 +585,8 @@ check(`500쪽: 읽기+검색 ${tSearch}ms, 점검 ${tLint}ms (각 2초 안)`, bp
 		put(".history/2026-11-16/pages/a.md", "# 가\n예전\n");
 		put("raw/big.txt", "x".repeat(w.MIRROR_FILE_MAX + 10));
 		const wd = { remote: true, cwd: nb, home: nb };
+		// 되돌려 쓸 내용은 노트북 임시 파일로 먼저 올림 (writeTarget): 여기서는 디스크에
+		globalThis.__piRelayMock = { writeTarget: async (t, d) => (mkdirSync(dirname(t.abs), { recursive: true }), writeFileSync(t.abs, d)), removeTarget: async () => {} };
 		const mi = await w.mirrorWiki(rw, wd, realRun);
 		const L = (rel) => readFileSync(join(mi.root, rel), "utf8");
 		check("노트북 위키 거울: 명령 한 번으로 읽음, 글은 내용째, .history·바이너리·큰 파일은 이름만 (빈 파일)",
@@ -606,6 +615,8 @@ check(`500쪽: 읽기+검색 ${tSearch}ms, 점검 ${tLint}ms (각 2초 안)`, bp
 		ma.close();
 		check("작업 방식 거울(only): AGENTS.md·lessons/ 만 받고, 배운 줄은 노트북 내 지침에 (raw/assets 폴더를 만들지 않음)",
 			got && sv.added.length === 1 && readFileSync(`${ad}/AGENTS.md`, "utf8").includes("시험은 pytest -q 로") && !existsSync(`${ad}/raw`), [got, sv, readdirSync(ad)]);
+		check("노트북 쓰기: 올린 임시 파일(.pi-upload-…)이 남지 않고, 명령은 짧음 (내용은 인자로 보내지 않음)", !readdirSync(ad).some((f) => f.startsWith(".pi-upload-")) && ran.every((c) => c.length < 4000), [readdirSync(ad), ran.map((c) => c.length)]);
+		delete globalThis.__piRelayMock;
 		rmSync(nb, { recursive: true, force: true });
 	}
 }

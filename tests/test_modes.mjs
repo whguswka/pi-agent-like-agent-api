@@ -999,11 +999,14 @@ rmSync(TW, { recursive: true, force: true });
 	const qargs = (cmd) => [...cmd.matchAll(/'((?:[^']|'\\'')*)'/g)].map((x) => x[1].replace(/'\\''/g, "'"));
 	const mock = {
 		readTarget: async (t) => (nbFiles.has(t.abs) ? Buffer.from(nbFiles.get(t.abs)) : null),
+		writeTarget: async (t, d) => void nbFiles.set(t.abs, d.toString("utf8")),
+		removeTarget: async (t) => void nbFiles.delete(t.abs),
 		runHere: async (cmd) => {
 			runs.push(cmd);
 			const a = qargs(cmd);
-			if (cmd.startsWith("python3 -c")) {
-				for (const [p, s] of Object.entries(JSON.parse(Buffer.from(a.at(-1), "base64").toString("utf8")))) nbFiles.set(p, s);
+			if (cmd.includes('"$p" -c')) {
+				for (const [n, s] of Object.entries(JSON.parse(nbFiles.get(a[2])))) nbFiles.set(`${a[1]}/${n}`, s);
+				nbFiles.delete(a[2]);
 				return { code: 0, out: "" };
 			}
 			if (cmd.startsWith("mv -- ")) {
@@ -1032,7 +1035,7 @@ rmSync(TW, { recursive: true, force: true });
 	const saved = JSON.parse(nbFiles.get(BJ));
 	check("노트북 작업판 쓰기: board.json·board.data.js·board.html 을 명령 한 번으로 (임시 파일 뒤 os.replace)",
 		saved.tasks.length === 1 && saved.tasks[0].remote === true && nbFiles.get("/home/jovyan/.pi/agent/todo/board.data.js")?.includes("__piBoard") && nbFiles.get("/home/jovyan/.pi/agent/todo/board.html")?.includes("board.data.js")
-		&& runs.filter((r) => r.startsWith("python3 -c")).length === 1 && runs[0].includes("os.replace"), [saved, runs.map((r) => r.slice(0, 40))]);
+		&& runs.filter((r) => r.includes('"$p" -c')).length === 1 && ![...nbFiles.keys()].some((k) => k.includes(".pi-upload-")) && runs[0].length < 2000 && runs[0].includes("command -v python3 || command -v python") && runs[0].includes("os.replace"), [saved, runs.map((r) => r.slice(0, 40))]);
 	// 그 사이에 다른 키트가 작업을 더함 -> 다음 고치기는 다시 읽어서 그것을 지우지 않음
 	saved.tasks.push({ ...saved.tasks[0], id: "other", no: 2 });
 	saved.next = 3;
@@ -1050,7 +1053,7 @@ rmSync(TW, { recursive: true, force: true });
 	} catch (e) {
 		err = e.message;
 	}
-	check("노트북 작업판을 쓰지 못하면 오류 (PC 작업판으로 몰래 바꾸지 않음)", err.includes("노트북 작업판을 쓰지 못했습니다") && err.includes("탭이 끊김"), err);
+	check("노트북 작업판을 쓰지 못하면 오류 (PC 작업판으로 몰래 바꾸지 않음), 올린 임시 파일은 지움", err.includes("노트북 작업판을 쓰지 못했습니다") && err.includes("탭이 끊김") && ![...nbFiles.keys()].some((k) => k.includes(".pi-upload-")), [err, [...nbFiles.keys()]]);
 	const dst = { v: 2, next: 2, updated: 0, tasks: [{ id: "d1", no: 1, remote: true }] };
 	const src = { v: 2, next: 4, updated: 0, tasks: [{ id: "p1", no: 1, remote: true }, { id: "p2", no: 2, remote: false }, { id: "p3", no: 3, remote: true }] };
 	const moved = m.importRemoteTasks(dst, src);
@@ -1061,7 +1064,8 @@ rmSync(TW, { recursive: true, force: true });
 	// 가짜 pi: jupyter 모드로 바꾸면 todo 가 노트북 작업판에 쓰고, /todo open 은 노트북 경로를 알림
 	mock.runHere = async (cmd) => {
 		const a = qargs(cmd);
-		if (cmd.startsWith("python3 -c")) for (const [p, s] of Object.entries(JSON.parse(Buffer.from(a.at(-1), "base64").toString("utf8")))) nbFiles.set(p, s);
+		if (cmd.includes('"$p" -c')) for (const [n, s] of Object.entries(JSON.parse(nbFiles.get(a[2])))) nbFiles.set(`${a[1]}/${n}`, s);
+				nbFiles.delete(a[2]);
 		return { code: 0, out: "" };
 	};
 	nbFiles.clear();
@@ -1087,6 +1091,7 @@ rmSync(TW, { recursive: true, force: true });
 		const wdR = { remote: true, cwd: `${nbHome}/work/p`, home: nbHome };
 		globalThis.__piRelayMock = {
 			readTarget: async (t) => (ex(t.abs) ? Buffer.from(rd(t.abs)) : null),
+			writeTarget: async (t, d) => (md(t.abs.slice(0, t.abs.lastIndexOf("/")), { recursive: true }), wr(t.abs, d)),
 			runHere: async (cmd) => {
 				const a = qargs(cmd);
 				const r = spawnSync(PY, ["-c", a[0], ...a.slice(1)], { encoding: "utf8" });
@@ -1097,7 +1102,7 @@ rmSync(TW, { recursive: true, force: true });
 		const td = `${nbHome}/.pi/agent/todo`;
 		const real = ex(`${td}/board.json`) && JSON.parse(rd(`${td}/board.json`, "utf8"));
 		check("노트북 작업판 쓰기 명령 (진짜 Python): 폴더를 만들고 세 파일을 씀, 임시 파일은 남지 않음",
-			real?.tasks?.[0]?.items?.[0]?.text === "진짜" && rd(`${td}/board.data.js`, "utf8").includes("진짜") && ex(`${td}/board.html`) && !rdir(td).some((f) => f.endsWith(".pi-tmp")), rdir(td));
+			real?.tasks?.[0]?.items?.[0]?.text === "진짜" && rd(`${td}/board.data.js`, "utf8").includes("진짜") && ex(`${td}/board.html`) && !rdir(td).some((f) => f.endsWith(".pi-tmp")) && !rdir(`${nbHome}/.pi/agent`).some((f) => f.startsWith(".pi-upload-")), [rdir(td), rdir(`${nbHome}/.pi/agent`)]);
 		delete globalThis.__piRelayMock;
 		rmSync(nbHome, { recursive: true, force: true });
 	}

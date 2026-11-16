@@ -77,6 +77,11 @@ export async function nbRun(command: string, cwd: string): Promise<{ code: numbe
 export const shq = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
 export type WorkDir = { remote: boolean; cwd: string; home?: string };
 export const workDir = (): WorkDir => (globalThis as any).__piWorkDir || { remote: false, cwd: process.cwd() };
+/** 노트북에서 Python 부르기 (셸 명령의 앞부분, 뒤에 -c '<코드>' 와 인자를 붙임): python3 가 없으면 python, 둘 다 없으면 까닭을 알리고 127 */
+export const NB_PY = `{ p="$(command -v python3 || command -v python)"; [ -n "$p" ] || { echo "노트북에서 python3 를 찾지 못했습니다" >&2; exit 127; }; } && "$p"`;
+/** 노트북에 내용을 먼저 올려 둘 임시 파일 (명령 인자 길이 한도를 피함: Linux 는 인자 하나에 128KB, Windows 는 명령 줄 32K 자). 쓰는 명령이 끝에 지움 */
+export const nbUpload = (wd: WorkDir = workDir()) =>
+	`${wd.remote ? wd.home || "/home/jovyan" : homedir().split("\\").join("/")}/.pi/agent/.pi-upload-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
 /** 같은 PVC를 쓰는 노트북 실행인지. 브리지는 remote, API 키트는 실행기가 PI_API_KIT=1 로 밝힌다. */
 export const notebookMode = (wd: WorkDir = workDir()) => !!wd.remote || process.env.PI_API_KIT === "1";
 export const notebookHome = (wd: WorkDir = workDir()) => wd.remote ? wd.home || "/home/jovyan" : homedir().split("\\").join("/");

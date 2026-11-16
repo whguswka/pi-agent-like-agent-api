@@ -37,7 +37,7 @@ import { delimiter, join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPlanDoc, projectRel } from "./lib/paths.ts";
-import { notebookHome, notebookMode, readTarget, runHere, SESSION, shq, shown, target, transformInput, userAsk, workDir, type WorkDir } from "./lib/relay.ts";
+import { NB_PY, nbUpload, notebookHome, notebookMode, readTarget, removeTarget, runHere, writeTarget, SESSION, shq, shown, target, transformInput, userAsk, workDir, type WorkDir } from "./lib/relay.ts";
 import { base, parseShell, strip } from "./lib/shell.ts";
 
 export type Mode = "plan" | "ask" | "auto";
@@ -1287,21 +1287,27 @@ export async function loadBoardHere(wd: WorkDir = workDir()): Promise<Board> {
 		throw e;
 	}
 }
-/** 원격 파일 셋을 명령 한 번으로 임시 파일+rename. 탭이 끊기면 PC 작업판으로 바꾸지 않고 오류를 올린다. */
+/** 원격 파일 셋: 내용을 노트북의 임시 파일로 올린 뒤 명령 한 번으로 임시 파일+rename. 탭이 끊기면 PC 작업판으로 바꾸지 않고 오류를 올린다. */
 export async function saveBoardHere(b: Board, now = Date.now(), wd: WorkDir = workDir()): Promise<string> {
 	if (!wd.remote) return saveBoard(b, now);
 	pruneBoard(b);
 	b.updated = now;
 	const files: Record<string, string> = {
-		[boardPath(wd)]: `${JSON.stringify(b, null, 1)}\n`,
-		[boardPath(wd, "board.data.js")]: boardDataJs(b),
-		[boardPath(wd, "board.html")]: boardHtml(b, "board.data.js"),
+		"board.json": `${JSON.stringify(b, null, 1)}\n`,
+		"board.data.js": boardDataJs(b),
+		"board.html": boardHtml(b, "board.data.js"),
 	};
-	const payload = Buffer.from(JSON.stringify(files), "utf8").toString("base64");
-	const py = "import base64,json,os,sys; fs=json.loads(base64.b64decode(sys.argv[1])); " +
-		"[(os.makedirs(os.path.dirname(p),exist_ok=True),open(p+'.pi-tmp','w',encoding='utf-8').write(s),os.replace(p+'.pi-tmp',p)) for p,s in fs.items()]";
-	const r = await runHere(`python3 -c ${shq(py)} ${shq(payload)}`, wd, 30000);
-	if (r.code !== 0) throw new Error(`노트북 작업판을 쓰지 못했습니다: ${r.out.slice(-300)}`);
+	// 폴더와 올린 파일은 보이는 인자로 (경로를 바꿔 실행하는 시험용 노트북에서도 같게). 작업판이 커져도 명령은 짧음
+	const dir = boardPath(wd, "").replace(/\/+$/, "");
+	const up = nbUpload(wd);
+	await writeTarget({ abs: up, remote: true }, Buffer.from(JSON.stringify(files), "utf8"));
+	const py = "import json,os,sys; d,u=sys.argv[1],sys.argv[2]; fs=json.load(open(u,encoding='utf-8')); os.makedirs(d,exist_ok=True); " +
+		"[(open(os.path.join(d,n)+'.pi-tmp','w',encoding='utf-8').write(s),os.replace(os.path.join(d,n)+'.pi-tmp',os.path.join(d,n))) for n,s in fs.items()]; os.remove(u)";
+	const r = await runHere(`${NB_PY} -c ${shq(py)} ${shq(dir)} ${shq(up)}`, wd, 30000);
+	if (r.code !== 0) {
+		await removeTarget({ abs: up, remote: true }).catch(() => {});
+		throw new Error(`노트북 작업판을 쓰지 못했습니다: ${r.out.slice(-300)}`);
+	}
 	remoteBoards.set(boardPath(wd), b);
 	return boardPath(wd, "board.html");
 }

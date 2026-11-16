@@ -23,7 +23,7 @@ import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
-import { decodeText, ENC_LABEL, notebookHome, notebookMode, rawInput, readTarget, readText, runHere, secretish, shq, type TextEnc, userAsk, type WorkDir, workDir, writeTarget } from "./lib/relay.ts";
+import { decodeText, ENC_LABEL, NB_PY, nbUpload, notebookHome, rawInput, readTarget, readText, removeTarget, runHere, secretish, shq, type TextEnc, userAsk, type WorkDir, workDir, writeTarget } from "./lib/relay.ts";
 
 export { decodeText, ENC_LABEL, readText, type TextEnc };
 
@@ -88,9 +88,9 @@ export function writeConfig(c: Config, file = configFile()) {
 
 /** 현재 실행 위치의 위키 설정. 브리지 jupyter만 비동기 원격 파일이고 API 키트는 노트북에서 로컬 파일이다. */
 export const configPath = (wd: WorkDir = workDir()) => wd.remote ? `${notebookHome(wd)}/.pi/agent/wiki.json` : configFile();
-export const defaultDirHere = (name: string, wd: WorkDir = workDir()) => notebookMode(wd) ? posix.join(notebookHome(wd), "pi-wiki", name) : defaultDir(name);
+export const defaultDirHere = (name: string, wd: WorkDir = workDir()) => wd.remote ? posix.join(notebookHome(wd), "pi-wiki", name) : defaultDir(name);
 export function wikiDirHere(arg: string, wd: WorkDir = workDir()): string {
-	if (!notebookMode(wd)) return wikiDir(arg, wd.cwd);
+	if (!wd.remote) return wikiDir(arg, wd.cwd); // API 키트처럼 자기 기계에서 도는 pi 는 그 기계의 경로 규칙 (노트북 쪽 posix 는 jupyter 모드만)
 	let s = arg.trim().replace(/^["']|["']$/g, "");
 	if (!s) return "";
 	if (s === "~" || s.startsWith("~/")) s = notebookHome(wd) + s.slice(1);
@@ -144,7 +144,7 @@ export async function mirrorWiki(remoteRoot: string, wd: WorkDir = workDir(), ru
 		"   if rel.startswith('.history/') or rel.startswith('raw/assets/') or b.search(rel) or os.path.getsize(p)>mx: s.append(rel)\n" +
 		"   else: o[rel]=base64.b64encode(open(p,'rb').read()).decode()\n" +
 		"print(json.dumps({'files':o,'skip':s},separators=(',',':')))";
-	const got = await runner(`python3 -c ${shq(dump)} ${shq(remoteRoot)} ${shq(BINARY.source)} ${MIRROR_FILE_MAX} ${shq(JSON.stringify(only))}`, wd, 60000);
+	const got = await runner(`${NB_PY} -c ${shq(dump)} ${shq(remoteRoot)} ${shq(BINARY.source)} ${MIRROR_FILE_MAX} ${shq(JSON.stringify(only))}`, wd, 60000);
 	if (got.code !== 0) throw new Error(`노트북 위키를 읽지 못했습니다: ${got.out.slice(-300)}`);
 	let obj: { files: Record<string, string>; skip: string[] };
 	try {
@@ -170,12 +170,17 @@ export async function mirrorWiki(remoteRoot: string, wd: WorkDir = workDir(), ru
 			for (const [rel, data] of after) if (!skip.has(rel) && !before.get(rel)?.equals(data)) put[rel] = data.toString("base64");
 			for (const rel of before.keys()) if (!skip.has(rel) && !after.has(rel)) del.push(rel);
 			if (!Object.keys(put).length && !del.length) return;
-			const payload = Buffer.from(JSON.stringify({ put, del })).toString("base64");
-			const sync = "import base64,json,os,sys; r=sys.argv[1]; x=json.loads(base64.b64decode(sys.argv[2])); " + (only.length ? "" : "os.makedirs(os.path.join(r,'raw','assets'),exist_ok=True); ") +
+			// 바뀐 내용은 노트북의 임시 파일로 먼저 올림 (명령 인자 길이 한도). 명령에는 위키 폴더와 그 파일 경로만
+			const up = nbUpload(wd);
+			await writeTarget({ abs: up, remote: true }, Buffer.from(JSON.stringify({ put, del })));
+			const sync = "import base64,json,os,sys; r,u=sys.argv[1],sys.argv[2]; x=json.load(open(u,encoding='utf-8')); " + (only.length ? "" : "os.makedirs(os.path.join(r,'raw','assets'),exist_ok=True); ") +
 				"[(os.makedirs(os.path.dirname(os.path.join(r,p)),exist_ok=True),open(os.path.join(r,p)+'.pi-tmp','wb').write(base64.b64decode(v)),os.replace(os.path.join(r,p)+'.pi-tmp',os.path.join(r,p))) for p,v in x['put'].items()]; " +
-				"[(os.unlink(os.path.join(r,p)) if os.path.isfile(os.path.join(r,p)) else None) for p in x['del']]";
-			const sent = await runner(`python3 -c ${shq(sync)} ${shq(remoteRoot)} ${shq(payload)}`, wd, 60000);
-			if (sent.code !== 0) throw new Error(`노트북 위키를 쓰지 못했습니다: ${sent.out.slice(-300)}`);
+				"[(os.unlink(os.path.join(r,p)) if os.path.isfile(os.path.join(r,p)) else None) for p in x['del']]; os.remove(u)";
+			const sent = await runner(`${NB_PY} -c ${shq(sync)} ${shq(remoteRoot)} ${shq(up)}`, wd, 60000);
+			if (sent.code !== 0) {
+				await removeTarget({ abs: up, remote: true }).catch(() => {});
+				throw new Error(`노트북 위키를 쓰지 못했습니다: ${sent.out.slice(-300)}`);
+			}
 		},
 		close: () => rmSync(tmp, { recursive: true, force: true }),
 	};
