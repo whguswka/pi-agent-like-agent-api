@@ -100,6 +100,7 @@ const cmds = {};
 const tools = {};
 const sent = [];
 const notes = [];
+const levels = []; // 알림의 등급 (info·warning). notes 와 짝
 const widgets = [];
 let idle = true;
 let setModelResult = true; // pi.setModel 은 인증이 없으면 false
@@ -112,7 +113,7 @@ const todoBounce1 = globalThis.__piTodoBounce; // 뒤에서 확장을 한 번 �
 const ctx = {
 	hasUI: true,
 	isIdle: () => idle,
-	ui: { notify: (t) => notes.push(t), setStatus() {}, setWidget: (k, v) => widgets.push({ k, v }), select: async (_t, opts) => opts[0], confirm: async () => true },
+	ui: { notify: (t, lv) => (notes.push(t), levels.push(lv)), setStatus() {}, setWidget: (k, v) => widgets.push({ k, v }), select: async (_t, opts) => opts[0], confirm: async () => true },
 };
 const tick = () => new Promise((r) => setTimeout(r, 20));
 // 확장이 setTimeout 으로 따로 하는 일(보내기, 계획서·설정 읽기, 모델 바꾸기)은 보낸 글이 늘 때까지 기다림 (5초까지).
@@ -450,6 +451,27 @@ check("계획 단계: '1. [x] 가' 처럼 칸을 쓴 계획도 끝남은 끝남,
 check("브라우저로 열기: Windows explorer, macOS open, 화면 있는 Linux xdg-open, 화면 없으면·PI_TODO_OPEN=0 이면 열지 않음",
 	m.openCmd("C:\\a.html", "win32", {})[0] === "explorer.exe" && m.openCmd("/a.html", "darwin", {})[0] === "open" && m.openCmd("/a.html", "linux", { DISPLAY: ":0" })[0] === "xdg-open"
 	&& m.openCmd("/a.html", "linux", {}) === null && m.openCmd("C:\\a.html", "win32", { PI_TODO_OPEN: "0" }) === null);
+// code-server(VS Code 웹) 통합 터미널: 화면이 없고 VSCODE_IPC_HOOK_CLI(편집기 연결 소켓)가 있으면 PATH 의 실행 파일 remote-cli(code-server 먼저, 그다음 code)로 편집기 탭에 열음 (세 번째 값 "editor")
+const { chmodSync } = await import("node:fs");
+const CLI0 = mkdtempSync(join(tmpdir(), "modes-cli-")); // 가짜 remote-cli 폴더 (시험용, 만들고 지움)
+const fakeCli = (name, code = 0) => { const p = join(CLI0, name); writeFileSync(p, `#!/bin/sh\nprintf '%s\\n' "$@" > "$FAKE_ARGS"\nexit ${code}\n`); chmodSync(p, 0o755); return p; };
+{
+	const cs = fakeCli("code-server");
+	const hook = { VSCODE_IPC_HOOK_CLI: join(CLI0, "vscode-ipc-test.sock"), PATH: CLI0 };
+	check("code-server 터미널: 화면 없고 VSCODE_IPC_HOOK_CLI + PATH 에 code-server → 그 경로로 -r 로 편집기 탭에 열기 (셋째 값 editor)",
+		JSON.stringify(m.openCmd("/a.html", "linux", hook)) === JSON.stringify([cs, ["-r", "/a.html"], "editor"]), m.openCmd("/a.html", "linux", hook));
+	const cc = fakeCli("code");
+	rmSync(cs);
+	check("code-server 없고 code 만 PATH 에 → code 로 편집기 탭에 열기 (editor)",
+		JSON.stringify(m.openCmd("/a.html", "linux", hook)) === JSON.stringify([cc, ["-r", "/a.html"], "editor"]), m.openCmd("/a.html", "linux", hook));
+	rmSync(cc);
+	check("PATH 에 code-server 도 code 도 없으면 열지 않음 (null)", m.openCmd("/a.html", "linux", hook) === null, m.openCmd("/a.html", "linux", hook));
+	check("DISPLAY 도 있으면 remote-cli 아니라 xdg-open (브라우저)가 먼저",
+		m.openCmd("/a.html", "linux", { ...hook, DISPLAY: ":0" })?.[0] === "xdg-open" && m.openCmd("/a.html", "linux", { ...hook, WAYLAND_DISPLAY: "wayland-0" })?.[0] === "xdg-open", m.openCmd("/a.html", "linux", { ...hook, DISPLAY: ":0" }));
+	check("PI_TODO_OPEN=0 이면 VSCODE_IPC_HOOK_CLI·code-server 가 있어도 열지 않음 (null)", m.openCmd("/a.html", "linux", { ...hook, PI_TODO_OPEN: "0" }) === null, m.openCmd("/a.html", "linux", { ...hook, PI_TODO_OPEN: "0" }));
+	check("VSCODE_IPC_HOOK_CLI 가 없으면 (화면 없는 보통 터미널) 열지 않음 (null)", m.openCmd("/a.html", "linux", { PATH: CLI0 }) === null, m.openCmd("/a.html", "linux", { PATH: CLI0 }));
+}
+rmSync(CLI0, { recursive: true, force: true });
 // 가짜 pi 로: todo 도구 -> 작업판 파일 셋·입력창 위 목록, /todo, 계획 모드, [N단계 완료], 끝난 작업은 다음 요청 때 닫힘
 const TW = mkdtempSync(join(tmpdir(), "modes-todo-"));
 globalThis.__piWorkDir = { remote: false, cwd: TW };
@@ -494,6 +516,28 @@ check("/todo: 진행 중 작업 목록 (지금 작업 ▶, 쉬는 중), 명령 �
 	notes.at(-1).includes("진행 중 작업 2개") && notes.at(-1).includes("▶ #2 학습 파이프라인을 만들어 줘 — 할 일 1/3 · 지금 작업") && notes.at(-1).includes("#1 옛 요청 — 할 일 1/2 · 쉬는 중") && notes.at(-1).includes("/todo 이어서 N"), notes.at(-1));
 await cmds.todo.handler("open", ctx);
 check("/todo open: 열 수 없으면 (PI_TODO_OPEN=0) 작업판 파일 경로를 알려 줌", notes.at(-1).includes("브라우저로 여세요") && notes.at(-1).includes("board.html"), notes.at(-1));
+// code-server 통합 터미널에서 /todo open: 편집기 탭으로 연다. 가짜 code-server 셸 스크립트 (받은 인자를 파일에 적고 exit 0/1)로 하고, 실제 code-server·브라우저는 띄우지 않음.
+//  PI_TODO_OPEN="0" 은 이 시험 동안만 바꾸고 되돌린다 (위의 PI_TODO_OPEN=0 시험은 그대로)
+//  Linux 에서만: Windows·macOS 에서는 openCmd 가 explorer·open 을 골라 실제 브라우저가 열리고, 가짜 셸 스크립트도 실행되지 않음
+if (process.platform !== "linux") console.log("건너뜀 /todo open (code-server 터미널) 시험 2개: Linux 에서만 (여기서는 실제 브라우저가 열리므로)");
+else {
+	const D = mkdtempSync(join(tmpdir(), "modes-cs-"));
+	const argsF = join(D, "args.txt"), csF = join(D, "code-server"), socket = join(D, "vscode-ipc-test.sock"); // 실제 소켓은 필요 없음 (가짜 스크립트는 무시함)
+	const saved = { PI_TODO_OPEN: process.env.PI_TODO_OPEN, VSCODE_IPC_HOOK_CLI: process.env.VSCODE_IPC_HOOK_CLI, PATH: process.env.PATH, FAKE_ARGS: process.env.FAKE_ARGS, DISPLAY: process.env.DISPLAY, WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY };
+	process.env.PI_TODO_OPEN = "1"; process.env.VSCODE_IPC_HOOK_CLI = socket; process.env.PATH = D; process.env.FAKE_ARGS = argsF;
+	delete process.env.DISPLAY; delete process.env.WAYLAND_DISPLAY; // 브라우저 쪽(xdg-open)으로 가지 않게
+	wr(csF, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\nexit 0\n"); chmodSync(csF, 0o755);
+	await cmds.todo.handler("open", ctx);
+	const gotArgs = rd(argsF, "utf8").split("\n").filter((x) => x !== "");
+	check("/todo open (code-server 터미널): 가짜 code-server 가 '-r 작업판.html' 을 받고 끝나면 info 로 편집기 탭에 열었다고 (Show Preview 단추 안내 포함)",
+		gotArgs[0] === "-r" && gotArgs[1] === join(tdir, "board.html") && levels.at(-1) === "info" && notes.at(-1).includes("편집기 탭에 열었습니다") && notes.at(-1).includes("Show Preview") && notes.at(-1).includes(join(tdir, "board.html")), [gotArgs, notes.at(-1), levels.at(-1)]);
+	wr(csF, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\nexit 1\n"); // 소켓이 닫힌 창을 가리키는 경우처럼 실패 (tmux 안에서 pi 를 켠 경우 등)
+	await cmds.todo.handler("open", ctx);
+	check("/todo open (code-server 터미널): remote-cli 가 0 이 아닌 코드로 끝나면 전과 같은 경고 (경로 포함)",
+		levels.at(-1) === "warning" && notes.at(-1).includes("브라우저로 여세요") && notes.at(-1).includes(join(tdir, "board.html")), [notes.at(-1), levels.at(-1)]);
+	for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v); // 시험 전 환경 그대로 되돌림
+	rmSync(D, { recursive: true, force: true });
+}
 // 모델이 남은 단계를 고치지 않고 답을 끝냄 (2026-11-02 실사용 시험): 브라우저가 '진행 중' 으로 시간을 계속 세지 않게 요청이 끝난 시각
 for (const f of on.agent_end) await f({ messages: [{ role: "assistant", content: "끝났습니다", stopReason: "stop" }] }, ctx);
 const st1 = doing().stopped;

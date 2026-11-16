@@ -3,6 +3,12 @@
 버전 번호는 `VERSION` 에 있습니다. 새 버전으로 바꾸면(`update.sh`) 끝에 그 버전의 항목을 보여 줍니다.
 버전마다 바탕이 된 [pi-agent-like-agent](https://github.com/whguswka/pi-agent-like-agent) 의 버전을 함께 적습니다.
 
+## 2026-11-16.1
+작업판을 code-server 편집기 탭에. 바탕: pi-agent-like-agent 2026-11-16.1. 단위 시험과 code-server 4.121 노트북(Live Preview 0.4.20)에서 확인했습니다. code-server 4.93.1 과 그곳의 Live Preview, 노트북의 실제 pi 에서는 아직 시험하지 못했습니다.
+- **`/todo open` 을 편집기 탭에** ([README 3-5](README.md#3-5-작업-모드-plan-mode)): code-server 터미널에서 `/todo open` 을 치면 작업판(`~/.pi/agent/todo/board.html`)을 그 창의 편집기 탭에 엽니다. 전에는 파일 경로만 알려 주었습니다.
+  - Live Preview 확장이 있으면 편집기 오른쪽 위의 'Show Preview'(미리 보기) 단추로 작업판을 보고, 3초마다 새로 읽습니다. 이 단추는 pi 가 대신 누를 수 없습니다. 작업판이 작업 폴더 밖에 있어 Live Preview 가 처음 한 번 안내 글을 띄워도 그대로 보입니다.
+  - 탭을 열지 못하면(닫힌 창에서 연 터미널, tmux 등) 지금처럼 파일 경로를 알려 줍니다. `"todo_open": true` 이면 새 작업 때 알림 없이 탭을 엽니다.
+
 ## 2026-11-12.1
 같은 글 edit 미리 막기. 바탕: pi-agent-like-agent 2026-11-12.1. 단위 시험으로 확인했습니다.
 - **같은 글 edit 미리 막기:** edit 의 바꿀 글과 새 글이 모두 같으면 실행하지 않고, 빠진 기호처럼 실제로 고칠 글자를 `newText` 에 넣었는지 확인하라고 모델에게 알립니다. 같은 요청에서 같은 파일로 되풀이하면 다시 읽은 뒤 고친 파일 전체를 write 로 쓰라고 안내합니다.

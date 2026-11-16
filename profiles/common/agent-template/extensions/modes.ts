@@ -31,9 +31,9 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPlanDoc, projectRel } from "./lib/paths.ts";
@@ -1513,12 +1513,38 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
 </script></body></html>
 `;
 }
-/** 기본 브라우저로 여는 명령 (Windows explorer, macOS open, 화면이 있는 Linux xdg-open). PI_TODO_OPEN=0 이면 열지 않음 (시험) */
-export function openCmd(file: string, platform: string = process.platform, env: NodeJS.ProcessEnv = process.env): [string, string[]] | null {
+/** 여는 방법: 브라우저 창 (explorer·open·xdg-open) 또는 편집기 탭 (code-server·code remote-cli). 세 번째 값이 "editor" 면 편집기 탭 (없으면 브라우저) */
+type OpenKind = "browser" | "editor";
+/** PATH 의 폴더에서 실행 파일 (보통 파일이고 실행 권한이 있는 것)을 찾아 전체 경로로 돌려줌.
+ *  PATH 는 이 컴퓨터의 것이라 나누는 글자도 이 컴퓨터 기준 (delimiter: Linux ":", Windows ";" — Windows 에서 돌리는 시험의 C:\ 경로가 잘리지 않게) */
+const execOnPath = (env: NodeJS.ProcessEnv, name: string): string | null => {
+	for (const dir of String(env.PATH || "").split(delimiter)) {
+		if (!dir) continue;
+		const p = join(dir, name);
+		try {
+			if (statSync(p).isFile()) accessSync(p, constants.X_OK);
+			else continue;
+		} catch {
+			continue;
+		}
+		return p;
+	}
+	return null;
+};
+/** 작업판을 여는 명령. PI_TODO_OPEN=0 이면 열지 않음 (시험).
+ *  화면(윈도우 explorer·macOS open·DISPLAY/WAYLAND_DISPLAY 의 xdg-open)이 있으면 브라우저로,
+ *  화면이 없고 VSCODE_IPC_HOOK_CLI (code-server·VS Code 원격 터미널의 편집기 연결 파일)가 있으면
+ *  PATH 의 remote-cli (code-server → code) 로 "[찾은 경로, ["-r", 파일], "editor"] (지금 창의 편집기 탭에 열림) */
+export function openCmd(file: string, platform: string = process.platform, env: NodeJS.ProcessEnv = process.env): [string, string[], OpenKind?] | null {
 	if (env.PI_TODO_OPEN === "0") return null;
 	if (platform === "win32") return ["explorer.exe", [file]];
 	if (platform === "darwin") return ["open", [file]];
-	return env.DISPLAY || env.WAYLAND_DISPLAY ? ["xdg-open", [file]] : null;
+	if (env.DISPLAY || env.WAYLAND_DISPLAY) return ["xdg-open", [file]];
+	if (env.VSCODE_IPC_HOOK_CLI) {
+		const cli = execOnPath(env, "code-server") ?? execOnPath(env, "code");
+		if (cli) return [cli, ["-r", file], "editor"];
+	}
+	return null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1621,16 +1647,39 @@ export default function (pi: ExtensionAPI) {
 		}
 		showSteps(ctx);
 	};
-	const openTodo = (file: string): boolean => {
+	/** 작업판을 연다. 여는 방법이 없으면 null, 있으면 { kind: 여는 방법, done: 열린 뒤 결과(ok) }를 줌.
+	 *  브라우저 창(explorer·open·xdg-open)은 전처럼 바로 ok=true (띄운 뒤의 오류는 막지 않음).
+	 *  편집기 탭(code-server remote-cli)은 비동기로 끝나기를 기다려 (10초 안팎) 종료 코드가 0 이어야만 ok=true —
+	 *  소켓이 닫힌 창을 가리켜 실패하면 (tmux 안에서 pi 를 켠 경우 등) 부르는 쪽이 그 결과로 경고를 낼 수 있게 */
+	const openTodo = (file: string): Promise<{ kind: OpenKind; ok: boolean }> | null => {
 		const c = openCmd(file);
-		if (!c) return false;
+		if (!c) return null;
+		const kind: OpenKind = c[2] === "editor" ? "editor" : "browser";
 		try {
-			const ch = spawn(c[0], c[1], { detached: true, stdio: "ignore" });
-			ch.on("error", () => {});
-			ch.unref();
-			return true;
+			const ch = spawn(c[0], c[1], { detached: kind === "browser", stdio: "ignore" });
+			if (kind === "browser") {
+				ch.on("error", () => {});
+				ch.unref();
+				return Promise.resolve({ kind, ok: true });
+			}
+			return new Promise((res) => {
+				let over = false;
+				const fin = (ok: boolean) => {
+					if (over) return;
+					over = true;
+					clearTimeout(timer);
+					res({ kind, ok });
+				};
+				const timer = setTimeout(() => {
+					ch.kill();
+					fin(false);
+				}, 10_000);
+				timer.unref(); // 결과를 기다리는 일이 pi 를 살아 있게 하지 않음
+				ch.on("error", () => fin(false));
+				ch.on("exit", (code) => fin(code === 0));
+			});
 		} catch {
-			return false;
+			return null;
 		}
 	};
 	/** 새 작업을 지금 작업으로 (하던 작업은 쉬는 중으로 작업판에 남음). 쉬게 한 작업을 돌려준다 */
@@ -1642,8 +1691,12 @@ export default function (pi: ExtensionAPI) {
 			if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped, paused] = ["paused", null, old];
 			[curId, curSince] = [addTask(b, s, now).id, now];
 		});
-		// 내 설정 "todo_open": true 면 새 작업이 생길 때 (세션에 한 번) 브라우저로 연다
-		if (ctx?.hasUI && !autoOpened && userConfig().todo_open === true) autoOpened = openTodo(todoFile());
+		// 내 설정 "todo_open": true 면 새 작업이 생길 때 (세션에 한 번) 작업판을 연다 (화면이 있으면 브라우저 창, code-server 터미널에서는 편집기 탭).
+		//  저절로 열 때는 알림 없음: 창·탭이 저절로 열리는 것이 이미 표시이고, 실패해도 전처럼 창이 안 열리는 뿐이므로 조용히 넘긴다 (필요하면 언제든 /todo open)
+		if (ctx?.hasUI && !autoOpened && userConfig().todo_open === true) {
+			const opened = openTodo(todoFile()); // 저절로 열 때는 결과가 어떻게 끝나든 알림을 내지 않는다 (Promise 결과는 버림)
+			if (opened) autoOpened = true; // 여는 방법이 있었으면 한 번 연 셈 (성패와 무관하게 세션에 한 번만 시도)
+		}
 		return paused;
 	};
 	/** 지금 작업의 목록을 바꿈 (작업판에서 없어졌으면 새 작업으로) */
@@ -2429,9 +2482,13 @@ export default function (pi: ExtensionAPI) {
 			if (sub === "open" || sub === "열기") {
 				if (!existsSync(todoFile())) edit(ctx, () => {});
 				const file = todoFile();
-				return openTodo(file)
-					? ctx.ui.notify(`작업판을 브라우저로 엽니다 (창을 열어 두면 3초마다 새로 읽음): ${file}`, "info")
-					: ctx.ui.notify(`여기서는 브라우저를 열 수 없습니다. 이 파일을 브라우저로 여세요: ${file}`, "warning");
+				const opened = openTodo(file);
+				if (!opened) return ctx.ui.notify(`여기서는 브라우저를 열 수 없습니다. 이 파일을 브라우저로 여세요: ${file}`, "warning");
+				const r = await opened; // 편집기 탭(code-server)은 종료 코드 0 이어야 ok=true (닫힌 창 소켓을 가리키면 실패할 수 있음)
+				if (r.ok && r.kind === "editor")
+					return ctx.ui.notify(`작업판 파일을 편집기 탭에 열었습니다. Live Preview 확장이 있으면 편집기 오른쪽 위의 'Show Preview'(미리 보기) 단추를 누르세요. 작업판이 보이고 3초마다 새로 읽습니다: ${file}`, "info");
+				if (r.ok) return ctx.ui.notify(`작업판을 브라우저로 엽니다 (창을 열어 두면 3초마다 새로 읽음): ${file}`, "info");
+				return ctx.ui.notify(`여기서는 브라우저를 열 수 없습니다. 이 파일을 브라우저로 여세요: ${file}`, "warning");
 			}
 			if (["이어서", "계속", "resume", "완료", "done", "폐기", "drop", "clear", "지우기"].includes(sub)) {
 				// clear·지우기: 지금 작업을 폐기 (2026-11-02.1 의 '목록 지우기')
