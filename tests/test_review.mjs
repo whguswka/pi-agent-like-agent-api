@@ -282,6 +282,69 @@ await tick();
 check("확인 답이 '고칠 것 없음' 이면 묻지 않고 알림", asked.length === nA && notes.at(-1)[0].includes("고칠 것이 없습니다"), notes.at(-1));
 await fire("agent_start");
 
+// ── 계획 단계 리뷰 관문: 개발 pi와 리뷰 pi가 같은 작업판을 순서대로 씀 ──────────
+cfg({ review_gate: true });
+const gateBoard = m.emptyBoard();
+const gateTask = m.addTask(gateBoard, m.planTodo(["구현", "시험"], Date.now(), { project: "repo", cwd: R, remote: false, request: "관문 작업", source: "plan" }), Date.now());
+gateTask.range = { from: 1, to: 1, at: Date.now() };
+m.saveBoard(gateBoard);
+await fire("agent_start");
+await fire("message_end", { message: { role: "assistant", content: "[1단계 완료]", stopReason: "stop" } });
+check("개발 pi: 단계가 끝나면 공유 작업판 gate=wait", m.loadBoard().tasks[0].gate?.state === "wait" && m.loadBoard().tasks[0].gate?.step === 1, m.loadBoard().tasks[0]);
+
+// 리뷰하는 쪽은 review_gate 설정이 꺼져 있어도 작업판의 wait를 보고 새 선택을 보여야 한다.
+cfg({});
+const ron = {}, rcmd = {}, rsent = [];
+m.default({
+	on: (e, f) => (ron[e] ||= []).push(f), registerCommand: (n, d) => (rcmd[n] = d), sendUserMessage: (text) => rsent.push(text),
+	setModel: async () => true, registerTool() {},
+});
+const rfire = async (name, event = {}) => { let out; for (const f of ron[name] || []) { const x = await f(event, ctx); if (x !== undefined) out = x; } return out; };
+await rfire("agent_start");
+// 막기는 관문을 건 pi(holder) 에서만: 같은 작업판을 보는 다른 키트의 pi(리뷰하는 쪽)는 쓰기를 막지 않음
+check("관문을 건 쪽이 holder 로 남음", m.loadBoard().tasks[0].gate?.holder === m.kitKind(), m.loadBoard().tasks[0].gate);
+process.env.PI_API_KIT = m.kitKind() === "api" ? "" : "1";
+const otherBlock = await rfire("tool_call", { toolName: "write", input: { path: "x.txt", content: "a" } });
+delete process.env.PI_API_KIT;
+const mineBlock = await fire("tool_call", { toolName: "write", input: { path: "x.txt", content: "a" } });
+check("리뷰 관문: 관문을 건 pi 는 쓰기를 막고, 다른 키트의 pi 는 같은 작업판을 봐도 막지 않음", mineBlock?.block === true && !otherBlock?.block, [mineBlock, otherBlock]);
+await rcmd.review.handler("", ctx);
+check("리뷰 pi(설정 꺼짐): 요청에 N단계 글을 붙임", rsent.at(-1).includes("리뷰 관문: 1단계(구현)를 리뷰"), rsent.at(-1).slice(0, 300));
+await rfire("agent_end", { messages: [{ role: "assistant", content: FOUND, stopReason: "stop" }] });
+const selectBeforeGate = ctx.ui.select;
+ctx.ui.select = async (t, opts) => (asked.push([t, opts]), opts.find((x) => x.startsWith("통과 (")));
+await rfire("agent_settled");
+await tick();
+check("리뷰 관문 선택: 통과·고칠 것 있음이 보이고 통과하면 gate=ok", asked.at(-1)[1].some((x) => x.startsWith("통과 (")) && asked.at(-1)[1].some((x) => x.startsWith("고칠 것 있음"))
+	&& m.loadBoard().tasks[0].gate?.state === "ok", [asked.at(-1), m.loadBoard().tasks[0].gate]);
+
+check("범위 리뷰 통과: 범위 삭제", !m.loadBoard().tasks[0].range);
+m.editBoard((b) => { b.tasks[0].range = { from: 1, to: 1, at: Date.now() }; b.tasks[0].gate = { step: 1, state: "wait", at: Date.now() }; b.tasks[0].state = "doing"; });
+await rfire("agent_start");
+await rcmd.review.handler("", ctx);
+await rfire("agent_end", { messages: [{ role: "assistant", content: FOUND, stopReason: "stop" }] });
+ctx.ui.select = async (t, opts) => (asked.push([t, opts]), opts.find((x) => x.startsWith("고칠 것 있음")));
+await rfire("agent_settled");
+await tick();
+const gateReviewFile = join(R, `docs/reviews/작업${gateTask.no}-1단계.md`);
+check("리뷰 관문 선택: 고칠 것 있으면 작업 폴더에 리뷰 글을 쓰고 gate=fix·note", m.loadBoard().tasks[0].gate?.state === "fix"
+	&& m.loadBoard().tasks[0].gate?.note === `docs/reviews/작업${gateTask.no}-1단계.md` && readFileSync(gateReviewFile, "utf8").includes("a.py:2"), [m.loadBoard().tasks[0].gate, gateReviewFile]);
+check("고칠 것으로 넘기면 그 단계를 다시 '하는 중' 으로 (고치기 전에 같은 목록을 보내도 바로 리뷰 대기로 돌아가지 않게)", m.loadBoard().tasks[0].items[0].status === "doing", m.loadBoard().tasks[0].items.map((x) => [x.text, x.status]));
+ctx.ui.select = selectBeforeGate;
+
+cfg({ review_gate: false });
+await fire("agent_start");
+let gateInput = "고쳐 줘";
+for (const f of on.input || []) {
+	const x = await f({ text: gateInput, source: "interactive" }, ctx);
+	if (x?.action === "transform") gateInput = x.text;
+}
+check("개발 pi 다음 요청: fix 경로와 리뷰 글 앞부분을 붙임", gateInput.startsWith("[리뷰: 고칠 것] 1단계") && gateInput.includes("docs/reviews/") && gateInput.includes("a.py:2"), gateInput.slice(0, 500));
+await fire("message_end", { message: { role: "assistant", content: "[1단계 완료]", stopReason: "stop" } });
+check("개발 pi가 수정 완료를 다시 알리면 같은 공유 작업판이 wait", m.loadBoard().tasks[0].gate?.state === "wait", m.loadBoard().tasks[0].gate);
+check("범위 수정 뒤에도 범위 유지·다시 대기", m.loadBoard().tasks[0].range?.to === 1 && m.loadBoard().tasks[0].gate?.state === "wait");
+cfg({});
+
 // ── /review --new: 새 대화에서 리뷰 (새 세션을 열면 pi 가 확장을 새로 불러옴) ─────────
 check("새 대화 리뷰 글: 앞 대화가 없다고, 이 대화에서 요청한 것은 보지 않음",
 	m.reviewPrompt({ nogit: false, status: "M a", stat: "", diff: "+x", fresh: "" }, "w", "", true).startsWith("[리뷰] 리뷰만 하려고 새 대화를 열었습니다")

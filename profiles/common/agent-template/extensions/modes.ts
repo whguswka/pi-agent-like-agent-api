@@ -37,7 +37,7 @@ import { delimiter, join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPlanDoc, projectRel } from "./lib/paths.ts";
-import { NB_PY, nbUpload, notebookHome, notebookMode, readTarget, removeTarget, runHere, writeTarget, SESSION, shq, shown, target, transformInput, userAsk, workDir, type WorkDir } from "./lib/relay.ts";
+import { NB_PY, nbUpload, notebookHome, notebookMode, onNotebook, readTarget, removeTarget, runHere, writeTarget, SESSION, shq, shown, target, transformInput, userAsk, workDir, type WorkDir } from "./lib/relay.ts";
 import { base, parseShell, strip } from "./lib/shell.ts";
 
 export type Mode = "plan" | "ask" | "auto";
@@ -446,15 +446,29 @@ async function preview(tool: string, input: any): Promise<{ title: string; body:
 // ── 계획과 진행 목록 ──────────────────────────────────────────────
 
 // 2026-10 시험: 계획서는 쓸 수 있다고 끝에만 적었더니 '승인해 주시면 먼저 계획서를 작성하겠습니다' 로 계획서 쓰기를 단계에 넣음 -> 앞에 분명히
-export const planNote = (dir: string) =>
+export const planNote = (dir: string, detail = userConfig().plan_detail) =>
 	"[계획 모드] 지금은 계획만 세웁니다. 코드·설정 파일을 바꾸는 도구와 명령은 막혀 있습니다 (read 와 읽기 전용 명령만). " +
-	`단, 계획서는 지금 쓸 수 있습니다: 계획서를 남겨 달라는 요청이면 승인을 기다리지 말고 지금 write 로 ${dir}/<이름>.md ` +
+	`단, 계획서는 지금 쓸 수 있습니다: ${detail === "handoff" ? "계획서를 늘 남기세요. 요청이 없어도" : "계획서를 남겨 달라는 요청이면"} 승인을 기다리지 말고 지금 write 로 ${dir}/<이름>.md ` +
 	"(또는 이름에 '계획'·plan 이 든 .md)에 쓰세요. 계획서 쓰기를 계획의 단계로 넣지는 마세요. " +
 	"필요하면 read 와 읽기 전용 명령(ls, grep, git diff 등)으로 살펴본 뒤 번호를 붙인 단계로 계획을 적어 주세요 " +
 	"(단계마다 할 일과 바꿀 파일. 하위 작업은 그 단계 아래에 들여 쓴 목록으로 적으면 할 일 목록의 하위 단계가 됩니다). " +
-	"정해야 할 점이 있으면 계획 끝에 질문으로 적어 주세요. 사용자가 승인하면 그때 진행합니다.";
+	"정해야 할 점이 있으면 계획 끝에 질문으로 적어 주세요. 사용자가 승인하면 그때 진행합니다." +
+	(detail === "handoff" ? "\n이 계획은 다른(작은) 모델이 계획서만 보고 단계별로 실행합니다. 모호한 말 없이, 단계마다 아래를 들여 쓴 목록으로 적으세요: " +
+		"바꿀 파일·함수: 대상 / 방법: 순서, 핵심 코드 꼴 / 확인: 실행할 명령과 기대 결과 / 끝 조건: 완료 기준 / 하지 말 것: 제한 (해당 없으면 뺌). " +
+		"각 항목은 별도의 '- 항목: 내용' 줄로 적으세요. 확인·끝 조건은 작업판의 하위 단계로 남습니다. " +
+		`계획서는 늘 ${dir}/<이름>.md에 남기세요.` : "");
+/** 설정이 다른 pi에서도 작업판의 하위 단계로 확인 의무를 전달한다. */
+export function detailCheck(items: TodoLine[], range?: { from: number; to: number }): string {
+	let n = 0;
+	const steps = new Set<number>();
+	for (const it of items) {
+		if (it.level === 0) n++;
+		else if (/^(확인|끝\s*조건)\s*[:：]/.test(it.text) && (!range || (n >= range.from && n <= range.to))) steps.add(n);
+	}
+	return steps.size ? `\n${[...steps].join(", ")}단계: 확인 명령을 돌리고 끝 조건을 확인한 뒤에만 [N단계 완료]를 적으세요 (N은 해당 단계 번호).` : "";
+}
 /** 계획대로 진행해 달라는 요청. plan·how: 계획 글을 함께 보냄 (edit 사용자가 고친 계획, fresh 새 대화로 넘긴 계획) */
-export const proceedText = (n: number, mode: Mode, doc = "", done: number[] = [], plan = "", how: "" | "edit" | "fresh" = "") =>
+export const proceedText = (n: number, mode: Mode, doc = "", done: number[] = [], plan = "", how: "" | "edit" | "fresh" = "", items: TodoLine[] = []) =>
 	`${how === "edit" ? "사용자가 고친 아래 계획" : how === "fresh" ? "아래 계획(앞 대화에서 승인한 것을 새 대화로 넘김)" : "위 계획"}` +
 	`${doc ? `(계획서 ${doc})` : ""}대로 진행해 주세요. 계획 모드는 끝났고 이제 파일을 바꾸고 명령을 실행할 수 있습니다` +
 	`${mode === "ask" ? " (바꾸기 전에 사용자가 하나씩 확인합니다)" : ""}. ` +
@@ -462,6 +476,7 @@ export const proceedText = (n: number, mode: Mode, doc = "", done: number[] = []
 	`${done.length ? `이미 끝난 단계(${done.join(", ")}단계)는 다시 하지 말고 남은 단계를 이어서 해 주세요. ` : ""}` +
 	`단계 하나를 마칠 때마다 답에 "[N단계 완료]" 라고 적어 주세요 (N 은 단계 번호, 모두 ${n}단계). ` +
 	`할 일 목록은 pi 가 이 계획의 단계로 이미 만들었습니다 (todo 로 진행을 고칠 때는 같은 ${n}개 단계를 같은 차례로).` +
+	detailCheck(items.length ? items : planSteps(plan).flatMap((text, i) => [{text, level: 0, status: "todo" as const}, ...(planKids(plan, planSteps(plan))[i] || [])])) +
 	(plan ? `\n\n계획:\n${plan}` : "");
 // 계획을 승인하는 창의 고르기 (2026-11-05)
 export const PLAN_EDIT = "계획 고쳐서 진행 (편집기에서 고친 뒤 자동으로)";
@@ -736,7 +751,7 @@ export function parseReviewScan(out: string): { nogit: boolean; status: string; 
 	return { nogit: "nogit" in parts, status: t("status"), stat: t("stat"), diff: t("diff"), fresh: t("new") };
 }
 /** 리뷰 요청 글 (who: 리뷰 모델 이름, focus: /review 뒤에 적은 볼 점, fresh: /review --new 로 새 대화에서 하는 리뷰) */
-export function reviewPrompt(scan: ReturnType<typeof parseReviewScan>, who: string, focus = "", fresh = false): string {
+export function reviewPrompt(scan: ReturnType<typeof parseReviewScan>, who: string, focus = "", fresh = false, gate?: { step: number; text: string }): string {
 	const lines = [
 		fresh
 			? `${REVIEW_TAG} 리뷰만 하려고 새 대화를 열었습니다 (앞 대화는 없음). 아래 바뀐 내용을 ${who} 로 검토합니다. 이번 답에서는 파일을 바꾸지 말고, 찾은 것만 적어 주세요.`
@@ -748,6 +763,7 @@ export function reviewPrompt(scan: ReturnType<typeof parseReviewScan>, who: stri
 		// 스킬 문서: 2026-10-28 실사용 시험에서 리뷰 모델이 debugging 스킬부터 읽음 (고급 모델은 도구마다 질문 하나)
 		`- 아래 바뀐 내용으로 보통 충분합니다. 꼭 필요할 때만 read·grep 으로 프로젝트 파일을 더 보세요 (${REVIEW_TOOLS_MAX}번까지, 스킬 문서는 읽지 않아도 됨). ${fresh ? "바뀐 내용" : "이 대화에서 바꾼 것"} 위주로 봅니다.`,
 	];
+	if (gate) lines.push(`- 리뷰 관문: ${gate.step}단계(${gate.text})를 리뷰해 주세요. 이 단계에서 한 변경만 통과시킬 수 있는지 판단합니다.`);
 	if (focus.trim()) lines.push(`- 사용자가 특히 볼 점: ${focus.trim()}`);
 	if (scan.nogit) {
 		lines.push("", "(작업 폴더가 git 저장소가 아니라 바뀐 내용을 모으지 못했습니다. 이 대화에서 바꾼 파일을 read 로 보고 검토하세요.)");
@@ -1101,9 +1117,11 @@ export function todoWidget(s: TodoState & { no?: number }): string {
 	const mark = (it: TodoItem) => (it.status === "done" ? "x" : it.status === "doing" ? "~" : " ");
 	const stop = !sum.all && s.stopped ? " · 요청 끝 (남은 단계 있음)" : "";
 	const task = s.no ? ` · 작업 #${s.no}` : "";
+	const gate = (s as Task).gate;
+	const gateText = gate ? ` · ${gate.state === "wait" ? "리뷰 대기" : gate.state === "fix" ? "리뷰에서 고칠 것" : "리뷰 통과"} (${gate.step}단계${gate.by ? ` · ${gate.by}` : ""})` : "";
 	const head =
 		s.source === "plan"
-			? `── 계획 진행 ${sum.done}/${sum.total}${sum.all ? " · 모두 완료 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`
+			? `── 계획 진행 ${sum.done}/${sum.total}${gateText}${rangeLabel(s as Task)}${sum.all && !gate ? " · 모두 완료 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`
 			: `── 할 일 ${sum.done}/${sum.total} (${sum.pct}%)${sum.all ? " · 모두 끝남 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`;
 	// 12줄이 넘으면 맨 위 단계와 지금 단계(하는 중, 없으면 남은 첫 단계)의 하위 단계만 (다른 단계는 하위 단계 수만). 2026-11-05 실제 Copilot: 5단계 + 하위 22개
 	let show = s.items.map((it, i) => i);
@@ -1163,7 +1181,22 @@ const safeJson = (x: unknown) => JSON.stringify(x).replace(/</g, "\\u003c");
 export type TaskState = "doing" | "paused" | "done" | "dropped";
 // alias: 승인한 계획에 맞춰 받은 모델의 단계 글 (모델은 제 글로 다시 보냄. 새 요청 뒤에도 이 글과 겹치면 같은 계획으로 봄),
 //  lastTop: 마지막으로 맞춰 받은 모델의 맨 위 단계 글 (계획의 단계 차례대로)
-export type Task = TodoState & { id: string; no: number; state: TaskState; closed: number | null; manual?: boolean; alias?: string[]; lastTop?: string[] };
+// holder: 대기를 건 쪽 (단계를 끝낸 키트, "api"·"pc"). 막기·안내는 그 pi 에서만 (같은 작업판을 보는 리뷰하는 pi 는 막지 않음)
+export type ReviewGate = { step: number; state: "wait" | "ok" | "fix"; at: number; by?: string; note?: string; holder?: string };
+/** 이 pi 의 키트 ("api": 노트북의 API 키트, "pc": 업무 PC 키트). 리뷰 관문의 holder */
+export const kitKind = () => (onNotebook() ? "api" : "pc");
+export type Task = TodoState & {
+	id: string;
+	no: number;
+	state: TaskState;
+	closed: number | null;
+	manual?: boolean;
+	alias?: string[];
+	lastTop?: string[];
+	/** 계획 단계 리뷰 관문. 예전 작업판에는 없으며 그대로 읽을 수 있다. */
+	gate?: ReviewGate;
+	range?: { from: number; to: number; at: number };
+};
 // 같은 단계인지 볼 때의 글: 진행 표시는 빼고 봄 (전에 '(끝남)' 이 글에 들어간 채 저장된 작업도 같은 작업으로)
 export const textKey = (t: string) => stripMarks(t).replace(/\s+/g, " ").trim().toLowerCase();
 /** 목록의 단계 가운데 작업의 단계 글이나 alias 와 같은 것이 있는지 */
@@ -1192,7 +1225,79 @@ const isBoard = (b: any): b is Board => !!b && b.v === 2 && Array.isArray(b.task
 export const isOpen = (t: Task) => t.state === "doing" || t.state === "paused";
 /** 모든 단계가 끝나면 완료 (완료 탭으로) */
 export function finishIfDone(t: Task, now: number) {
-	if (isOpen(t) && t.items.length && todoSummary(t).all) [t.state, t.closed, t.stopped] = ["done", now, null];
+	if (isOpen(t) && t.items.length && todoSummary(t).all && !t.gate && !t.range) [t.state, t.closed, t.stopped] = ["done", now, null];
+}
+const topIndexes = (t: { items: TodoItem[] }) => t.items.flatMap((it, i) => (it.level === 0 ? [i] : []));
+export const gateStepText = (t: Task, step = t.gate?.step || 0) => {
+	const i = topIndexes(t)[step - 1];
+	return i === undefined ? "" : t.items[i].text;
+};
+/** 범위는 /todo 명령의 첫 낱말에서만 읽는다. */
+export function resumeRange(t: Task, text: string): { extra: string; range?: Task["range"]; error?: string } {
+	const [word = "", ...rest] = text.trim().split(/\s+/);
+	const m = word.match(/^(?:(\d+)(?:[-~](\d+))?(?:단계)?|(\d+)단계까지|~(\d+))$/);
+	if (!m) return { extra: text };
+	const tops = topIndexes(t);
+	const until = m[3] || m[4];
+	const from = until ? tops.findIndex(i => t.items[i].status !== "done") + 1 : Number(m[1]);
+	const to = Number(until || m[2] || m[1]);
+	const error = t.source !== "plan" ? "단계 범위는 계획 작업에만 지정할 수 있습니다" :
+		!from || from > to || to > tops.length ? "없는 단계 번호이거나 잘못된 범위입니다" :
+		tops.slice(from - 1, to).every(i => t.items[i].status === "done") ? "이미 끝난 범위입니다" : "";
+	return { extra: rest.join(" "), ...(error ? { error } : { range: { from, to, at: Date.now() } }) };
+}
+function preserveOutsideRange(t: Task, before: TodoItem[]) {
+	if (!t.range) return;
+	let n = 0;
+	for (let i = 0; i < t.items.length; i++) {
+		if (t.items[i].level === 0) n++;
+		if (n < t.range.from || n > t.range.to) t.items[i] = { ...before[i] };
+	}
+}
+export const rangeLabel = (t: Task) => t.range ? ` · 범위 ${t.range.from}~${t.range.to}단계` : "";
+const gateAt = (t: Task, n: number, enabled: boolean) => t.source === "plan" && (t.range ? n === t.range.to || topIndexes(t).slice(t.range.from - 1, t.range.to).every(i => t.items[i].status === "done") : enabled);
+/** N단계 뒤를 다시 열고 리뷰 대기로 둔다. 모델이 여러 단계를 한꺼번에 [x]로 보내도 N+1 이후는 끝난 것으로 받지 않는다. */
+export function waitReviewGate(t: Task, step: number, now: number, holder = kitKind()): boolean {
+	if (t.source !== "plan" || step < 1) return false;
+	const tops = topIndexes(t);
+	if (tops[step - 1] === undefined) return false;
+	for (let n = step; !t.range && n < tops.length; n++) {
+		const from = tops[n];
+		const to = tops[n + 1] ?? t.items.length;
+		for (let i = from; i < to; i++) [t.items[i].status, t.items[i].started, t.items[i].ended] = ["todo", null, null];
+	}
+	t.gate = { step, state: "wait", at: now, holder };
+	[t.state, t.closed, t.stopped, t.updated] = ["doing", null, null, now];
+	return true;
+}
+/** 리뷰 통과 뒤 다음 단계를 시작한다. 마지막 단계는 다음 요청에 커밋 안내를 붙일 때 닫는다. */
+export function passReviewGate(t: Task, now: number, by?: string): boolean {
+	if (!t.gate || (t.gate.state !== "wait" && t.gate.state !== "fix")) return false;
+	const step = t.gate.step;
+	delete t.range;
+	t.gate = { step, state: "ok", at: now, ...(t.gate.holder ? { holder: t.gate.holder } : {}), ...(by ? { by } : {}) };
+	const next = topIndexes(t)[step];
+	if (next !== undefined && t.items[next].status === "todo") {
+		let i = next;
+		while (hasKids(t.items, i)) i++;
+		[t.items[i].status, t.items[i].started] = ["doing", now];
+		rollUp(t.items);
+	}
+	t.updated = now;
+	return true;
+}
+/** 리뷰에서 고칠 것: 그 단계를 다시 '하는 중' 으로 (첫 하위 단계를 하는 중으로, 다른 하위 단계의 진행은 그대로).
+ *  끝난 표시가 남아 있으면 모델이 고치기 전에 같은 목록을 다시 보내기만 해도 바로 리뷰 대기로 돌아가 쓰기가 막힘 */
+export function reopenStep(t: Task, step: number, now: number): boolean {
+	const from = topIndexes(t)[step - 1];
+	if (from === undefined) return false;
+	let i = from;
+	while (hasKids(t.items, i)) i++;
+	[t.items[i].status, t.items[i].ended] = ["doing", null];
+	t.items[i].started ||= now;
+	rollUp(t.items);
+	t.updated = now;
+	return true;
 }
 /** 새 작업 (#번호는 작업판 안에서 하나씩 늘어남) */
 export function addTask(b: Board, s: TodoState, now: number): Task {
@@ -1410,11 +1515,13 @@ export function resumeText(t: Task, extra = ""): string {
 	const tops = t.items.filter((it) => it.level === 0).length;
 	return (
 		`[할 일 목록] 쉬던 작업 #${t.no} 을(를) 이어서 합니다${t.request ? ` (처음 요청: ${t.request})` : ""}.\n` +
-		boxLines(t) +
+		boxLines(t, TODO_MAX, t.range ? Number.MAX_SAFE_INTEGER : 120) +
+		(t.range ? `\n${t.range.from}단계부터 ${t.range.to}단계까지만 하고 멈추세요 (${t.range.to}단계가 끝나면 키트가 쓰기를 막습니다).\n` : "") +
 		`${BOX_NOTE}끝난 단계는 다시 하지 말고 남은 단계부터 이어서 해 주세요. 필요하면 먼저 파일을 읽어 지금 상태를 확인하세요. ` +
 		(t.source === "plan"
 			? `단계 하나를 마칠 때마다 답에 "[N단계 완료]" 라고 적어 주세요 (N 은 단계 번호, 모두 ${tops}단계).`
 			: "진행을 고칠 때는 todo 로 이 목록을 같은 글·같은 차례로 보내세요.") +
+		detailCheck(t.items, t.range) +
 		(extra ? `\n\n${extra}` : "")
 	);
 }
@@ -1541,6 +1648,8 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
   function opened(t) { return t.state === "doing" || t.state === "paused"; }
   function pkey(t) { return (t.remote ? "nb:" : "pc:") + t.cwd; }
   function badge(t, s) {
+	if (t.gate) return '<span class="bd ' + (t.gate.state === "ok" ? "done" : "warn") + '">' +
+	  (t.gate.state === "wait" ? "리뷰 대기" : t.gate.state === "fix" ? "리뷰에서 고칠 것" : "리뷰 통과") + " (" + t.gate.step + "단계" + (t.gate.by ? " · " + esc(t.gate.by) : "") + ")</span>";
     if (t.state === "dropped") return '<span class="bd drop">폐기</span>';
     if (t.state === "done") return '<span class="bd done">' + (t.manual && !s.all ? "완료 처리" : "완료") + "</span>";
     if (t.state === "paused") return '<span class="bd pause">쉬는 중</span>';
@@ -1575,7 +1684,7 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
     var end = t.state === "dropped" ? "폐기 " + when(t.closed) : t.state === "done" ? when(s.ended || t.closed) : t.stopped ? "요청 끝 " + when(t.stopped) : t.state === "paused" ? "쉬는 중" : "진행 중";
     var took = s.started ? dur((t.state === "doing" && !t.stopped ? Date.now() : s.ended || t.closed || t.stopped || t.updated) - s.started) : "—";
     return '<details class="task st-' + t.state + '" data-id="' + t.id + '"' + (op ? " open" : "") + "><summary><span class=tno>#" + t.no + "</span><span class=ttl>" + esc(t.request || "(요청 글 없음)") +
-      "</span>" + badge(t, s) + '<span class=prog><i style="width:' + s.pct + '%"></i></span><span class=cnt>' + s.done + "/" + s.total + "</span><span class=up data-u=" + t.updated + ">" + ago(t.updated) + "</span></summary>" +
+      "</span>" + (t.range ? '<span class="bd">범위 ' + t.range.from + "~" + t.range.to + "단계</span>" : "") + badge(t, s) + '<span class=prog><i style="width:' + s.pct + '%"></i></span><span class=cnt>' + s.done + "/" + s.total + "</span><span class=up data-u=" + t.updated + ">" + ago(t.updated) + "</span></summary>" +
       '<div class=body><div class=grid><div><b>시작</b>' + when(s.started || t.created) + "</div><div><b>끝</b>" + end + "</div><div><b>걸린 시간</b>" + took + "</div><div><b>마지막 갱신</b>" + when(t.updated) +
       "</div><div><b>목록</b>" + (t.source === "plan" ? "승인한 계획" : "pi 가 만든 목록") + "</div></div>" + cmds(t) + steps(t) + "</div></details>";
   }
@@ -1696,8 +1805,13 @@ export default function (pi: ExtensionAPI) {
 	let gateTries = 0; // 목록을 고치지 않아 막은 답 수
 	let gateOff = false; // TODO_GATE_TRIES 번 막아도 고치지 않음: 이 요청 동안 막지 않음
 	let todoInAnswer = false; // 이번 답에 todo 도 있음 (같은 답의 다른 도구는 막지 않음)
+	let gateIntro = ""; // 같은 확장 인스턴스에서 같은 관문 안내를 요청마다 되풀이하지 않음
+	let gateNotice = ""; // 요청 끝의 리뷰 대기 알림은 관문 상태마다 한 번
 	const sameEditByPath = new Map<string, number>(); // 사용자 요청마다 같은 글 edit 를 경로별로 센다
 	const todoEnforce = () => userConfig().todo_enforce !== false;
+	const reviewGateEnabled = () => userConfig().review_gate === true;
+	/** 이 pi 가 그 관문을 건 쪽인지: 막기·[리뷰 통과] 안내·요청 끝 알림은 그 pi 에서만 (리뷰하는 다른 pi 는 같은 작업판을 봐도 막지 않음) */
+	const gateMine = (t: Task | null | undefined) => !!t?.gate && (t.gate.holder ? t.gate.holder === kitKind() : reviewGateEnabled() || !!t.range);
 	const listUpdated = () => {
 		[sinceTodo, workSince, gateTries, gateOff, listTouched] = [0, 0, 0, false, true];
 	};
@@ -1720,6 +1834,7 @@ export default function (pi: ExtensionAPI) {
 		found: string;
 		verified: string;
 		checker: string;
+		gate?: { taskId: string; no: number; step: number; text: string };
 	};
 	let review: Review | null = null;
 
@@ -1746,6 +1861,10 @@ export default function (pi: ExtensionAPI) {
 		const w = todoWhere();
 		return !!t && t.cwd === w.cwd && t.remote === w.remote;
 	};
+	const waitingGate = (): Task | null =>
+		activeBoard().tasks
+			.filter((t) => here(t) && t.source === "plan" && t.gate?.state === "wait")
+			.sort((a, b) => b.updated - a.updated)[0] || null;
 	const todoFile = () => boardPath(workDir(), "board.html");
 	/** 작업판을 고치고 입력창 위 목록을 다시 그림 (쓰지 못하면 한 번 알림) */
 	const edit = async (ctx: any, fn: (b: Board) => boolean | void | Promise<boolean | void>) => {
@@ -1798,7 +1917,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (switched || !cur() || !here(cur())) {
 			const t = activeBoard()
-				.tasks.filter((x) => x.state === "doing" && here(x) && !todoSummary(x).all)
+				.tasks.filter((x) => x.state === "doing" && here(x) && (!todoSummary(x).all || !!x.gate))
 				.sort((a, b) => b.updated - a.updated)[0];
 			// 세션 중에 다른 pi(같은 노트북의 다른 키트)가 바꾼 작업을 지금 작업으로 잡을 때는 시작 시각을 0 으로:
 			//  지금 요청이 그 작업을 연 요청이 아니므로 새 요청의 규칙(keepsTask)으로 같은 작업인지 가린다
@@ -1908,7 +2027,7 @@ export default function (pi: ExtensionAPI) {
 			const done = (cur()?.items || []).filter((it) => it.level === 0).flatMap((it, i) => (it.status === "done" ? [i + 1] : []));
 			[planDoc, planReq] = ["", ""];
 			await toExecuteModel(ctx);
-			g.__piPlanFreshSend = userAsk(proceedText(hand.n, "auto", hand.doc, done, hand.plan, "fresh"), `(계획대로 진행, 새 대화, ${hand.n}단계)`);
+			g.__piPlanFreshSend = userAsk(proceedText(hand.n, "auto", hand.doc, done, hand.plan, "fresh", hand.task.items), `(계획대로 진행, 새 대화, ${hand.n}단계)`);
 		}
 		showSteps(ctx);
 	});
@@ -1917,13 +2036,46 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", async (event: any, ctx: any) => {
 		const text = String(event.text || "");
 		if (text.startsWith("/")) return;
-		if (lastWhereKey !== todoWhere().key) await syncBoard(ctx);
+		// 다른 pi 가 같은 작업판에서 리뷰 결과를 썼을 수 있으므로 지금 작업이 있을 때 사용자 요청마다 다시 읽는다.
+		// /todo clear 직후에는 다른 예전 작업을 임의로 지금 작업으로 잡지 않는다.
+		if (event.source !== "extension" && curId && lastWhereKey === todoWhere().key) {
+			try {
+				await loadBoardHere(workDir());
+				showSteps(ctx);
+			} catch {}
+		} else if (lastWhereKey !== todoWhere().key) await syncBoard(ctx, event.source !== "extension");
 		if (event.source !== "extension" && text.trim()) {
 			[lastReq, lastInputAt] = [cut(text.trim().split("\n")[0], 100), Date.now()];
 			[workSince, listTouched, bounced, gateTries, gateOff] = [0, false, false, 0, false];
 			sameEditByPath.clear();
 		}
 		const t = cur();
+		if (event.source !== "extension" && text.trim() && t?.source === "plan" && t.gate && t.gate.state !== "wait" && gateMine(t)) {
+			const sig = `${t.id}:${t.gate.step}:${t.gate.state}:${t.gate.at}`;
+			if (sig !== gateIntro) {
+				gateIntro = sig;
+				let note = t.gate.state === "ok" && t.range
+					? `[리뷰 통과] 새 범위 ${t.range.from}~${t.range.to}단계만 진행하세요.`
+					: t.gate.state === "ok"
+					? `[리뷰 통과] ${t.gate.step}단계: 이 단계의 변경을 커밋한 뒤 ${topIndexes(t)[t.gate.step] === undefined ? "작업을 마치세요" : `${t.gate.step + 1}단계로 진행하세요`}.`
+					: `[리뷰: 고칠 것] ${t.gate.step}단계, 리뷰 글: ${t.gate.note || "(경로 없음)"}`;
+				if (t.gate.state === "fix" && t.gate.note) {
+					try {
+						const b = await readTarget(target(t.gate.note));
+						if (b) note += `\n\n리뷰 글 앞부분:\n${b.toString("utf8").slice(0, 4000)}`;
+					} catch {}
+				}
+				if (t.gate.state === "ok" && !t.range && topIndexes(t)[t.gate.step] === undefined) {
+					await edit(ctx, (b) => {
+						const x = b.tasks.find((y) => y.id === t.id);
+						if (!x) return false;
+						delete x.gate;
+						finishIfDone(x, Date.now());
+					});
+				}
+				return transformInput(text, `${note}\n\n${text}`);
+			}
+		}
 		if (event.source !== "extension" && t && !isOpen(t)) {
 			curId = null; // 끝난 작업은 화면에서 닫음 (작업판에는 완료로 남음)
 			showSteps(ctx);
@@ -1962,6 +2114,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		const tool = String(event.toolName || "");
 		const input = event.input || {};
+		const waiting = cur();
+		if (waiting?.source === "plan" && waiting.gate?.state === "wait" && gateMine(waiting) && changesThings(tool, input)) {
+			return { block: true, reason: `${waiting.range ? `지정한 범위(${waiting.range.from}~${waiting.range.to}단계까지)가 끝남. ` : ""}${waiting.gate.step}단계 리뷰를 기다리는 중: 다음 단계로 가지 말고, ${waiting.gate.step}단계에서 한 것을 짧게 정리하고 멈추세요.` };
+		}
 		if (tool === "edit") {
 			const edits: any[] = Array.isArray(input.edits) ? [...input.edits] : [];
 			if (input.oldText !== undefined || input.newText !== undefined) edits.push({ oldText: input.oldText, newText: input.newText });
@@ -2076,6 +2232,15 @@ export default function (pi: ExtensionAPI) {
 	// 요청이 끝났는데 일을 한 뒤로 목록을 고치지 않았으면 표시만 맞추게 한 번 돌려보냄. 완료 점검·목표 확인과 함께 보내지 않게 hooks.ts 가 그 뒤에 부름 (확장을 다시 불러오면 새 것으로 바뀜).
 	//  이 요청이 그 목록의 일일 때만 (목록을 고쳤거나, 승인·이어서로 진행). 다른 일을 시킨 요청, Esc·오류·거부로 멈춘 요청, 계획 모드, 리뷰, 화면이 없는 실행은 하지 않음
 	(globalThis as any).__piTodoBounce = (ctx: any) => {
+		const waiting = cur();
+		if (waiting?.source === "plan" && waiting.gate?.state === "wait" && gateMine(waiting) && ctx?.hasUI) {
+			const sig = `${waiting.id}:${waiting.gate.step}:${waiting.gate.at}`;
+			if (gateNotice !== sig) {
+				gateNotice = sig;
+				ctx.ui.notify(`${waiting.gate.step}단계 끝: PC 에서 /review 로 리뷰해 주세요 (통과해야 다음 단계로). 건너뛰려면 /review 건너뛰기`, "info");
+			}
+			return true;
+		}
 		if (bounced || lastEnd !== "stop" || workSince < 1 || !ctx?.hasUI || mode === "plan" || review || (globalThis as any).__piReview) return;
 		const t = cur();
 		if (!t?.items.length || !isOpen(t) || todoSummary(t).all || !(listTouched || curSince >= lastInputAt) || !todoEnforce()) return;
@@ -2087,11 +2252,17 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	/** 작업을 지금 작업으로 되돌려 이어서 보냄 (하던 작업은 쉬는 중으로). /todo 이어서, /planauto */
-	const resumeTask = async (ctx: any, t: Task, extra = "") => {
+	const resumeTask = async (ctx: any, t: Task, extra = "", range?: Task["range"]) => {
 		const now = Date.now();
 		await edit(ctx, (b) => {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
+			if (range) {
+				passReviewGate(x, now, "새 범위");
+				x.range = range;
+				for (const it of x.items) if (it.status === "doing") it.status = "todo";
+				reopenStep(x, range.from, now);
+			}
 			const old = curId && curId !== x.id ? b.tasks.find((y) => y.id === curId) : undefined;
 			if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped] = ["paused", null];
 			[x.state, x.closed, x.stopped, x.updated] = ["doing", null, null, now];
@@ -2293,7 +2464,18 @@ export default function (pi: ExtensionAPI) {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
 			const now = Date.now();
-			for (const n of marks) if (stepDone(x, n, now)) changed = true;
+			for (const n of marks) {
+				if (x.gate?.state === "wait" || (x.range && (n < x.range.from || n > x.range.to))) continue;
+				const saved = x.range ? x.items.map(it => ({ ...it })) : null;
+				const done = stepDone(x, n, now);
+				if (saved) preserveOutsideRange(x, saved);
+				if (done) changed = true;
+				if (gateAt(x, n, reviewGateEnabled()) && (done || (x.gate?.state === "fix" && x.gate.step === n))) {
+					waitReviewGate(x, x.range?.to ?? n, now);
+					changed = true;
+					break;
+				}
+			}
 			if (!changed) return false;
 			finishIfDone(x, now);
 		});
@@ -2437,7 +2619,7 @@ export default function (pi: ExtensionAPI) {
 				await toExecuteModel(ctx);
 				listUpdated();
 				bounced = false;
-				pi.sendUserMessage(userAsk(proceedText(found.length, next, doc, done, plan, how), `(계획대로 진행, ${found.length}단계${how === "edit" ? ", 고친 계획" : ""})`));
+				pi.sendUserMessage(userAsk(proceedText(found.length, next, doc, done, plan, how, task.items), `(계획대로 진행, ${found.length}단계${how === "edit" ? ", 고친 계획" : ""})`));
 			} catch (e) {
 				// 여기서 던지면 처리되지 않은 오류로 pi 가 꺼질 수 있음
 				try {
@@ -2456,10 +2638,10 @@ export default function (pi: ExtensionAPI) {
 		r.answer = ""; // 한 번만
 		if (r.kind === "verify") {
 			r.verified = answer;
-			if (verifyClean(answer)) return ctx.ui.notify(`확인(${r.checker}): 리뷰에서 찾은 것 가운데 고칠 것이 없습니다 (확인 답을 보세요)`, "info");
+			if (verifyClean(answer) && !r.gate) return ctx.ui.notify(`확인(${r.checker}): 리뷰에서 찾은 것 가운데 고칠 것이 없습니다 (확인 답을 보세요)`, "info");
 		} else {
 			r.found = answer;
-			if (reviewClean(answer)) return ctx.ui.notify(`리뷰(${r.who}): 문제 없음${r.prev ? ` · 원래 모델 ${r.prev.id} 로 돌아왔습니다` : ""}`, "info");
+			if (reviewClean(answer) && !r.gate) return ctx.ui.notify(`리뷰(${r.who}): 문제 없음${r.prev ? ` · 원래 모델 ${r.prev.id} 로 돌아왔습니다` : ""}`, "info");
 		}
 		setTimeout(() => reviewAsk(ctx, r).catch(() => {}), 0);
 	});
@@ -2470,8 +2652,43 @@ export default function (pi: ExtensionAPI) {
 		const VERIFY = `다시 확인하기 (찾은 것이 맞는지 ${now} 로 코드만 확인, 고치지 않음)`;
 		const MR = "MR 댓글 글로 저장 (파일로만, 올리지 않음)";
 		const KEEP = "그대로 두기 (나중에 직접)";
+		const PASS = "통과 (개발 쪽이 다음 단계로)";
+		const FINDINGS = "고칠 것 있음 (리뷰 글을 개발 쪽에 넘김)";
 		const title = r.verified ? `확인(${r.checker}) 결과대로 고칠까요?` : `리뷰(${r.who})에서 찾은 것을 고칠까요?`;
-		const pick = await ctx.ui.select(title, [FIX, ...(r.verified ? [] : [VERIFY]), ...(saved ? [] : [MR]), KEEP]);
+		const pick = await ctx.ui.select(title, [...(r.gate ? [PASS, FINDINGS] : []), FIX, ...(r.verified ? [] : [VERIFY]), ...(saved ? [] : [MR]), KEEP]);
+		if (pick === PASS && r.gate) {
+			await edit(ctx, (b) => {
+				const t = b.tasks.find((x) => x.id === r.gate!.taskId);
+				return t ? void passReviewGate(t, Date.now(), r.who) : false;
+			});
+			return ctx.ui.notify(`작업 #${r.gate.no}의 ${r.gate.step}단계 리뷰를 통과시켰습니다. 개발 쪽의 다음 요청에서 이어집니다`, "info");
+		}
+		if (pick === FINDINGS && r.gate) {
+			const path = `docs/reviews/작업${r.gate.no}-${r.gate.step}단계.md`;
+			try {
+				const body = [
+					`# 작업 ${r.gate.no} · ${r.gate.step}단계 리뷰`,
+					"",
+					`단계: ${r.gate.text}`,
+					`리뷰: ${r.who}`,
+					"",
+					(r.verified || r.found).trim(),
+					"",
+				].join("\n");
+				await writeTarget(target(path), Buffer.from(body, "utf8"));
+				await edit(ctx, (b) => {
+					const t = b.tasks.find((x) => x.id === r.gate!.taskId);
+					if (!t?.gate || t.gate.step !== r.gate!.step) return false;
+					t.gate = { step: r.gate!.step, state: "fix", at: Date.now(), by: r.who, note: path, ...(t.gate.holder ? { holder: t.gate.holder } : {}) };
+					t.state = "doing";
+					t.closed = null;
+					reopenStep(t, r.gate!.step, Date.now());
+				});
+				return ctx.ui.notify(`리뷰 글을 ${path}에 저장하고 개발 쪽에 고칠 것으로 넘겼습니다`, "info");
+			} catch (e) {
+				return ctx.ui.notify(`리뷰 글을 넘기지 못했습니다: ${(e as Error).message}`, "warning");
+			}
+		}
 		if (pick === FIX) return void pi.sendUserMessage(userAsk(r.verified ? REVIEW_FIX_VERIFIED : REVIEW_FIX, "(리뷰대로 고치기)"));
 		if (pick === VERIFY) {
 			review = { ...r, phase: "running", kind: "verify", prev: null, checker: now, wantId: "", tools: 0, max: VERIFY_TOOLS_MAX, statusUrl: "", answer: "" };
@@ -2580,7 +2797,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"지금 작업의 할 일 목록을 만들거나 고친다 (사용자가 입력창 위와 브라우저에서 진행을 본다). text 에 목록 전체를 한 줄에 하나씩: " +
 			"'- [ ] 할 일', '- [~] 하는 중', '- [x] 끝남', 하위 단계는 두 칸 들여 쓴다. 고칠 때도 목록 전체를 다시 보낸다 (시작·끝 시각은 pi 가 적음). " +
-			"지금 작업의 목록만 고친다: 쉬는 중인 다른 작업(#N)은 사용자가 /todo 이어서 N · /todo 완료 N · /todo 폐기 N 으로 바꾸니, 그 일을 부탁받으면 이 명령을 알려 준다",
+			"지금 작업의 목록만 고친다: 쉬는 중인 다른 작업(#N)은 사용자가 /todo 이어서 N [범위] [덧붙일 말] · /todo 완료 N · /todo 폐기 N 으로 바꾸니, 그 일을 부탁받으면 이 명령을 알려 준다",
 		promptSnippet: "여러 단계 작업의 할 일 목록(단계·하위 단계와 진행 상태)을 만들고 고치기",
 		promptGuidelines: [TODO_GUIDE],
 		parameters: Type.Object({ text: Type.String({ description: "할 일 목록 전체 ('- [ ] …' 한 줄에 하나, 하위 단계는 두 칸 들여 씀)" }) }),
@@ -2596,6 +2813,7 @@ export default function (pi: ExtensionAPI) {
 			const w = todoWhere();
 			const t0 = cur();
 			const prev = here(t0) ? t0 : null;
+			if (prev?.gate?.state === "wait" && gateMine(prev)) return reply("리뷰 대기 중입니다. 목록을 바꾸지 말고 멈추세요.");
 			const open = !!prev && isOpen(prev) && !todoSummary(prev).all;
 			// 사용자가 새 요청을 보내기 전 (계획을 승인하거나 /todo 이어서 한 그 요청 안)
 			const sameReq = !!prev && curSince >= lastInputAt;
@@ -2605,7 +2823,7 @@ export default function (pi: ExtensionAPI) {
 			// 진행 중인 승인한 계획: 같은 단계 수일 때만 진행을 받고 글은 계획대로 (다르면 그대로 두고 고치는 법을 알림).
 			//  그 계획을 진행하는 요청 안이거나, 새 요청 뒤라도 계획의 글·앞서 받은 모델의 글(alias)로 남은 단계를 이어 갈 때.
 			//  그렇지 않은 새 요청 뒤의 목록(급한 일로 바꿈 등)은 새 작업
-			const plan = keeps && prev?.source === "plan" && (same || overlapsTask(prev, lines)) ? prev : null;
+			const plan = prev?.range || (keeps && prev?.source === "plan" && (same || overlapsTask(prev, lines))) ? prev : null;
 			let alias: string[] = [];
 			if (plan) {
 				const fit = fitPlan(plan, lines);
@@ -2615,15 +2833,32 @@ export default function (pi: ExtensionAPI) {
 			}
 			const meta = { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq };
 			const next = mergeTodo(prev, lines, Date.now(), { ...meta, source: prev?.source === "plan" ? "plan" : "todo" });
+			if (prev?.range) {
+				const tops = topIndexes(prev);
+				for (let n = 0; n < tops.length; n++) if (n + 1 < prev.range.from || n + 1 > prev.range.to) {
+					for (let i = tops[n]; i < (tops[n + 1] ?? prev.items.length); i++) next.items[i] = { ...prev.items[i] };
+				}
+			}
+			const beforeTop = prev?.items.filter((it) => it.level === 0).map((it) => it.status) || [];
+			const afterTop = next.items.filter((it) => it.level === 0).map((it) => it.status);
+			const gateStep = prev?.source === "plan" && (prev.range || reviewGateEnabled())
+				? afterTop.findIndex((status, i) => status === "done" && gateAt({ ...prev!, items: next.items }, i + 1, reviewGateEnabled()) && (beforeTop[i] !== "done" || (prev.gate?.state === "fix" && prev.gate.step === i + 1))) + 1
+				: 0;
 			// 겹치는 단계가 없거나 남은 단계를 이어 가지 않는 목록: 사용자가 새 요청을 보낸 뒤면 새 작업 (하던 작업은 쉬는 중으로 작업판에 남음),
 			//  같은 요청 안이면 같은 작업을 바꿔 씀 (막 끝낸 목록에 단계를 더하면 그 작업을 다시 엶. 끝난 작업은 다음 요청 때 지금 작업에서 빠짐)
 			let paused: Task | null = null;
 			let mixed = false;
-			const sameTask = !!prev && (sameReq || (next.updates > 1 && keeps));
+			const sameTask = !!prev && (!!prev.range || sameReq || (next.updates > 1 && keeps));
 			if (sameTask) await updateTask(ctx, next, alias);
 			else {
 				mixed = !!prev && next.updates > 1; // 앞 작업의 단계를 섞어 보냄
 				paused = await newTask(ctx, mergeTodo(null, lines, Date.now(), { ...meta, source: "todo" }));
+			}
+			if (sameTask && gateStep > 0) {
+				await edit(ctx, (b) => {
+					const x = curId ? b.tasks.find((y) => y.id === curId) : undefined;
+					return x ? void waitReviewGate(x, x.range?.to ?? gateStep, Date.now()) : false;
+				});
 			}
 			listUpdated();
 			const s = todoSummary(cur());
@@ -2662,8 +2897,14 @@ export default function (pi: ExtensionAPI) {
 				const t = sub === "clear" || sub === "지우기" ? cur() : byNo();
 				if (!t) return ctx.ui.notify(sub === "clear" || sub === "지우기" ? "지금 작업이 없습니다 (/todo 로 진행 중 작업)" : `작업 #${n0 || "?"} 이(가) 작업판에 없습니다. ${usage}`, "warning");
 				if (sub === "이어서" || sub === "계속" || sub === "resume") {
-					if (!here(t)) return ctx.ui.notify(`작업 #${t.no} 은(는) 다른 폴더의 작업입니다 (${t.project}: ${t.cwd}). 그 폴더에서 pi 를 켜고 /todo 이어서 ${t.no}`, "warning");
-					return await resumeTask(ctx, t, more.join(" "));
+					if (!here(t)) {
+						// 폴더는 같은데 위치(노트북 작업인지)만 다름: 이 pi 가 노트북에서 도는 것을 알아보지 못함 (2026-11-17 회사 보고)
+						const hint = t.cwd.replace(/\\/g, "/").replace(/\/+$/, "") === todoWhere().cwd.replace(/\\/g, "/").replace(/\/+$/, "") ? " 같은 폴더인데 이 pi 가 노트북 작업으로 알아보지 못했습니다: pi 를 끄고 다시 켜 보세요 (~/tools/pi/bin/pi)." : "";
+						return ctx.ui.notify(`작업 #${t.no} 은(는) 다른 폴더의 작업입니다 (${t.project}: ${t.cwd}). 그 폴더에서 pi 를 켜고 /todo 이어서 ${t.no}.${hint}`, "warning");
+					}
+					const parsed = resumeRange(t, more.join(" "));
+					if (parsed.error) return ctx.ui.notify(parsed.error, "warning");
+					return await resumeTask(ctx, t, parsed.extra, parsed.range);
 				}
 				const drop = sub !== "완료" && sub !== "done";
 				await setTaskState(ctx, t, drop ? "dropped" : "done");
@@ -2677,7 +2918,8 @@ export default function (pi: ExtensionAPI) {
 			const line = (t: Task) => {
 				const s = todoSummary(t);
 				const where = here(t) ? "" : ` · ${t.project}`;
-				return `${t.id === curId ? "▶" : " "} #${t.no} ${cut(t.request || "(요청 글 없음)", 40)} — ${t.source === "plan" ? "계획" : "할 일"} ${s.done}/${s.total} · ${t.id === curId ? "지금 작업" : t.state === "paused" ? "쉬는 중" : "하는 중"}${where}`;
+				const gate = t.gate ? ` · ${t.gate.state === "wait" ? "리뷰 대기" : t.gate.state === "fix" ? "리뷰에서 고칠 것" : "리뷰 통과"} (${t.gate.step}단계${t.gate.by ? ` · ${t.gate.by}` : ""})` : "";
+				return `${t.id === curId ? "▶" : " "} #${t.no} ${cut(t.request || "(요청 글 없음)", 40)} — ${t.source === "plan" ? "계획" : "할 일"} ${s.done}/${s.total} · ${t.id === curId ? "지금 작업" : t.state === "paused" ? "쉬는 중" : "하는 중"}${gate}${rangeLabel(t)}${where}`;
 			};
 			ctx.ui.notify(
 				open.length
@@ -2733,17 +2975,19 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const who = String(use?.name || use?.id || "지금 모델");
+		const task = waitingGate();
+		const gate = task?.gate?.state === "wait" ? { taskId: task.id, no: task.no, step: task.gate.step, text: gateStepText(task) } : undefined;
 		// 중계 서버(이 PC 의 127.0.0.1)면 리뷰 뒤 /status 로 그 모델을 실제로 골랐는지 본다 (API 키트의 vLLM 등은 보지 않음)
 		let statusUrl = "";
 		try {
 			const u = new URL(String(use?.baseUrl || ""));
 			if (/^(127\.0\.0\.1|localhost)$/.test(u.hostname)) statusUrl = `${u.origin}/status?session=${encodeURIComponent(SESSION)}`;
 		} catch {}
-		review = { phase: "running", kind: "review", prev, who, wantId: String(use?.id || ""), tools: 0, max: REVIEW_TOOLS_MAX, statusUrl, answer: "", focus, found: "", verified: "", checker: "" };
+		review = { phase: "running", kind: "review", prev, who, wantId: String(use?.id || ""), tools: 0, max: REVIEW_TOOLS_MAX, statusUrl, answer: "", focus, found: "", verified: "", checker: "", gate };
 		// 다른 확장도 리뷰 중임을 봄: guard·hooks 는 묻지 않고(막는 것은 여기서), 완료 점검·사용량 제한 뒤 자동 다시 시도는 하지 않음
 		(globalThis as any).__piReview = "running";
 		ctx.ui.notify(`${who} 로 리뷰합니다${fresh ? " (새 대화)" : ""}${prev ? ` (끝나면 ${prev.id} 로 돌아옵니다)` : ""}. 리뷰하는 동안은 파일을 바꾸지 않습니다`, "info");
-		return userAsk(reviewPrompt(scan, who, focus, fresh), `(리뷰${fresh ? ", 새 대화" : ""}: ${who}${focus ? ` · ${focus}` : ""})`);
+		return userAsk(reviewPrompt(scan, who, focus, fresh, gate), `(리뷰${fresh ? ", 새 대화" : ""}: ${who}${focus ? ` · ${focus}` : ""})`);
 	}
 	// /review --new 로 넘긴 리뷰: 새 세션을 열면 pi 가 확장을 새로 불러오므로 리뷰 모델·상태는 새 확장(여기)에서 정하고, 보내기는 withSession 이
 	pi.on("session_start", async (event: any, ctx: any) => {
@@ -2760,6 +3004,16 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.isIdle()) return ctx.ui.notify("pi 가 일하는 중입니다. 지금 요청이 끝난 뒤 다시 /review 해 주세요", "warning");
 			if (review?.phase === "running") return ctx.ui.notify("리뷰가 이미 진행 중입니다", "info");
 			let focus = String(args || "").trim();
+			await syncBoard(ctx, true);
+			if (/^(건너뛰기|skip)$/i.test(focus)) {
+				const task = waitingGate();
+				if (!task) return ctx.ui.notify("지금 폴더에 리뷰를 기다리는 단계가 없습니다", "warning");
+				await edit(ctx, (b) => {
+					const t = b.tasks.find((x) => x.id === task.id);
+					return t ? void passReviewGate(t, Date.now(), "건너뜀") : false;
+				});
+				return ctx.ui.notify(`${task.gate!.step}단계 리뷰 관문을 건너뛰었습니다. 다음 요청에서 이어집니다`, "info");
+			}
 			const fresh = /^(--new|새 ?대화)(\s|$)/.test(focus);
 			if (fresh) focus = focus.replace(/^(--new|새 ?대화)\s*/, "");
 			// 바뀐 내용을 먼저 모은다 (모델을 바꾸기 전에: 여기서 실패해도 모델은 그대로)

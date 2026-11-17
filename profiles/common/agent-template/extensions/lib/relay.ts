@@ -83,7 +83,10 @@ export const NB_PY = `{ p="$(command -v python3 || command -v python)"; [ -n "$p
 export const nbUpload = (wd: WorkDir = workDir()) =>
 	`${wd.remote ? wd.home || "/home/jovyan" : homedir().split("\\").join("/")}/.pi/agent/.pi-upload-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
 /** 같은 PVC를 쓰는 노트북 실행인지. 브리지는 remote, API 키트는 실행기가 PI_API_KIT=1 로 밝힌다. */
-export const notebookMode = (wd: WorkDir = workDir()) => !!wd.remote || process.env.PI_API_KIT === "1";
+/** 노트북(Kubeflow) 안에서 도는 pi 인지: API 키트 실행기(bin/pi)의 PI_API_KIT=1, 없으면 Kubeflow 가 노트북 파드에 넣는 NB_PREFIX.
+ *  (업데이트 전에 켠 pi 가 /new·/reload 로 새 확장만 불러왔거나, 다른 실행기로 켰을 때도 노트북으로 알아보게. PC 에는 NB_PREFIX 가 없음) */
+export const onNotebook = () => process.env.PI_API_KIT === "1" || !!process.env.NB_PREFIX;
+export const notebookMode = (wd: WorkDir = workDir()) => !!wd.remote || onNotebook();
 export const notebookHome = (wd: WorkDir = workDir()) => wd.remote ? wd.home || "/home/jovyan" : homedir().split("\\").join("/");
 /** pi 설정 안에서도 두 키트가 함께 써야 하는 파일. 일반 target()은 jupyter의 설정 경로를 PC로 보내므로 이 용도에는 이 함수를 쓴다. */
 export function notebookTarget(path: string, wd: WorkDir = workDir()): Target {

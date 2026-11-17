@@ -330,6 +330,189 @@ async function doctorLines(): Promise<string[]> {
 	return [head, ...body.map((l) => " " + l)];
 }
 
+// ── /doctor 도구: API 키트에서 LLM 서버의 도구 호출을 진단 ───────────────────────────────────────────
+
+/** JSON 문자열을 안전히 파싱 */
+function safeJson(s: string): any {
+	try {
+		return JSON.parse(s);
+	} catch {
+		return undefined;
+	}
+}
+
+/** 답 글에 도구 호출처럼 보이는 패턴이 있는지 */
+function looksLikeToolCall(text: string): boolean {
+	if (!text) return false;
+	return text.includes("<tool_call>") || text.includes("<function=") || /"name"\s*:\s*"get_time"/.test(text);
+}
+
+/** 응답 앞부분에서 비밀처럼 보이는 글을 가림 */
+function maskSecrets(s: string): string {
+	if (!s) return "";
+	return s
+		.replace(/Bearer\s+\S+/gi, "Bearer ***")
+		.replace(/[a-f0-9]{32,}/gi, "***")
+		.replace(/sk-[a-z0-9_\-]+/gi, "***")
+		.slice(0, 200);
+}
+
+/** 지금 모델의 서버 정보를 models.json 에서 찾음 */
+function loadModelInfo(ctx: any): { provider: string; id: string; baseUrl: string; apiKey: string; model: any; compat: any } | null {
+	const cfg = safeJson(read(join(agentDir, "models.json")));
+	if (!cfg?.providers) return null;
+	let provider = String(ctx?.model?.provider || "");
+	let id = String(ctx?.model?.id || "");
+	if (!provider || !id) {
+		const settings = safeJson(read(join(agentDir, "settings.json")));
+		provider = provider || String(settings?.defaultProvider || "");
+		id = id || String(settings?.defaultModel || "");
+	}
+	const pcfg = cfg.providers[provider];
+	if (!pcfg) return null;
+	const models = Array.isArray(pcfg.models) ? pcfg.models : [];
+	const model = models.find((m: any) => String(m?.id || "") === id) || { id };
+	let apiKey = String(pcfg.apiKey || "");
+	if (/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(apiKey)) apiKey = process.env[apiKey.slice(1)] || "";
+	return { provider, id, baseUrl: String(pcfg.baseUrl || ""), apiKey, model, compat: pcfg.compat || {} };
+}
+
+/** 도구 호출 probe: 요청 하나를 보내고 choices[0] 까지 반환 */
+async function probeToolCall(baseUrl: string, apiKey: string, modelId: string, toolChoice: "auto" | "required", timeoutMs: number) {
+	const url = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+	const body = {
+		model: modelId,
+		messages: [
+			{ role: "system", content: "사용자가 부탁한 일은 도구를 불러 처리하세요." },
+			{ role: "user", content: "지금 시각을 get_time 도구로 알아봐 주세요. 글로 답하지 말고 도구를 부르세요." },
+		],
+		tools: [
+			{
+				type: "function",
+				function: {
+					name: "get_time",
+					description: "Returns the current time",
+					parameters: {
+						type: "object",
+						properties: { tz: { type: "string", description: "timezone (optional)" } },
+						required: [],
+					},
+				},
+			},
+		],
+		tool_choice: toolChoice,
+		temperature: 0,
+		max_tokens: 512,
+	};
+	const headers: Record<string, string> = { "Content-Type": "application/json" };
+	if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+	const ac = new AbortController();
+	const t = setTimeout(() => ac.abort(), timeoutMs);
+	try {
+		const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: ac.signal });
+		const text = await res.text();
+		clearTimeout(t);
+		let json: any = null;
+		try {
+			json = text ? JSON.parse(text) : null;
+		} catch {}
+		return { ok: res.ok, status: res.status, statusText: res.statusText, text, json, choice: json?.choices?.[0] };
+	} catch (e) {
+		clearTimeout(t);
+		const aborted = ac.signal.aborted;
+		return {
+			ok: false,
+			status: 0,
+			statusText: aborted ? "시간 초과" : "요청 실패",
+			text: "",
+			json: null,
+			choice: undefined,
+			error: aborted ? `시간 초과 (${timeoutMs}ms)` : `요청 실패: ${(e as Error).message}`,
+		};
+	}
+}
+
+function classifyToolCall(choice: any) {
+	const message = choice?.message || {};
+	const content = String(message.content || "");
+	const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+	let reasoning = "생각 글 없음";
+	if (message.reasoning_content || message.reasoning) reasoning = "생각 글 따로 옴";
+	else if (/<\/?think(?:ing)?>/i.test(content)) reasoning = "생각 글이 답에 섞임 (vLLM --reasoning-parser 또는 models.json reasoning·thinkingFormat 확인)";
+
+	const getTime = toolCalls.find((c: any) => String(c?.function?.name || c?.name || "") === "get_time");
+	if (getTime) {
+		const args = String(getTime.function?.arguments ?? getTime.arguments ?? "");
+		return { verdict: safeJson(args) ? "도구 호출 정상" : "인자 JSON 이 깨짐", reasoning, needRequired: false };
+	}
+	if (looksLikeToolCall(content)) {
+		return {
+			verdict:
+				"도구 호출이 글로 샘: vLLM 을 --enable-auto-tool-choice --tool-call-parser <모델에 맞는 파서> 로 띄웠는지 운영 쪽에 확인 (Qwen 계열 예: hermes, Qwen3-Coder 계열 예: qwen3_coder)",
+			reasoning,
+			needRequired: false,
+		};
+	}
+	return { verdict: "(글만 옴)", reasoning, needRequired: true };
+}
+
+function classifyRequired(choice: any) {
+	const message = choice?.message || {};
+	const content = String(message.content || "");
+	const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+	let reasoning = "생각 글 없음";
+	if (message.reasoning_content || message.reasoning) reasoning = "생각 글 따로 옴";
+	else if (/<\/?think(?:ing)?>/i.test(content)) reasoning = "생각 글이 답에 섞임 (vLLM --reasoning-parser 또는 models.json reasoning·thinkingFormat 확인)";
+	const getTime = toolCalls.find((c: any) => String(c?.function?.name || c?.name || "") === "get_time");
+	return {
+		verdict: getTime ? "강제하면 부름: 모델이 스스로 도구를 잘 고르지 않음 (하네스 쪽)" : "강제해도 안 부름: 서버의 도구 호출이 꺼져 있을 수 있음",
+		reasoning,
+	};
+}
+
+/** /doctor 도구 — API 키트에서 LLM 서버의 도구 호출을 진단 */
+export async function diagnoseToolCalling(ctx: any): Promise<string[]> {
+	const head = `── 도구 호출 진단 (버전 ${version()}) ── 닫기: /doctor 다시 입력 또는 요청 보내기`;
+	if (isBridge()) return [head, " Copilot 중계 서버를 쓰는 중이라 해당 없음"];
+	const info = loadModelInfo(ctx);
+	if (!info) return [head, " 지금 모델을 ~/.pi/agent/models.json 에서 찾지 못했습니다. /model 로 모델을 고르거나 설정 파일을 확인하세요."];
+	const lines: string[] = [head];
+	lines.push(` 모델: ${info.provider} / ${info.id}`);
+	lines.push(` 주소: ${info.baseUrl}`);
+	lines.push(` 키: ${info.apiKey && info.apiKey !== "EMPTY" ? "있음 (화면에 안 찍음)" : info.apiKey === "EMPTY" ? "없음 (EMPTY)" : "없음"}`);
+	const reasoningCfg = info.model?.reasoning ?? "(없음)";
+	const thinkingFormat = info.compat?.thinkingFormat ?? "(없음)";
+	lines.push(` 생각 글 설정: models.json reasoning=${reasoningCfg}, compat.thinkingFormat=${thinkingFormat}`);
+	const t0 = Date.now();
+	const r1 = await probeToolCall(info.baseUrl, info.apiKey, info.id, "auto", 60000);
+	lines.push(` 시간: ${Date.now() - t0}ms`);
+	if (!r1.ok || !r1.choice) {
+		lines.push(` 요청 1 (tool_choice=auto): ${r1.error || `HTTP ${r1.status} ${r1.statusText}`}`);
+		lines.push(`  → 응답: ${maskSecrets(r1.text) || "(없음)"}`);
+	} else {
+		const c1 = classifyToolCall(r1.choice);
+		lines.push(` 요청 1 (tool_choice=auto): ${c1.verdict}`);
+		lines.push(` 생각 글: ${c1.reasoning}`);
+		if (c1.needRequired) {
+			const r2 = await probeToolCall(info.baseUrl, info.apiKey, info.id, "required", 60000);
+			if (!r2.ok || !r2.choice) {
+				lines.push(` 요청 2 (tool_choice=required): ${r2.error || `HTTP ${r2.status} ${r2.statusText}`}`);
+				lines.push(`  → 응답: ${maskSecrets(r2.text) || "(없음)"}`);
+			} else {
+				const c2 = classifyRequired(r2.choice);
+				lines.push(` 요청 2 (tool_choice=required): ${c2.verdict}`);
+				lines.push(` 생각 글: ${c2.reasoning}`);
+			}
+		}
+	}
+	let messages: any[] = [];
+	try {
+		messages = ctx?.sessionManager?.buildSessionProjection?.().messages || [];
+	} catch {}
+	lines.push(...summarizeToolUsage(messages));
+	return lines;
+}
+
 // ── 문서 찾기 (docs_lookup 도구, /docs): 설치된 버전의 설명 ───────────────────────────────
 // context7 처럼 모델이 라이브러리 사용법을 추측하지 않게. 사내망이라 인터넷 대신 지금 실행 위치(jupyter 모드면 노트북)에 설치된
 // Python 패키지를 직접 불러와 버전·시그니처·설명·하위 이름을 보고, 문서 폴더(~/pi-docs: 받아 둔 문서 .md·.txt·.html 등)에서 맞는 줄을 더한다.
@@ -875,6 +1058,64 @@ function msgText(m: any): string {
 	if (m?.role === "compactionSummary" || m?.role === "branchSummary") return String(m.summary || "");
 	return parts(m?.content);
 }
+
+/** 세션 메시지에서 도구 호출·실패·반복 등을 집계 (30줄 안쪽) */
+export function summarizeToolUsage(messages: any[]): string[] {
+	let toolCalls = 0;
+	const byName: Record<string, number> = {};
+	let toolErrors = 0;
+	let editNotFoundSame = 0;
+	let argValidationErrors = 0;
+	let kitBlocked = 0;
+	let otherErrors = 0;
+	let answerToolLike = 0;
+	let todoCalls = 0;
+	let stepDone = 0;
+	const callKeys: string[] = [];
+	for (const m of messages || []) {
+		const role = String(m?.role || "");
+		if (role === "assistant") {
+			const text = msgText(m);
+			if (looksLikeToolCall(text)) answerToolLike++;
+			stepDone += (text.match(/\[(\d+)단계 완료\]/g) || []).length;
+			const content = Array.isArray(m.content) ? m.content : [];
+			for (const p of content) {
+				if (p?.type === "toolCall") {
+					toolCalls++;
+					const name = String(p.name || "");
+					byName[name] = (byName[name] || 0) + 1;
+					if (name === "todo") todoCalls++;
+					callKeys.push(`${name}:${JSON.stringify(p.arguments ?? {})}`);
+				}
+			}
+		} else if (role === "toolResult" && m.isError) {
+			toolErrors++;
+			const text = msgText(m);
+			const tn = String(m.toolName || "");
+			if (tn === "edit" && (/찾지 못함/.test(text) || /같은 글/.test(text) || /페이지에 없는 글/.test(text))) {
+				editNotFoundSame++;
+			} else if (/인자|인수|매개변수|schema|validation|필수|required|올바르지 않은|잘못된/.test(text)) {
+				argValidationErrors++;
+			} else if (/리뷰 대기|할 일 목록|계획 모드|위험 명령|확인|거절|막힘|허용하지 않음/.test(text)) {
+				kitBlocked++;
+			} else {
+				otherErrors++;
+			}
+		}
+	}
+	const counts: Record<string, number> = {};
+	for (const k of callKeys) counts[k] = (counts[k] || 0) + 1;
+	const repeats = Object.values(counts).filter((c) => c > 3).length;
+	const top = Object.entries(byName).sort((a, b) => b[1] - a[1]).slice(0, 5);
+	const lines: string[] = [];
+	lines.push("── 세션 집계 ──");
+	lines.push(` 도구 호출: ${toolCalls}회${top.length ? ` (${top.map(([n, c]) => `${n} ${c}회`).join(", ")})` : ""}`);
+	lines.push(` 실패한 도구 결과: ${toolErrors}개 (edit 찾지못함/같은글 ${editNotFoundSame}, 인자검증 ${argValidationErrors}, 키트막음 ${kitBlocked}, 그밖 ${otherErrors})`);
+	lines.push(` 도구처럼 보이는 글 답: ${answerToolLike}개 / 같은 도구·인자 3회 초과 반복: ${repeats}개`);
+	lines.push(` todo 호출: ${todoCalls}회 / 답의 [N단계 완료]: ${stepDone}회`);
+	return lines.slice(0, 30);
+}
+
 const imagesOf = (m: any) => (Array.isArray(m?.content) ? m.content.filter((p: any) => p?.type === "image").length : 0);
 export type CtxInput = {
 	system: string;
@@ -1405,10 +1646,19 @@ export default function (pi: ExtensionAPI) {
 		description: isBridge()
 			? "상태 요약 (버전 번호, Node, 중계 서버, 전용 창, 모델, 최근 요청, 최근 로그). 문제가 생기면 이 화면을 찍어 보내 주세요"
 			: "상태 요약 (버전 번호, pi 폴더, Node). 문제가 생기면 이 화면을 찍어 보내 주세요",
-		handler: async (_args, ctx) => {
+		handler: async (args, ctx) => {
 			if (shown === "doctor") return show(ctx, "doctor", undefined);
+			const sub = String(args || "").trim();
+			if (sub === "도구" || sub === "tools") {
+				if (isBridge()) return show(ctx, "doctor", [`── 도구 호출 진단 (버전 ${version()}) ── 닫기: /doctor 다시 입력 또는 요청 보내기`, " Copilot 중계 서버를 쓰는 중이라 해당 없음"]);
+				ctx.ui.notify("도구 호출 진단 중입니다 (최대 2분)...", "info");
+				show(ctx, "doctor", await diagnoseToolCalling(ctx));
+				return;
+			}
 			ctx.ui.notify("상태를 확인하는 중입니다 (몇 초 걸림)...", "info");
-			show(ctx, "doctor", await doctorLines());
+			const lines = await doctorLines();
+			if (!isBridge()) lines.push("도구 호출 진단: /doctor 도구");
+			show(ctx, "doctor", lines);
 		},
 	});
 	// 요청 때 실제로 보낸 지침: pi 0.87 은 요청 사이에 ctx.getSystemPrompt() 가 기본 지침만 돌려주고, 확장이 before_agent_start 에서 더한 것

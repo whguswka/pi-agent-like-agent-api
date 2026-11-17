@@ -76,6 +76,7 @@ vllm serve <모델> --enable-auto-tool-choice --tool-call-parser <모델에 맞�
 - 파서는 모델 계열마다 다릅니다. 예: Qwen 계열 `hermes`, Llama 3.x `llama3_json`, Mistral `mistral` (vLLM 문서의 'Tool Calling' 에 전체 목록).
 - 꺼져 있으면 pi 가 명령을 실행하지 못하고 글로만 답하거나 오류가 납니다. vLLM 운영 담당에게 위 옵션을 부탁하세요.
 - 작은 모델일수록 도구 호출을 자주 틀립니다. 코딩 작업에는 도구 호출을 잘하는 모델(보통 30B 안팎 이상)을 권합니다.
+- 도구 호출이 이상하면 pi 안에서 `/doctor 도구` 로 서버가 도구를 부르는지 판정해 보세요.
 
 ## 5. 모델·서버 여러 개
 - `models` 에 여러 개를 적으면 `/model`(또는 `Ctrl+L`)에서 고르고, `Ctrl+P` 로 다음 모델로 바꿉니다.

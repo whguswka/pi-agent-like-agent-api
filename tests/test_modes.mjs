@@ -82,6 +82,18 @@ check("번호 붙인 절 안의 계획: '계획' 절 안의 목록이 단계", e
 check("번호가 없으면 계획 아님", m.planSteps("설명만 있는 답입니다.").length === 0);
 check("단계 하나는 계획 아님 (2개 이상부터)", m.planSteps("1. 하나만").length === 1);
 
+// 상세 수행 계획: 설정과 무관하게 저장된 하위 단계로 실행 안내
+const detailPlan = "1. 구현\n   - 바꿀 파일: a.ts\n   - 방법: 함수 추가\n   - 확인: node test.mjs, 종료 0\n   - 끝 조건: 오류 없음\n2. 정리\n   - 하지 말 것: 배포";
+const detailSteps = m.planSteps(detailPlan), detailKids = m.planKids(detailPlan, detailSteps);
+const detailNote = m.planNote("docs/plans", "handoff");
+check("handoff 계획 안내 항목·항상 저장", ["다른(작은) 모델", "바꿀 파일·함수", "핵심 코드 꼴", "실행할 명령과 기대 결과", "끝 조건", "하지 말 것", "계획서는 늘 docs/plans"].every(x=>detailNote.includes(x)) && !detailNote.includes("계획서를 남겨 달라는 요청이면"));
+check("상세 설정 꺼짐: 기존 안내", m.planNote("docs/plans", "").includes("계획서를 남겨 달라는 요청이면") && !m.planNote("docs/plans", "").includes("다른(작은) 모델"));
+check("확인·끝 조건 하위 작업 유지", detailKids[0].some(x=>x.text.startsWith("확인:")) && detailKids[0].some(x=>x.text.startsWith("끝 조건:")) && !detailKids[0].some(x=>x.text.startsWith("바꿀 파일:")));
+const detailItems = detailSteps.flatMap((text,i)=>[{text,level:0,status:"todo"},...detailKids[i]]);
+check("승인·새 대화 계획의 확인 지시",m.proceedText(2,"auto","",[],"","",detailItems).includes("확인 명령을 돌리고 끝 조건을 확인한 뒤에만 [N단계 완료]") && m.proceedText(2,"auto","",[],detailPlan,"fresh").includes("확인 명령을 돌리고"));
+check("일반 계획 진행 글 그대로", !m.proceedText(2,"auto").includes("끝 조건"));
+check("범위 안 단계에만 확인 지시", m.detailCheck(detailItems,{from:1,to:1}).includes("1단계:") && m.detailCheck(detailItems,{from:2,to:2}) === "");
+
 // 바뀐 줄 보기 (확인 모드)
 let d = m.lineDiff("a\nb\nc\n", "a\nB\nc\n");
 check("바뀐 줄만 (- 지움, + 넣음)", d === "(2번째 줄부터)\n- b\n+ B", d);
@@ -1025,6 +1037,17 @@ rmSync(TW, { recursive: true, force: true });
 	if (oldKit === undefined) delete process.env.PI_API_KIT;
 	else process.env.PI_API_KIT = oldKit;
 	const brW = m.todoWhere(wdNb);
+	// 실행기 표시(PI_API_KIT) 없이 Kubeflow 의 NB_PREFIX 만 있어도 노트북 (업데이트 전에 켠 pi, 2026-11-17 회사 보고)
+	const oldKit2 = process.env.PI_API_KIT, oldNb = process.env.NB_PREFIX;
+	delete process.env.PI_API_KIT;
+	process.env.NB_PREFIX = "/notebook/ns/nb";
+	const nbW = m.todoWhere({ remote: false, cwd: "/home/jovyan/work/proj" });
+	const nbKind = m.kitKind();
+	delete process.env.NB_PREFIX;
+	const pcKind = m.kitKind();
+	if (oldNb !== undefined) process.env.NB_PREFIX = oldNb;
+	if (oldKit2 !== undefined) process.env.PI_API_KIT = oldKit2;
+	check("PI_API_KIT 없이 NB_PREFIX 만 있어도 노트북 작업 위치(브리지 jupyter 와 같은 key)·api 키트, 둘 다 없으면 pc", nbW.key === brW.key && nbW.remote && nbKind === "api" && pcKind === "pc", [nbW, nbKind, pcKind]);
 	const pcW = m.todoWhere({ remote: false, cwd: "C:\\Users\\u\\proj" });
 	check("같은 노트북 폴더: API 키트(PI_API_KIT=1)와 브리지 jupyter 가 같은 작업 위치 ('노트북 …', 같은 key)",
 		apiW.key === brW.key && apiW.remote && brW.remote && apiW.cwd === brW.cwd && apiW.project === "노트북 work/proj" && brW.project === apiW.project && !pcW.remote && !pcW.project.startsWith("노트북"), [apiW, brW, pcW]);
@@ -1106,6 +1129,160 @@ rmSync(TW, { recursive: true, force: true });
 		delete globalThis.__piRelayMock;
 		rmSync(nbHome, { recursive: true, force: true });
 	}
+}
+
+// ── 계획 단계 리뷰 관문 (review_gate) ───────────────────────────────────────
+{
+	const GA = mkdtempSync(join(tmpdir(), "modes-review-gate-agent-"));
+	const GP = mkdtempSync(join(tmpdir(), "modes-review-gate-project-"));
+	const oldEnv = [process.env.PI_CODING_AGENT_DIR, process.env.PI_COPILOT_USER_CONFIG];
+	process.env.PI_CODING_AGENT_DIR = GA;
+	process.env.PI_COPILOT_USER_CONFIG = join(GA, "bridge.json");
+	globalThis.__piWorkDir = { remote: false, cwd: GP };
+	const gateMeta = { project: "gate-project", cwd: GP, remote: false, request: "관문 시험", source: "plan" };
+	const resetGateBoard = (now = Date.now()) => {
+		const b = m.emptyBoard();
+		const t = m.addTask(b, m.planTodo(["구현", "시험"], now, gateMeta), now);
+		m.saveBoard(b, now);
+		return t;
+	};
+	const gon = {}, gcmd = {}, gtools = {}, gnotes = [], gwidgets = [], gsent = [];
+	m.default({
+		on: (e, f) => (gon[e] ||= []).push(f), registerCommand: (n, d) => (gcmd[n] = d), registerTool: (d) => (gtools[d.name] = d), sendUserMessage: text => gsent.push(text), setModel: async () => true,
+	});
+	const gctx = { hasUI: true, isIdle: () => true, model: { provider: "x", id: "x" }, modelRegistry: { find: () => undefined }, ui: {
+		notify: (t) => gnotes.push(t), setStatus() {}, setWidget: (_k, v) => gwidgets.push(v), select: async (_t, o) => o[0], confirm: async () => true,
+	} };
+	const gemit = async (name, event = {}) => { let out; for (const f of gon[name] || []) { const x = await f(event, gctx); if (x !== undefined) out = x; } return out; };
+	const ginput = async (text) => { let out = text; for (const f of gon.input || []) { const x = await f({ text: out, source: "interactive" }, gctx); if (x?.action === "transform") out = x.text; } return out; };
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({ review_gate: false }));
+	resetGateBoard(1000);
+	await gemit("agent_start");
+	await gemit("message_end", { message: { role: "assistant", content: "[1단계 완료]", stopReason: "stop" } });
+	check("리뷰 관문 기본 꺼짐: 단계 완료 뒤 gate 없이 예전처럼 다음 단계 진행", !m.loadBoard().tasks[0].gate && m.loadBoard().tasks[0].items.filter((x) => x.level === 0)[1].status === "doing", m.loadBoard().tasks[0]);
+
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({ review_gate: true }));
+	resetGateBoard(2000);
+	await gemit("agent_start");
+	await gemit("message_end", { message: { role: "assistant", content: "[1단계 완료]", stopReason: "stop" } });
+	let gt = m.loadBoard().tasks[0];
+	check("리뷰 관문: 계획의 단계 완료 표식 뒤 작업판에 wait, 다음 단계는 시작하지 않음", gt.gate?.state === "wait" && gt.gate.step === 1 && gt.items.filter((x) => x.level === 0)[1].status === "todo", gt);
+	const blocks = [];
+	for (const [toolName, input] of [["write", { path: "a" }], ["edit", { path: "a" }], ["bash", { command: "npm test" }], ["write", { path: "b" }]]) blocks.push(await gemit("tool_call", { toolName, input }));
+	const reads = [await gemit("tool_call", { toolName: "read", input: { path: "a" } }), await gemit("tool_call", { toolName: "bash", input: { command: "git status" } })];
+	check("리뷰 대기: write·edit·실행 bash는 되풀이해도 계속 막고 읽기는 허용", blocks.every((x) => x?.block && x.reason.includes("1단계 리뷰를 기다리는 중")) && reads.every((x) => x === undefined), { blocks, reads });
+	const bounceGate = globalThis.__piTodoBounce;
+	bounceGate(gctx); bounceGate(gctx);
+	check("리뷰 대기: 요청 끝 알림은 한 번이고 /review·건너뛰기를 안내", gnotes.filter((x) => x.includes("1단계 끝: PC 에서 /review")).length === 1 && gnotes.at(-1).includes("/review 건너뛰기"), gnotes.slice(-3));
+	check("리뷰 대기 표시: 입력창 위 목록과 작업판 HTML", m.todoWidget(gt).includes("리뷰 대기 (1단계)") && m.boardHtml(m.loadBoard(), "x.js").includes("리뷰 대기"), [m.todoWidget(gt).split("\n")[0]]);
+	await gcmd.todo.handler("", gctx);
+	check("리뷰 대기 표시: /todo 목록", gnotes.at(-1).includes("리뷰 대기 (1단계)"), gnotes.at(-1));
+	await gcmd.review.handler("skip", gctx);
+	gt = m.loadBoard().tasks[0];
+	check("/review skip: gate를 ok·건너뜀으로 바꾸고 알림", gt.gate?.state === "ok" && gt.gate.by === "건너뜀" && gnotes.at(-1).includes("건너뛰었습니다"), [gt.gate, gnotes.at(-1)]);
+	const okInput = await ginput("계속");
+	check("다음 요청: 리뷰 통과 안내와 N+1단계 지시를 앞에 붙임", okInput.startsWith("[리뷰 통과] 1단계") && okInput.includes("2단계로 진행") && okInput.endsWith("계속"), okInput);
+
+	const reviewPath = "docs/reviews/작업1-1단계.md";
+	m.editBoard((b) => { const t = b.tasks[0]; t.gate = { step: 1, state: "fix", at: 3000, note: reviewPath }; t.state = "doing"; });
+	mkdirSync(join(GP, "docs", "reviews"), { recursive: true });
+	writeFileSync(join(GP, reviewPath), "첫 지적\n둘째 지적\n");
+	await gemit("agent_start");
+	const fixInput = await ginput("고쳐 줘");
+	check("다음 요청: fix 안내·리뷰 경로·글 앞부분을 붙이고 쓰기는 허용", fixInput.startsWith("[리뷰: 고칠 것] 1단계") && fixInput.includes(reviewPath) && fixInput.includes("첫 지적") && !(await gemit("tool_call", { toolName: "write", input: { path: "a" } }))?.block, fixInput);
+	await gemit("message_end", { message: { role: "assistant", content: "[1단계 완료]", stopReason: "stop" } });
+	check("수정 뒤 같은 단계 완료 표식: 다시 wait", m.loadBoard().tasks[0].gate?.state === "wait", m.loadBoard().tasks[0].gate);
+
+	resetGateBoard(4000);
+	await gemit("agent_start");
+	await gtools.todo.execute("gate-todo", { text: "- [x] 구현\n- [ ] 시험" }, undefined, undefined, gctx);
+	check("todo [x]로 계획 단계 완료: wait", m.loadBoard().tasks[0].gate?.state === "wait", m.loadBoard().tasks[0]);
+	const lastBoard = m.emptyBoard();
+	m.addTask(lastBoard, m.planTodo(["마지막"], 6000, gateMeta), 6000);
+	m.saveBoard(lastBoard, 6000);
+	await gemit("agent_start");
+	await gemit("message_end", { message: { role: "assistant", content: "[1단계 완료]", stopReason: "stop" } });
+	check("마지막 단계도 리뷰를 기다리며 작업을 열린 상태로 둠", m.loadBoard().tasks[0].gate?.state === "wait" && m.loadBoard().tasks[0].state === "doing", m.loadBoard().tasks[0]);
+	await gcmd.review.handler("건너뛰기", gctx);
+	const lastInput = await ginput("마무리해 줘");
+	check("마지막 단계 통과 다음 요청: 커밋·작업 마침 안내 뒤 작업을 닫음", lastInput.includes("변경을 커밋한 뒤 작업을 마치세요") && m.loadBoard().tasks[0].state === "done" && !m.loadBoard().tasks[0].gate, [lastInput, m.loadBoard().tasks[0]]);
+	const oldBoard = m.loadBoard(); delete oldBoard.tasks[0].gate; m.saveBoard(oldBoard, 5000);
+	check("예전 작업판: gate 필드가 없어도 읽음", m.loadBoard().tasks.length === 1 && m.loadBoard().tasks[0].gate === undefined);
+
+	// 단계 범위: 명령 해석과 실제 확장 이벤트
+	const rangeTask = m.addTask(m.emptyBoard(), m.planTodo(["하나", "둘", "셋", "넷"], 1, gateMeta), 1);
+	for (const [word, from, to] of [["3단계",3,3],["3",3,3],["4단계까지",1,4],["~4",1,4],["2-4단계",2,4],["2~4",2,4]]) {
+		const parsed = m.resumeRange(rangeTask, word + " 확인도");
+		check("범위 해석 " + word, parsed.range?.from === from && parsed.range?.to === to && parsed.extra === "확인도");
+	}
+	check("없는 번호·거꾸로·계획 아님 거부", m.resumeRange(rangeTask,"5").error && m.resumeRange(rangeTask,"4~2").error && m.resumeRange({...rangeTask,source:"todo"},"2").error);
+	check("범위 없는 덧붙일 말 유지", m.resumeRange(rangeTask,"로그 확인").extra === "로그 확인" && !m.resumeRange(rangeTask,"로그 확인").range);
+	resetGateBoard(7000); await gemit("agent_start");
+	await gcmd.todo.handler("이어서 1 1-2단계", gctx);
+	await gemit("message_end", {message:{role:"assistant",content:"[1단계 완료]",stopReason:"stop"}});
+	check("범위 중간은 review_gate 켜져도 진행", !m.loadBoard().tasks[0].gate && m.loadBoard().tasks[0].range?.to === 2);
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({review_gate:false}));
+	await gemit("message_end", {message:{role:"assistant",content:"[2단계 완료]",stopReason:"stop"}});
+	check("설정 꺼져도 범위 끝은 대기", m.loadBoard().tasks[0].gate?.state === "wait" && m.loadBoard().tasks[0].gate.step === 2);
+	const blockedRange = await gemit("tool_call", {toolName:"write",input:{path:"a.txt",content:"x"}});
+	check("범위 끝 쓰기 차단 이유", blockedRange?.block && blockedRange.reason.includes("지정한 범위(1~2단계까지)가 끝남"), blockedRange);
+	await gcmd.review.handler("건너뛰기",gctx);
+	check("범위 건너뛰기: 범위 삭제", !m.loadBoard().tasks[0].range && m.loadBoard().tasks[0].gate?.state === "ok");
+	check("끝난 범위 거부", !!m.resumeRange(m.loadBoard().tasks[0],"1~2").error);
+	resetGateBoard(8000); await gemit("agent_start");
+	await gcmd.todo.handler("이어서 1 2",gctx);
+	check("시작 앞의 미완료 보존", m.loadBoard().tasks[0].items[0].status === "todo" && m.loadBoard().tasks[0].items[1].status === "doing");
+	await gtools.todo.execute("range",{text:"- [x] 구현\n- [x] 시험"},undefined,undefined,gctx);
+	check("todo 완료도 범위 끝 대기·범위 밖 미완료 보존",m.loadBoard().tasks[0].gate?.step === 2 && m.loadBoard().tasks[0].items[0].status === "todo");
+	await gcmd.todo.handler("이어서 1 1",gctx);
+	check("새 범위가 대기를 통과로 풀기",m.loadBoard().tasks[0].range?.from === 1 && m.loadBoard().tasks[0].gate?.by === "새 범위" && m.loadBoard().tasks[0].gate.state === "ok");
+	const beforeInvalid = JSON.stringify(m.loadBoard());
+	await gcmd.todo.handler("이어서 1 99",gctx);
+	check("잘못된 범위는 알림만",gnotes.at(-1).includes("없는 단계") && JSON.stringify(m.loadBoard()) === beforeInvalid);
+	await new Promise(r=>setTimeout(r,10));
+
+	// 서버가 필요 없는 범위 수정·종료 회귀 시험
+	resetGateBoard(9000); await gemit("agent_start");
+	await gcmd.todo.handler("이어서 1 1",gctx);
+	await gemit("message_end",{message:{role:"assistant",content:"[1단계 완료] [2단계 완료]",stopReason:"stop"}});
+	check("한 답의 범위 밖 완료 표식 무시", m.loadBoard().tasks[0].items[1].status === "todo");
+	const waitingSnapshot = JSON.stringify(m.loadBoard().tasks[0].items);
+	await gtools.todo.execute("waiting",{text:"- [x] 구현\n- [x] 시험"},undefined,undefined,gctx);
+	check("대기 중 todo로 다음 단계 완료 불가",JSON.stringify(m.loadBoard().tasks[0].items) === waitingSnapshot);
+	m.editBoard(b=>{const t=b.tasks[0];t.gate={step:1,state:"fix",at:Date.now()};m.reopenStep(t,1,Date.now());});
+	await gemit("agent_start");
+	check("설정 꺼진 범위 수정 안내",(await ginput("고쳐 줘")).includes("[리뷰: 고칠 것]"));
+	await gemit("message_end",{message:{role:"assistant",content:"[1단계 완료]",stopReason:"stop"}});
+	check("범위 수정 뒤 같은 단계 다시 대기",m.loadBoard().tasks[0].gate?.state === "wait" && m.loadBoard().tasks[0].range?.to === 1);
+	m.editBoard(b=>{m.passReviewGate(b.tasks[0],Date.now(),"시험 리뷰");});
+	check("범위 통과는 범위를 지움",!m.loadBoard().tasks[0].range && m.loadBoard().tasks[0].gate?.state === "ok");
+	await new Promise(r=>setTimeout(r,10));
+	const sentBefore = gsent.length;
+	await gcmd.todo.handler("이어서 1 99",gctx);
+	await new Promise(r=>setTimeout(r,10));
+	check("잘못된 범위는 모델에 보내지 않음",gsent.length === sentBefore);
+	check("예전 작업판 range 없음 유지",!m.loadBoard().tasks[0].range);
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG,JSON.stringify({plan_detail:"handoff"}));
+	check("내 설정 plan_detail 읽기",m.planNote("docs/plans").includes("다른(작은) 모델"));
+
+	resetGateBoard(10000);
+	m.editBoard(b=>{m.stepDone(b.tasks[0],2,10001);});
+	await gemit("agent_start");
+	await gcmd.todo.handler("이어서 1 1~2",gctx);
+	await gemit("message_end",{message:{role:"assistant",content:"[1단계 완료]",stopReason:"stop"}});
+	check("범위 끝이 이미 끝났어도 남은 단계 완료 뒤 끝에서 대기",m.loadBoard().tasks[0].gate?.step === 2 && m.loadBoard().tasks[0].gate.state === "wait");
+	await new Promise(r=>setTimeout(r,10));
+
+	const detailTask = {...rangeTask,items:detailItems};
+	check("이어서도 저장된 확인·끝 조건 안내", m.resumeText(detailTask).includes("확인 명령을 돌리고 끝 조건을 확인한 뒤에만 [N단계 완료]"));
+	check("범위 이어서 확인 안내", m.resumeText({...detailTask,range:{from:1,to:1,at:1}}).includes("확인 명령을 돌리고"));
+
+	[process.env.PI_CODING_AGENT_DIR, process.env.PI_COPILOT_USER_CONFIG] = oldEnv;
+	if (oldEnv[0] === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	if (oldEnv[1] === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
+	globalThis.__piWorkDir = { remote: false, cwd: TW };
+	rmSync(GA, { recursive: true, force: true });
+	rmSync(GP, { recursive: true, force: true });
 }
 rmSync(AGENT0, { recursive: true, force: true });
 

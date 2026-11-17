@@ -1,11 +1,20 @@
-// /kit env (profiles/common/agent-template/extensions/kit.ts) 단위 테스트: 조사 결과 읽기, 지침의 '실행 환경' 부분 쓰기
+// /kit env (profiles/common/agent-template/extensions/kit.ts) 단위 테스트: 조사 결과 읽기, 지침의 '실행 환경' 부분 쓰기 + /doctor 도구 진단
 // 사용법: node tests/test_kitenv.mjs   (저장소의 runtime/node_modules/jiti 로 .ts 를 불러옴)
 import { fileURLToPath } from "node:url";
 import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
+import { join } from "node:path";
+import { writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import { createServer } from "node:http";
 
 // typebox 는 pi 처럼 runtime 의 것으로 (kit.ts 의 docs_lookup 도구)
 const jiti = createJiti(import.meta.url, { alias: { typebox: fileURLToPath(new URL("../runtime/node_modules/typebox/build/index.mjs", import.meta.url)) } });
-const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE, KIT_GUIDES, addKitGuides, promptSections, contextReport } = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
+
+const testAgentDir = mkdtempSync(join(process.cwd(), "tmp-test-kitenv-"));
+process.env.PI_KIT_HOME = process.cwd();
+process.env.PI_CODING_AGENT_DIR = testAgentDir;
+
+const kitMod = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
+const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE, KIT_GUIDES, addKitGuides, promptSections, contextReport, diagnoseToolCalling, summarizeToolUsage } = kitMod;
 let fails = 0;
 const check = (name, cond, detail = "") => {
 	console.log((cond ? "OK   " : "FAIL ") + name + (cond ? "" : "  -> " + JSON.stringify(detail)));
@@ -84,6 +93,186 @@ const rep4 = contextReport({ system: SYS, tools: [], messages: [], pending: ["�
 check("/context: 지난 요청 때 보낸 지침이면 그렇다고, 첫 요청 전이면 요청 때 더하는 것(노트북 지침 파일 경로·글자 수)이 아직 빠졌다고",
 	rep3.includes("(지난 요청 때 실제로 보낸 지침") && !rep3.includes("안 보여야 함") && !rep3.includes("첫 요청 전")
 	&& rep4.includes("첫 요청 전이라 요청 때 더하는 것은 아직 빠짐: 노트북 지침 파일 /home/jovyan/p/AGENTS.md 56자 · 노트북 실행 환경 안내 · 키트 안내") && !rep4.includes("지난 요청 때"), [rep3, rep4]);
+
+// ── /doctor 도구 진단 시험 ───────────────────────────────────────────────────
+
+function writeModels(baseUrl, { reasoning, thinkingFormat } = {}) {
+	const model = { id: "Qwen/Qwen3-8B", name: "Qwen3 8B", contextWindow: 32768, maxTokens: 4096 };
+	if (reasoning !== undefined) model.reasoning = reasoning;
+	const compat = { supportsDeveloperRole: false };
+	if (thinkingFormat !== undefined) compat.thinkingFormat = thinkingFormat;
+	const cfg = { providers: { vllm: { baseUrl, api: "openai-completions", apiKey: "EMPTY", compat, models: [model] } } };
+	writeFileSync(join(testAgentDir, "models.json"), JSON.stringify(cfg));
+}
+
+function fakeCtx(messages = []) {
+	return { model: { provider: "vllm", id: "Qwen/Qwen3-8B" }, sessionManager: { buildSessionProjection: () => ({ messages }) } };
+}
+
+async function startServer(handler) {
+	const server = createServer((req, res) => {
+		let body = "";
+		req.on("data", (d) => (body += d));
+		req.on("end", () => {
+			const json = body ? JSON.parse(body) : {};
+			const r = handler(json);
+			const status = r.status ?? 200;
+			const payload = r.body ? JSON.stringify(r.body) : "{}";
+			res.writeHead(status, { "Content-Type": "application/json" });
+			res.end(payload);
+		});
+	});
+	await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", (err) => (err ? reject(err) : resolve())));
+	const addr = server.address();
+	const port = typeof addr === "object" ? addr.port : 0;
+	return { server, url: `http://127.0.0.1:${port}/v1`, stop: () => new Promise((resolve) => server.close(() => resolve())) };
+}
+
+let serverOk = true;
+try {
+	// 정상 tool_calls
+	{
+		const { url, stop } = await startServer(() => ({
+			body: { choices: [{ message: { tool_calls: [{ id: "1", type: "function", function: { name: "get_time", arguments: '{"tz":"Asia/Seoul"}' } }] } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: 정상 tool_calls → 도구 호출 정상", lines.some((l) => l.includes("도구 호출 정상")), lines);
+	}
+
+	// 글로 샘
+	{
+		const { url, stop } = await startServer(() => ({
+			body: { choices: [{ message: { content: '<tool_call>\n<name>get_time</name>\n<arguments>{"tz":"Asia/Seoul"}</arguments>\n</tool_call>' } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: content 에 도구 호출 글 → 도구 호출이 글로 샘", lines.some((l) => l.includes("도구 호출이 글로 샘")), lines);
+	}
+
+	// 글만 → required 로 부름
+	{
+		const { url, stop } = await startServer((body) => ({
+			body: body.tool_choice === "required"
+				? { choices: [{ message: { tool_calls: [{ id: "2", type: "function", function: { name: "get_time", arguments: '{"tz":"Asia/Seoul"}' } }] } }] }
+				: { choices: [{ message: { content: "지금 시각은 오전 10시입니다." } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: auto 는 글만, required 는 부름 → 강제하면 부름", lines.some((l) => l.includes("강제하면 부름")), lines);
+	}
+
+	// 글만 → required 도 안 부름
+	{
+		const { url, stop } = await startServer(() => ({
+			body: { choices: [{ message: { content: "지금 시각은 오전 10시입니다." } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: auto/required 모두 글만 → 강제해도 안 부름", lines.some((l) => l.includes("강제해도 안 부름")), lines);
+	}
+
+	// 깨진 인자
+	{
+		const { url, stop } = await startServer(() => ({
+			body: { choices: [{ message: { tool_calls: [{ id: "3", type: "function", function: { name: "get_time", arguments: "{invalid" } }] } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: arguments JSON 깨짐 → 인자 JSON 이 깨짐", lines.some((l) => l.includes("인자 JSON 이 깨짐")), lines);
+	}
+
+	// 생각 글 따로
+	{
+		const { url, stop } = await startServer(() => ({
+			body: { choices: [{ message: { reasoning_content: "시간을 알아봐야겠다", tool_calls: [{ id: "4", type: "function", function: { name: "get_time", arguments: "{}" } }] } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: reasoning_content 따로 옴", lines.some((l) => l.includes("생각 글 따로 옴")), lines);
+	}
+
+	// 생각 글이 답에 섞임
+	{
+		const { url, stop } = await startServer((body) => ({
+			body: body.tool_choice === "required"
+				? { choices: [{ message: { content: "<thinking>time</thinking> 지금 시각은 오전 10시입니다." } }] }
+				: { choices: [{ message: { content: "<thinking>time</thinking> 지금 시각은 오전 10시입니다." } }] },
+		}));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: content 에 thinking 이 섞임", lines.some((l) => l.includes("생각 글이 답에 섞임")), lines);
+	}
+
+	// HTTP 500
+	{
+		const { url, stop } = await startServer(() => ({ status: 500, body: { error: "internal error" } }));
+		writeModels(url);
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: HTTP 500 → 상태와 응답 앞부분", lines.some((l) => l.includes("HTTP 500")), lines);
+	}
+
+	// models.json reasoning / thinkingFormat 표시
+	{
+		const { url, stop } = await startServer(() => ({
+			body: { choices: [{ message: { tool_calls: [{ id: "5", type: "function", function: { name: "get_time", arguments: "{}" } }] } }] },
+		}));
+		writeModels(url, { reasoning: true, thinkingFormat: "parsed" });
+		const lines = await diagnoseToolCalling(fakeCtx());
+		await stop();
+		check("/doctor 도구: models.json reasoning·thinkingFormat 표시", lines.some((l) => l.includes("reasoning=true")) && lines.some((l) => l.includes("thinkingFormat=parsed")), lines);
+	}
+} catch (e) {
+	serverOk = false;
+	check("가짜 서버 진단 시험: 로컬 서버를 못 띄우면 미확인", false, e.message);
+}
+
+// 브리지(models.json 이 127.0.0.1:8765)면 해당 없음
+try {
+	writeFileSync(join(testAgentDir, "models.json"), JSON.stringify({ providers: { copilot: { baseUrl: "http://127.0.0.1:8765/v1", apiKey: "copilot-relay", models: [{ id: "copilot" }] } } }));
+	const lines = await diagnoseToolCalling({ model: { provider: "copilot", id: "copilot" } });
+	check("/doctor 도구: 브리지(127.0.0.1:8765)면 해당 없음", lines.some((l) => l.includes("해당 없음")), lines);
+} catch (e) {
+	check("/doctor 도구: 브리지 판정 시험", false, e.message);
+}
+
+// 세션 집계 시험
+{
+	const sessionMsgs = [
+		{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "a.txt" } }] },
+		{ role: "toolResult", toolName: "read", isError: true, content: [{ type: "text", text: "찾지 못함: a.txt" }] },
+		{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "b.txt" } }] },
+		{ role: "assistant", content: [{ type: "toolCall", name: "todo", arguments: { text: "- [ ] 할 일" } }] },
+		{ role: "assistant", content: [{ type: "text", text: "[1단계 완료]" }] },
+		{ role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "c.txt" } }] },
+		{ role: "toolResult", toolName: "edit", isError: true, content: [{ type: "text", text: "같은 글입니다" }] },
+		{ role: "assistant", content: [{ type: "text", text: "<tool_call>get_time</tool_call>" }] },
+		{ role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "ls" } }] },
+		{ role: "toolResult", toolName: "bash", isError: true, content: [{ type: "text", text: "리뷰 대기 중이라 실행하지 않았습니다" }] },
+	];
+	const sum = summarizeToolUsage(sessionMsgs).join("\n");
+	check("세션 집계: 도구 호출 수와 이름별 상위", /도구 호출: 5회.*read 2회/.test(sum) && sum.includes("todo 1회"), sum);
+	check("세션 집계: 실패 종류 (edit 찾지못함/같은글 1, 키트막음 1, 그밖 1)", sum.includes("edit 찾지못함/같은글 1") && sum.includes("키트막음 1") && sum.includes("그밖 1"), sum);
+	check("세션 집계: 도구처럼 보이는 글 답 1개, todo 호출 1회, [N단계 완료] 1회", sum.includes("도구처럼 보이는 글 답: 1개") && sum.includes("todo 호출: 1회") && sum.includes("[N단계 완료]: 1회"), sum);
+}
+
+// 같은 도구·같은 인자 3회 초과 반복 시험
+{
+	const repeatMsgs = [];
+	for (let i = 0; i < 5; i++) repeatMsgs.push({ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "x.txt" } }] });
+	const sum = summarizeToolUsage(repeatMsgs).join("\n");
+	check("세션 집계: 같은 도구·같은 인자 3회 초과 반복 1개", sum.includes("같은 도구·인자 3회 초과 반복: 1개"), sum);
+}
+
+try { rmSync(testAgentDir, { recursive: true, force: true }); } catch {}
 
 console.log(fails ? `RESULT: FAIL (${fails})` : "RESULT: PASS");
 process.exit(fails ? 1 : 0);

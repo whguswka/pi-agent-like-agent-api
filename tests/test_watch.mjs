@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
 
@@ -87,6 +87,83 @@ process.env.PI_WATCH_POLL_MS = "120";
 const jiti = createJiti(import.meta.url, { alias: { typebox: fileURLToPath(new URL("../runtime/node_modules/typebox/build/index.mjs", import.meta.url)) } });
 const kit = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
 const { tailLines, doneExit, watchMarker, ago, watchStatus } = kit;
+
+// ── kubeflow-notebook 스킬의 KFP 대기 블록 ──
+const skillText = readFileSync(new URL("../skills/kubeflow-notebook/SKILL.md", import.meta.url), "utf8");
+const kfpSection = skillText.match(/## 파이프라인\(KFP\) 실행([\s\S]*?)## 노트북/);
+const kfpBash = kfpSection?.[1].match(/```bash\n([\s\S]*?)\n```/)?.[1] || "";
+const kfpPython = kfpBash.match(/# PI_KFP_WATCH_BEGIN\n([\s\S]*?)\n# PI_KFP_WATCH_END/)?.[1] || "";
+check("KFP 대기 Python 블록을 스킬 글에서 찾음", !!kfpPython, kfpBash);
+
+const fakeKfp = join(T, "fake-kfp");
+mkdirSync(join(fakeKfp, "kfp"), { recursive: true });
+writeFileSync(
+	join(fakeKfp, "kfp", "__init__.py"),
+	`import os
+
+class Box:
+    pass
+
+class Client:
+    def __init__(self):
+        self.values = os.environ["PI_TEST_STATES"].split(",")
+        self.index = 0
+
+    def get_run(self, run_id):
+        value = self.values[min(self.index, len(self.values) - 1)]
+        self.index += 1
+        if value.startswith("RAISE:"):
+            raise RuntimeError(value.split(":", 1)[1])
+        result = Box()
+        if os.environ.get("PI_TEST_SHAPE") == "v1":
+            result.run = Box()
+            result.run.status = value
+        else:
+            result.state = value
+        return result
+`,
+);
+
+const pythonCandidates = process.env.PI_TEST_PYTHON ? [process.env.PI_TEST_PYTHON] : ["python3"];
+const testPython = pythonCandidates.find((command) => spawnSync(command, ["--version"], { encoding: "utf8" }).status === 0);
+if (!testPython) {
+	console.log("SKIP KFP 대기 블록: PI_TEST_PYTHON과 python3 모두 없음");
+} else {
+	const runKfpWait = (states, shape, timeout = "2") =>
+		spawnSync(testPython, ["-u", "-c", kfpPython], {
+			encoding: "utf8",
+			timeout: 10000,
+			env: {
+				...process.env,
+				PYTHONPATH: [fakeKfp, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+				PYTHONIOENCODING: "utf-8", // Windows 의 Python 은 한글을 cp949 로 찍음 (노트북 Linux 는 UTF-8)
+				PI_KFP_RUN_ID: "run-1",
+				PI_KFP_INTERVAL: "0.01",
+				PI_KFP_TIMEOUT: timeout,
+				PI_TEST_STATES: states,
+				PI_TEST_SHAPE: shape,
+			},
+		});
+	const cases = [
+		["KFP v2 성공", "running,sUcCeEdEd", "v2", "2", "[pi-done] exit=0", "SUCCEEDED"],
+		["KFP v1 실패", "RUNNING,fAiLeD", "v1", "2", "[pi-done] exit=1", "FAILED"],
+		["KFP 시간 초과", "RUNNING", "v2", "0", "[pi-done] exit=124", "아직 끝나지 않음"],
+		["KFP 조회 3회 실패", "RAISE:network,RAISE:network,RAISE:network", "v1", "2", "[pi-done] exit=2", "조회 실패 (3/3)"],
+	];
+	for (const [name, states, shape, timeout, last, expected] of cases) {
+		const result = runKfpWait(states, shape, timeout);
+		const lines = (result.stdout || "").trim().split(/\r?\n/);
+		check(name, result.status === 0 && lines.at(-1) === last && (result.stdout || "").includes(expected), { status: result.status, stdout: result.stdout, stderr: result.stderr });
+	}
+}
+
+const kfpLastLine = kfpBash.trim().split(/\r?\n/).at(-1) || "";
+const echoResult = spawnSync("bash", ["-c", `LOG=logs/kfp-test.log; ${kfpLastLine}`], { cwd: T, encoding: "utf8" });
+check(
+	"KFP 블록 마지막 echo를 watchMarker가 찾음",
+	kfpLastLine === 'echo "[pi-watch] $PWD/$LOG"' && //logs/kfp-test.log$/.test(watchMarker(echoResult.stdout || "") || ""), // Git Bash 의 $PWD 는 /tmp/… 로 나올 수 있어 끝만 봄
+	{ line: kfpLastLine, stdout: echoResult.stdout },
+);
 
 // ── 정리 함수 ──
 check("끝부분: 색 코드 빼고, \\r 로 덮어쓴 진행 막대는 마지막 것만", JSON.stringify(tailLines("a\n\x1b[32mok\x1b[0m\n 10%|#  \r 50%|### \r 90%|#### \r\nlast\n", 9)) === JSON.stringify(["a", "ok", " 90%|#### ", "last"]));
