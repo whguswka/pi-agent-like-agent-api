@@ -1,10 +1,12 @@
 // /kit env (profiles/common/agent-template/extensions/kit.ts) 단위 테스트: 조사 결과 읽기, 지침의 '실행 환경' 부분 쓰기 + /doctor 도구 진단
 // 사용법: node tests/test_kitenv.mjs   (저장소의 runtime/node_modules/jiti 로 .ts 를 불러옴)
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
-import { join } from "node:path";
-import { writeFileSync, rmSync, mkdtempSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { writeFileSync, rmSync, mkdtempSync, symlinkSync, existsSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
+import { startLeakProxy } from "./stubs/leak-proxy.mjs";
 
 // typebox 는 pi 처럼 runtime 의 것으로 (kit.ts 의 docs_lookup 도구)
 const jiti = createJiti(import.meta.url, { alias: { typebox: fileURLToPath(new URL("../runtime/node_modules/typebox/build/index.mjs", import.meta.url)) } });
@@ -14,7 +16,11 @@ process.env.PI_KIT_HOME = process.cwd();
 process.env.PI_CODING_AGENT_DIR = testAgentDir;
 
 const kitMod = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
-const { parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE, KIT_GUIDES, addKitGuides, promptSections, contextReport, diagnoseToolCalling, summarizeToolUsage } = kitMod;
+const {
+	parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE,
+	KIT_GUIDES, addKitGuides, promptSections, contextReport, diagnoseToolCalling, summarizeToolUsage,
+	smallModel, extractToolCalls, stripThinking, recoverAssistantMessage, isTaskRequest, isVerbalAnswer, shouldBounceTextOnly, isBridge
+} = kitMod;
 let fails = 0;
 const check = (name, cond, detail = "") => {
 	console.log((cond ? "OK   " : "FAIL ") + name + (cond ? "" : "  -> " + JSON.stringify(detail)));
@@ -270,6 +276,394 @@ try {
 	for (let i = 0; i < 5; i++) repeatMsgs.push({ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "x.txt" } }] });
 	const sum = summarizeToolUsage(repeatMsgs).join("\n");
 	check("세션 집계: 같은 도구·같은 인자 3회 초과 반복 1개", sum.includes("같은 도구·인자 3회 초과 반복: 1개"), sum);
+}
+
+// ── 작은 모델 방어 순수 함수 시험 ──
+// 0) smallModel() 조건 판정
+{
+	check("smallModel: model_profile small 이면 켬", smallModel({ model_profile: "small" }) === true);
+	check("smallModel: model_profile off 면 끔", smallModel({ model_profile: "off" }) === false);
+	check("smallModel: model_profile default 면 끔", smallModel({ model_profile: "default" }) === false);
+	const origKit = process.env.PI_API_KIT;
+	const origNb = process.env.NB_PREFIX;
+	try {
+		delete process.env.PI_API_KIT;
+		delete process.env.NB_PREFIX;
+		check("smallModel: 설정 없고 PC 설치면 끔", smallModel({}) === false);
+		process.env.PI_API_KIT = "1";
+		check("smallModel: 설정 없고 API 키트 + 브리지면 끔", smallModel({}) === false);
+		writeFileSync(join(testAgentDir, "models.json"), JSON.stringify({ providers: { vllm: { baseUrl: "http://localhost:8000/v1" } } }));
+		check("smallModel: 설정 없고 API 키트 + 브리지 아님 켬", smallModel({}) === true);
+	} finally {
+		if (origKit !== undefined) process.env.PI_API_KIT = origKit; else delete process.env.PI_API_KIT;
+		if (origNb !== undefined) process.env.NB_PREFIX = origNb; else delete process.env.NB_PREFIX;
+	}
+}
+
+// 1) 세 꼴 해석 (extractToolCalls)
+{
+	const tools = new Set(["bash", "read", "edit", "write"]);
+
+	// 꼴 (a): <tool_call>{"name":…,"arguments":{…}}</tool_call>
+	const aText = '결과입니다.\n<tool_call>{"name":"bash","arguments":{"command":"ls -la"}}</tool_call>\n끝.';
+	const aRes = extractToolCalls(aText, tools);
+	check("세 꼴 해석 (a): tool_call JSON", aRes.toolCalls.length === 1 && aRes.toolCalls[0].name === "bash" && aRes.toolCalls[0].arguments.command === "ls -la");
+	check("세 꼴 해석 (a): 호출 글 답 글에서 뺌", !aRes.remainingText.includes("<tool_call>") && aRes.remainingText.includes("결과입니다.") && aRes.remainingText.includes("끝."));
+
+	// 꼴 (b): <function=이름><parameter=키>값</parameter></function>
+	const bText = '<function=read><parameter=path>foo/bar.txt</parameter></function>';
+	const bRes = extractToolCalls(bText, tools);
+	check("세 꼴 해석 (b): function XML", bRes.toolCalls.length === 1 && bRes.toolCalls[0].name === "read" && bRes.toolCalls[0].arguments.path === "foo/bar.txt");
+
+	// 꼴 (b)가 <tool_call>로 감싸인 경우
+	const bWrapped = '<tool_call>\n<function=write><parameter=path>out.txt</parameter><parameter=content>hello</parameter></function>\n</tool_call>';
+	const bWRes = extractToolCalls(bWrapped, tools);
+	check("세 꼴 해석 (b): tool_call 로 감싸인 function XML", bWRes.toolCalls.length === 1 && bWRes.toolCalls[0].name === "write" && bWRes.toolCalls[0].arguments.content === "hello");
+	check("세 꼴 해석 (b): 감싼 태그 전부 제거", bWRes.remainingText.trim() === "");
+
+	// 꼴 (c): 코드 블록 (그 밖의 글 <= 200자)
+	const cCodeText = '다음 명령을 실행합니다:\n```json\n{"name":"bash","arguments":{"command":"pwd"}}\n```';
+	const cCodeRes = extractToolCalls(cCodeText, tools);
+	check("세 꼴 해석 (c): 코드 블록 JSON", cCodeRes.toolCalls.length === 1 && cCodeRes.toolCalls[0].name === "bash" && cCodeRes.toolCalls[0].arguments.command === "pwd");
+
+	// 꼴 (c): 맨 JSON (그 밖의 글 <= 200자)
+	const cRawText = '{"name":"read","arguments":{"path":"config.json"}}';
+	const cRawRes = extractToolCalls(cRawText, tools);
+	check("세 꼴 해석 (c): 맨 JSON", cRawRes.toolCalls.length === 1 && cRawRes.toolCalls[0].name === "read" && cRawRes.toolCalls[0].arguments.path === "config.json");
+
+	// 여러 개 호출 (a, b 혼합 및 순서 유지)
+	const multiText = '<tool_call>{"name":"read","arguments":{"path":"1.txt"}}</tool_call>\n중간 글\n<function=write><parameter=path>2.txt</parameter><parameter=content>ok</parameter></function>';
+	const multiRes = extractToolCalls(multiText, tools);
+	check("여러 개 호출 순서대로", multiRes.toolCalls.length === 2 && multiRes.toolCalls[0].name === "read" && multiRes.toolCalls[1].name === "write");
+	check("여러 개 호출 글 제거", !multiRes.remainingText.includes("<tool_call>") && !multiRes.remainingText.includes("<function=") && multiRes.remainingText.includes("중간 글"));
+}
+
+// 2) 알 수 없는 도구, 객체가 아닌 인자, (c)의 긴 글 속 JSON
+{
+	const tools = new Set(["bash", "read", "edit", "write"]);
+
+	// 알 수 없는 도구는 바꾸지 않음
+	const unkText = '<tool_call>{"name":"unknown_tool","arguments":{"x":1}}</tool_call>';
+	const unkRes = extractToolCalls(unkText, tools);
+	check("알 수 없는 도구: 바꾸지 않음", unkRes.toolCalls.length === 0 && unkRes.remainingText === unkText);
+
+	// 인자가 객체가 아니면 바꾸지 않음
+	const nonObjText = '<tool_call>{"name":"bash","arguments":"echo 1"}</tool_call>';
+	const nonObjRes = extractToolCalls(nonObjText, tools);
+	check("객체가 아닌 인자: 바꾸지 않음", nonObjRes.toolCalls.length === 0 && nonObjRes.remainingText === nonObjText);
+
+	// (c) 긴 글 속 JSON (200자 초과)은 바꾸지 않음
+	const longOutside = "가".repeat(250) + '\n{"name":"bash","arguments":{"command":"ls"}}\n';
+	const longRes = extractToolCalls(longOutside, tools);
+	check("(c) 긴 글 속 JSON: 바꾸지 않음", longRes.toolCalls.length === 0);
+}
+
+// 3) 생각 글 걷어내기 (stripThinking)
+{
+	// 일반 <think>...</think>
+	const th1 = stripThinking("<think>여기서 생각을 정리합니다.</think>실제 답변입니다.");
+	check("생각 글 걷어내기: think 태그", th1.thinking === "여기서 생각을 정리합니다." && th1.text === "실제 답변입니다.");
+
+	// 여는 태그 없이 </think> 만 있는 경우
+	const th2 = stripThinking("여는 태그 없이 생각한 내용입니다.\n</think>\n다음 작업을 수행합니다.");
+	check("생각 글 걷어내기: 여는 태그 없는 </think>", th2.thinking === "여는 태그 없이 생각한 내용입니다." && th2.text === "다음 작업을 수행합니다.");
+
+	// 생각 글 없는 일반 텍스트
+	const th3 = stripThinking("그냥 텍스트입니다.");
+	check("생각 글 걷어내기: 생각 글 없음", th3.thinking === "" && th3.text === "그냥 텍스트입니다.");
+}
+
+// 4) 생각 글 안의 호출 (recoverAssistantMessage)
+{
+	const tools = new Set(["bash", "read", "edit", "write"]);
+	const msg = {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text: '<think>파일을 먼저 봐야겠다.\n<tool_call>{"name":"read","arguments":{"path":"a.txt"}}</tool_call>\n</think>파일을 확인하겠습니다.',
+			},
+		],
+		stopReason: "stop",
+	};
+	const rec = recoverAssistantMessage(msg, tools);
+	check("생각 글 안의 호출: 수정됨", rec.modified === true && rec.recoveredCount === 1);
+	check("생각 글 안의 호출: stopReason 도구 호출로", rec.message.stopReason === "toolUse");
+	const tc = rec.message.content.find((c) => c.type === "toolCall");
+	const th = rec.message.content.find((c) => c.type === "thinking");
+	const tx = rec.message.content.find((c) => c.type === "text");
+	check("생각 글 안의 호출: toolCall 생성", tc && tc.name === "read" && tc.arguments.path === "a.txt");
+	check("생각 글 안의 호출: thinking 에서 toolCall 글 빠짐", th && !th.thinking.includes("<tool_call>") && th.thinking.includes("파일을 먼저 봐야겠다."));
+	check("생각 글 안의 호출: text 에 think 없음", tx && !tx.text.includes("<think>") && tx.text === "파일을 확인하겠습니다.");
+}
+
+// 5) 되돌리기 판정 (shouldBounceTextOnly)
+{
+	check("isTaskRequest: 만들어", isTaskRequest("테스트 파일 하나 만들어 줘"));
+	check("isTaskRequest: 고쳐", isTaskRequest("이 버그 좀 고쳐"));
+	check("isTaskRequest: 실행", isTaskRequest("스크립트 실행해"));
+	check("isTaskRequest: 일반 대화는 아님", !isTaskRequest("오늘 날씨 어때?"));
+
+	check("isVerbalAnswer: 하겠습니다", isVerbalAnswer("다음과 같이 구현하겠습니다."));
+	check("isVerbalAnswer: 명령 코드 블록", isVerbalAnswer("```bash\ncat file.txt\n```"));
+	check("isVerbalAnswer: 질문으로 끝나면 아님", !isVerbalAnswer("다음과 같이 하겠습니다. 진행할까요?"));
+	check("isVerbalAnswer: 단순 설명은 아님", !isVerbalAnswer("이 함수는 합계를 계산합니다."));
+
+	const baseOpts = {
+		userText: "hello.py 파일 만들어 줘",
+		assistantText: "네, hello.py 파일을 다음과 같이 작성하겠습니다.",
+		toolCallCount: 0,
+		hasUI: true,
+		mode: "auto",
+		isReview: false,
+		alreadyBounced: false,
+		isSmallModel: true,
+	};
+	check("shouldBounceTextOnly: 작업 요청 + 말로만 답 + 도구 0회 -> 되돌림", shouldBounceTextOnly(baseOpts) === true);
+	check("shouldBounceTextOnly: 이미 도구 씀 -> 안 함", shouldBounceTextOnly({ ...baseOpts, toolCallCount: 1 }) === false);
+	check("shouldBounceTextOnly: 계획 모드 -> 안 함", shouldBounceTextOnly({ ...baseOpts, mode: "plan" }) === false);
+	check("shouldBounceTextOnly: 묻기 모드 -> 안 함", shouldBounceTextOnly({ ...baseOpts, mode: "ask" }) === false);
+	check("shouldBounceTextOnly: 리뷰 중 -> 안 함", shouldBounceTextOnly({ ...baseOpts, isReview: true }) === false);
+	check("shouldBounceTextOnly: 화면 없음(-p) -> 안 함", shouldBounceTextOnly({ ...baseOpts, hasUI: false }) === false);
+	check("shouldBounceTextOnly: 이미 한 번 되돌림 -> 안 함", shouldBounceTextOnly({ ...baseOpts, alreadyBounced: true }) === false);
+}
+
+// ── leak-proxy 중계 시험 (4 의 중계를 가짜 위쪽 서버 앞에 두고 세 방식이 맞게 바뀌는지) ──
+{
+	let upstreamResponse = {
+		id: "chatcmpl-test",
+		object: "chat.completion",
+		created: 12345,
+		model: "test-model",
+		choices: [
+			{
+				index: 0,
+				message: {
+					role: "assistant",
+					content: "결과 안내",
+					reasoning_content: "이것은 추론입니다",
+					tool_calls: [
+						{
+							id: "call_1",
+							type: "function",
+							function: {
+								name: "bash",
+								arguments: JSON.stringify({ command: "ls -la" }),
+							},
+						},
+					],
+				},
+				finish_reason: "stop",
+			},
+		],
+	};
+
+	const upstreamServer = createServer((req, res) => {
+		if (req.url.endsWith("/models")) {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ data: [{ id: "test-model" }] }));
+			return;
+		}
+		if (req.url.endsWith("/chat/completions")) {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify(upstreamResponse));
+			return;
+		}
+		res.writeHead(404);
+		res.end();
+	});
+
+	await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+	const upPort = upstreamServer.address().port;
+
+	const proxy = await startLeakProxy({ upstream: `http://127.0.0.1:${upPort}`, mode: "tools" });
+
+	async function callProxy(mode, isStream = true) {
+		const res = await fetch(`${proxy.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "x-leak-mode": mode },
+			body: JSON.stringify({ model: "test-model", messages: [{ role: "user", content: "hi" }], stream: isStream }),
+		});
+		if (!isStream) return await res.json();
+		const text = await res.text();
+		let combinedContent = "";
+		for (const line of text.split("\n")) {
+			if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+				try {
+					const chunk = JSON.parse(line.slice(6));
+					combinedContent += chunk.choices?.[0]?.delta?.content || "";
+				} catch {}
+			}
+		}
+		return { content: combinedContent, raw: text };
+	}
+
+	// 1) /v1/models pass-through
+	const modelsRes = await fetch(`${proxy.url}/v1/models`);
+	const modelsData = await modelsRes.json();
+	check("leak-proxy: /v1/models 그대로 넘김", modelsData.data?.[0]?.id === "test-model");
+
+	// 2) tools 모드
+	const toolsOut = await callProxy("tools");
+	check("leak-proxy: tools 모드 (tool_call 글 생성)", toolsOut.content.includes('<tool_call>{"name":"bash","arguments":{"command":"ls -la"}}</tool_call>'));
+	check("leak-proxy: tools 모드 (SSE [DONE] 포함)", toolsOut.raw.includes("data: [DONE]"));
+
+	// 3) xml 모드
+	const xmlOut = await callProxy("xml");
+	check("leak-proxy: xml 모드 (function XML 글 생성)", xmlOut.content.includes('<function=bash><parameter=command>ls -la</parameter></function>'));
+
+	// 4) think 모드
+	const thinkOut = await callProxy("think");
+	check("leak-proxy: think 모드 (think 글 생성)", thinkOut.content.includes("<think>이것은 추론입니다</think>"));
+
+	// 5) mix 모드
+	const mixOut = await callProxy("mix");
+	check("leak-proxy: mix 모드 (think 와 tool_call 둘 다 포함)", mixOut.content.includes("<think>이것은 추론입니다</think>") && mixOut.content.includes("<tool_call>"));
+
+	await proxy.close();
+	await new Promise((resolve) => upstreamServer.close(resolve));
+}
+
+// ── 실제 pi 실행 시험 (bin/pi, runtime) ──
+{
+	const cliJs = resolve(process.cwd(), "runtime/dist/bundle/cli.js");
+	const extSourceDir = resolve(process.cwd(), "profiles/common/agent-template/extensions");
+
+	async function runPiScenario({ modelProfile, isBridge = false, targetFileName = "created.txt" }) {
+		const tmpRealDir = mkdtempSync(join(process.cwd(), "tmp-realpi-"));
+		const aDir = join(tmpRealDir, "agent");
+		const wDir = join(tmpRealDir, "work");
+		mkdirSync(join(aDir, "sessions"), { recursive: true });
+		mkdirSync(wDir, { recursive: true });
+		symlinkSync(extSourceDir, join(aDir, "extensions"), process.platform === "win32" ? "junction" : "dir"); // Windows: 관리자 권한 없이 되는 정션
+
+		let calls = 0;
+		const mockServer = createServer((req, res) => {
+			if (req.url.endsWith("/models")) {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ data: [{ id: "mock-model" }] }));
+				return;
+			}
+			if (req.url.endsWith("/chat/completions")) {
+				calls++;
+				let body = "";
+				req.on("data", (d) => { body += d; });
+				req.on("end", () => {
+					res.writeHead(200, {
+						"Content-Type": "text/event-stream; charset=utf-8",
+						"Cache-Control": "no-cache",
+						Connection: "keep-alive",
+					});
+					if (calls === 1) {
+						const content = `<think>파일을 만듭니다.</think>\n<tool_call>{"name":"bash","arguments":{"command":"touch ${targetFileName}"}}</tool_call>`;
+						const chunk1 = { id: "1", object: "chat.completion.chunk", created: Date.now(), model: "mock-model", choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }] };
+						const chunk2 = { id: "1", object: "chat.completion.chunk", created: Date.now(), model: "mock-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
+						res.write(`data: ${JSON.stringify(chunk1)}\n\n`);
+						res.write(`data: ${JSON.stringify(chunk2)}\n\n`);
+						res.write("data: [DONE]\n\n");
+						res.end();
+					} else {
+						const content = "<think>완료했습니다.</think>\n파일이 생성되었습니다.";
+						const chunk1 = { id: "2", object: "chat.completion.chunk", created: Date.now(), model: "mock-model", choices: [{ index: 0, delta: { role: "assistant", content }, finish_reason: null }] };
+						const chunk2 = { id: "2", object: "chat.completion.chunk", created: Date.now(), model: "mock-model", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
+						res.write(`data: ${JSON.stringify(chunk1)}\n\n`);
+						res.write(`data: ${JSON.stringify(chunk2)}\n\n`);
+						res.write("data: [DONE]\n\n");
+						res.end();
+					}
+				});
+				return;
+			}
+			res.writeHead(404);
+			res.end();
+		});
+
+		try {
+			await new Promise((r) => mockServer.listen(0, "127.0.0.1", r));
+			const port = mockServer.address().port;
+
+			const baseUrl = `http://127.0.0.1:${port}/v1`;
+			writeFileSync(
+				join(aDir, "models.json"),
+				JSON.stringify({
+					providers: {
+						copilot: isBridge ? { baseUrl: "http://127.0.0.1:8765/v1" } : undefined,
+						vllm: {
+							baseUrl,
+							api: "openai-completions",
+							apiKey: "EMPTY",
+							models: [{ id: "mock-model", contextWindow: 32768, maxTokens: 4096 }],
+						},
+					},
+				})
+			);
+			writeFileSync(join(aDir, "settings.json"), JSON.stringify({ defaultProvider: "vllm", defaultModel: "mock-model" }));
+			if (modelProfile !== undefined) {
+				writeFileSync(join(aDir, "bridge.json"), JSON.stringify({ model_profile: modelProfile }));
+			}
+
+			const proc = spawn(process.execPath, [cliJs, "-p", "--mode", "json", "파일 만들어줘"], {
+				cwd: wDir,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: {
+					...process.env,
+					PI_CODING_AGENT_DIR: aDir,
+					PI_KIT_HOME: process.cwd(),
+					PI_API_KIT: "1",
+				},
+			});
+
+			let stdout = "";
+			proc.stdout.on("data", (d) => { stdout += d; });
+			await new Promise((r) => proc.on("close", r));
+
+			const fileCreated = existsSync(join(wDir, targetFileName));
+
+			const assistantMsgs = [];
+			for (const line of stdout.split("\n")) {
+				if (!line.trim()) continue;
+				try {
+					const obj = JSON.parse(line);
+					if (obj.type === "message_end" && obj.message?.role === "assistant") {
+						assistantMsgs.push(obj.message);
+					}
+				} catch {}
+			}
+
+			let hasThinkInText = false;
+			for (const m of assistantMsgs) {
+				for (const c of m.content || []) {
+					if (c.type === "text" && c.text && /<\/?think>/i.test(c.text)) {
+						hasThinkInText = true;
+					}
+				}
+			}
+
+			return { fileCreated, calls, hasThinkInText, assistantMsgs };
+		} finally {
+			await new Promise((r) => mockServer.close(r));
+			rmSync(tmpRealDir, { recursive: true, force: true });
+		}
+	}
+
+	try {
+		// 1) 정상 smallModel (model_profile: small)
+		const res1 = await runPiScenario({ modelProfile: "small", targetFileName: "created_pi.txt" });
+		check("실제 pi: <tool_call> 글로 파일 생성됨", res1.fileCreated === true);
+		check("실제 pi: 도구 결과 받고 두 번째 답까지 호출 (callCount 2)", res1.calls === 2);
+		check("실제 pi: 답 text 블록에 <think> 없음", res1.hasThinkInText === false);
+
+		// 2) model_profile: "off"
+		const res2 = await runPiScenario({ modelProfile: "off", targetFileName: "not_created_off.txt" });
+		check("실제 pi: model_profile off 면 바꾸지 않음 (파일 미생성)", res2.fileCreated === false);
+		check("실제 pi: model_profile off 면 도구 미실행 (callCount 1)", res2.calls === 1);
+
+		// 3) 브리지 (models.json 에 127.0.0.1:8765)
+		const res3 = await runPiScenario({ isBridge: true, targetFileName: "not_created_bridge.txt" });
+		check("실제 pi: 브리지(127.0.0.1:8765)면 바꾸지 않음", res3.fileCreated === false);
+	} catch (e) {
+		check("실제 pi 실행 시험", false, `미확인: ${e.message}`);
+	}
 }
 
 try { rmSync(testAgentDir, { recursive: true, force: true }); } catch {}

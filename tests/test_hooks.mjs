@@ -747,6 +747,33 @@ else {
 	delete process.env.PI_PYTHON_EXE;
 }
 
+// 작은 모델 방어 (2026-11-17): 글로만 답하고 끝나면 되돌림. 같은 요청에서는 한 번, 사용자 요청(pi 의 input)마다 다시
+{
+	const cfgOld = process.env.PI_COPILOT_USER_CONFIG;
+	const cf = join(tmp, "small.json");
+	writeFileSync(cf, JSON.stringify({ model_profile: "small" }));
+	process.env.PI_COPILOT_USER_CONFIG = cf;
+	const B = fakePi();
+	const bsent = [];
+	B.pi.sendUserMessage = (t) => bsent.push(t);
+	h.default(B.pi);
+	const msgs = [
+		{ role: "user", content: "파일 하나 만들어 줘" },
+		{ role: "assistant", content: [{ type: "text", text: "다음과 같이 하겠습니다.\n```bash\ntouch a.txt\n```" }] },
+	];
+	const bctx = { hasUI: true, isIdle: () => true, ui: { notify() {} }, sessionManager: { buildSessionProjection: () => ({ messages: msgs }) } };
+	const first = globalThis.__piTextOnlyBounce(bctx);
+	const second = globalThis.__piTextOnlyBounce(bctx);
+	await B.emit("input", { text: "다시 해 줘", source: "interactive" }, bctx);
+	const third = globalThis.__piTextOnlyBounce(bctx);
+	await B.emit("input", { text: "[도구로 하기]", source: "extension" }, bctx);
+	const fourth = globalThis.__piTextOnlyBounce(bctx);
+	check("작은 모델: 글로만 답하면 되돌림, 같은 요청에서는 한 번만, 사용자 요청마다 다시 (확장이 보낸 글은 새 요청 아님)",
+		first === true && second === false && third === true && fourth === false && bsent.length === 2, [first, second, third, fourth, bsent.length]);
+	if (cfgOld === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
+	else process.env.PI_COPILOT_USER_CONFIG = cfgOld;
+}
+
 rmSync(tmp, { recursive: true, force: true });
 console.log(fails ? `RESULT: FAIL (${fails})` : "RESULT: PASS");
 process.exit(fails ? 1 : 0);

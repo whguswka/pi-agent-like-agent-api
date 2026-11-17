@@ -88,6 +88,36 @@ export const nbUpload = (wd: WorkDir = workDir()) =>
 export const onNotebook = () => process.env.PI_API_KIT === "1" || !!process.env.NB_PREFIX;
 export const notebookMode = (wd: WorkDir = workDir()) => !!wd.remote || onNotebook();
 export const notebookHome = (wd: WorkDir = workDir()) => wd.remote ? wd.home || "/home/jovyan" : homedir().split("\\").join("/");
+
+/** 브리지(Copilot 중계 서버)를 쓰는지: models.json 에 127.0.0.1:8765 주소가 있는지 */
+export const isBridge = (agentD?: string) => {
+	const dir = agentD || process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent");
+	try {
+		return readFileSync(resolve(dir, "models.json"), "utf8").includes("127.0.0.1:8765");
+	} catch {
+		return false;
+	}
+};
+
+/** 작은 모델 방어(model_profile: small) 켜기 여부:
+ *  내 설정 "model_profile" 이 "small" 이면 켬, "default"·"off" 면 끔,
+ *  없으면 API 키트(onNotebook())이고 브리지가 아닐 때(!isBridge()) 켬.
+ *  원래 키트 PC 설치와 Copilot 중계 서버에서는 늘 꺼짐. */
+export function smallModel(cfg?: any): boolean {
+	let conf = cfg;
+	if (conf === undefined) {
+		const cfgPath = process.env.PI_COPILOT_USER_CONFIG || resolve(process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent"), "bridge.json");
+		try {
+			conf = JSON.parse(readFileSync(cfgPath, "utf8"));
+		} catch {
+			conf = {};
+		}
+	}
+	const profile = conf?.model_profile;
+	if (profile === "small") return true;
+	if (profile === "default" || profile === "off") return false;
+	return onNotebook() && !isBridge();
+}
 /** pi 설정 안에서도 두 키트가 함께 써야 하는 파일. 일반 target()은 jupyter의 설정 경로를 PC로 보내므로 이 용도에는 이 함수를 쓴다. */
 export function notebookTarget(path: string, wd: WorkDir = workDir()): Target {
 	const home = notebookHome(wd);
@@ -375,4 +405,58 @@ export function scrubText(s: string): string {
 			const a = accountPart(m);
 			return a === null ? m : `…${m.slice(a.length)}`;
 		});
+}
+
+/** 메시지 하나의 글 (글자 수를 셀 것): 그림·생각(thinking)은 빼고, 도구 호출은 이름과 인자 */
+export function msgText(m: any): string {
+	const parts = (c: any): string =>
+		typeof c === "string"
+			? c
+			: Array.isArray(c)
+				? c.map((p: any) => (p?.type === "text" ? String(p.text || "") : p?.type === "toolCall" ? `${p.name || ""}${JSON.stringify(p.arguments ?? {})}` : "")).join("")
+				: "";
+	if (m?.role === "bashExecution") return `${m.command || ""}\n${m.output || ""}`;
+	if (m?.role === "compactionSummary" || m?.role === "branchSummary") return String(m.summary || "");
+	return parts(m?.content);
+}
+
+/** 사용자 요청이 작업을 지시하는 것인지 판정 */
+export function isTaskRequest(text: string): boolean {
+	if (!text) return false;
+	return /(?:만들(?:어|기|어줘)?|고쳐|실행|돌려|추가|수정|써(?:줘)?|지워|확인해|세어)/.test(text);
+}
+
+/** 답이 말로 하겠다는 꼴(하겠습니다·다음과 같이·명령 코드 블록)이고 질문으로 끝나지 않는지 판정 */
+export function isVerbalAnswer(text: string): boolean {
+	if (!text) return false;
+	const t = text.trim();
+	if (/[?？]$|까요[.?]?$|습니까[.?]?$|나요[.?]?$/.test(t)) return false;
+	if (/하겠습니다|해\s*드리겠습니다|다음과\s*같이|아래와\s*같이/.test(t)) return true;
+	if (/```(?:bash|sh|shell|zsh|python|py)?\s*[\r\n]/.test(t)) return true;
+	return false;
+}
+
+export const TEXT_ONLY_BOUNCE_PROMPT =
+	"[도구로 하기] 방금 답은 말로만 설명했습니다. 설명 대신 도구(bash·read·edit·write)를 불러 실제로 해 주세요. 할 수 없으면 왜 못 하는지 한 줄로.";
+
+/** 글로만 답하고 끝났을 때 한 번 되돌리기 판정 */
+export function shouldBounceTextOnly(opts: {
+	userText: string;
+	assistantText: string;
+	toolCallCount: number;
+	hasUI?: boolean;
+	mode?: string;
+	isReview?: boolean;
+	alreadyBounced?: boolean;
+	isSmallModel?: boolean;
+}): boolean {
+	if (opts.isSmallModel === false) return false;
+	if (opts.hasUI === false) return false;
+	if (opts.mode === "plan" || opts.mode === "ask") return false;
+	if (opts.isReview) return false;
+	if (opts.alreadyBounced) return false;
+	if (opts.toolCallCount > 0) return false;
+	if (!isTaskRequest(opts.userText)) return false;
+	if (!isVerbalAnswer(opts.assistantText)) return false;
+	return true;
 }

@@ -24,7 +24,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { localPython, NB_FIND_PY, pythonCandidates, runProc } from "./lib/python.ts";
-import { call, decodeText, nbRun, type RelayError, shown as shownPath, shq, type Target, target, transformInput, workDir } from "./lib/relay.ts";
+import { call, decodeText, isBridge as relayIsBridge, isTaskRequest, isVerbalAnswer, msgText, nbRun, type RelayError, shouldBounceTextOnly, shown as shownPath, shq, smallModel, type Target, target, TEXT_ONLY_BOUNCE_PROMPT, transformInput, workDir } from "./lib/relay.ts";
 
 const agentDirRaw = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 const kitHome = process.env.PI_KIT_HOME || "";
@@ -44,7 +44,8 @@ const read = (p: string) => {
 	}
 };
 const version = () => read(join(kitHome, "VERSION")).trim() || "?";
-const isBridge = () => read(join(agentDir, "models.json")).includes("127.0.0.1:8765");
+export const isBridge = () => read(join(agentDir, "models.json")).includes("127.0.0.1:8765");
+export { isTaskRequest, isVerbalAnswer, msgText, shouldBounceTextOnly, smallModel, TEXT_ONLY_BOUNCE_PROMPT };
 const names = (dir: string, pick: (n: string) => string | null) => {
 	try {
 		return readdirSync(dir).map(pick).filter((x): x is string => !!x).sort();
@@ -1046,22 +1047,342 @@ export function promptSections(system: string): CtxSection[] {
 	if (rest) out.unshift({ name: "preamble", label: SECTION_LABEL.preamble, chars: rest });
 	return out;
 }
-/** 메시지 하나의 글 (글자 수를 셀 것): 그림·생각(thinking)은 빼고, 도구 호출은 이름과 인자 */
-function msgText(m: any): string {
-	const parts = (c: any): string =>
-		typeof c === "string"
-			? c
-			: Array.isArray(c)
-				? c.map((p: any) => (p?.type === "text" ? String(p.text || "") : p?.type === "toolCall" ? `${p.name || ""}${JSON.stringify(p.arguments ?? {})}` : "")).join("")
-				: "";
-	if (m?.role === "bashExecution") return `${m.command || ""}\n${m.output || ""}`;
-	if (m?.role === "compactionSummary" || m?.role === "branchSummary") return String(m.summary || "");
-	return parts(m?.content);
+
+// ── 작은 모델 방어 (model_profile: small) ───────────────────────────
+
+/** 문자열에서 startIndex 이후의 균형 잡힌 { ... } JSON 블록 찾기 */
+function findBalancedJson(text: string, startIndex: number): { json: string; start: number; end: number } | null {
+	const start = text.indexOf("{", startIndex);
+	if (start === -1) return null;
+	let depth = 0;
+	let inString = false;
+	let escape = false;
+	for (let i = start; i < text.length; i++) {
+		const ch = text[i];
+		if (escape) {
+			escape = false;
+			continue;
+		}
+		if (ch === "\\") {
+			escape = true;
+			continue;
+		}
+		if (ch === '"') {
+			inString = !inString;
+			continue;
+		}
+		if (!inString) {
+			if (ch === "{") depth++;
+			else if (ch === "}") {
+				depth--;
+				if (depth === 0) {
+					return { json: text.slice(start, i + 1), start, end: i + 1 };
+				}
+			}
+		}
+	}
+	return null;
+}
+
+export interface ExtractedToolCall {
+	start: number;
+	end: number;
+	name: string;
+	arguments: Record<string, any>;
+	raw: string;
+}
+
+/** 답 글에서 샌 도구 호출(꼴 a, b, c)을 찾아 추출 */
+export function extractToolCalls(
+	text: string,
+	availableTools?: Set<string> | string[],
+): { toolCalls: any[]; remainingText: string } {
+	if (!text) return { toolCalls: [], remainingText: "" };
+	const toolsSet = availableTools
+		? availableTools instanceof Set
+			? availableTools
+			: new Set(availableTools)
+		: new Set(["bash", "read", "edit", "write"]);
+
+	const matches: ExtractedToolCall[] = [];
+
+	// 1) 꼴 (b): Qwen XML <function=이름>...</function> (선택적으로 <tool_call>로 감싸짐)
+	const xmlRegex = /(?:<tool_call>\s*)?<function=([a-zA-Z0-9_\-.:]+)>([\s\S]*?)<\/function>(?:\s*<\/tool_call>)?/gi;
+	let m: RegExpExecArray | null;
+	while ((m = xmlRegex.exec(text)) !== null) {
+		const name = m[1].trim();
+		if (!toolsSet.has(name)) continue;
+		const body = m[2];
+		const paramRegex = /<parameter=([a-zA-Z0-9_\-.:]+)>([\s\S]*?)<\/parameter>/gi;
+		const args: Record<string, any> = {};
+		let pm: RegExpExecArray | null;
+		while ((pm = paramRegex.exec(body)) !== null) {
+			const pName = pm[1].trim();
+			const pValRaw = pm[2].trim();
+			let pVal: any = pValRaw;
+			try {
+				pVal = JSON.parse(pValRaw);
+			} catch {
+				pVal = pValRaw;
+			}
+			args[pName] = pVal;
+		}
+		if (typeof args === "object" && args !== null && !Array.isArray(args)) {
+			matches.push({
+				start: m.index,
+				end: m.index + m[0].length,
+				name,
+				arguments: args,
+				raw: m[0],
+			});
+		}
+	}
+
+	// 2) 꼴 (a): <tool_call>{"name":...,"arguments":{...}}</tool_call>
+	const toolCallRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
+	while ((m = toolCallRegex.exec(text)) !== null) {
+		const start = m.index;
+		const end = m.index + m[0].length;
+		if (matches.some((e) => Math.max(start, e.start) < Math.min(end, e.end))) continue;
+		const inner = m[1].trim();
+		try {
+			const obj = JSON.parse(inner);
+			if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+				const name = String(obj.name || "").trim();
+				if (toolsSet.has(name)) {
+					const rawArgs = obj.arguments ?? obj.parameters ?? {};
+					let args = rawArgs;
+					if (typeof rawArgs === "string") {
+						try { args = JSON.parse(rawArgs); } catch {}
+					}
+					if (typeof args === "object" && args !== null && !Array.isArray(args)) {
+						matches.push({
+							start,
+							end,
+							name,
+							arguments: args,
+							raw: m[0],
+						});
+					}
+				}
+			}
+		} catch {}
+	}
+
+	// 3) 꼴 (c): 코드 블록이나 맨 JSON (이름이 쓸 수 있는 도구이고 그 밖의 글이 200자 안쪽일 때만)
+	if (matches.length === 0) {
+		// 코드 블록 먼저 확인
+		const codeBlockRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+		while ((m = codeBlockRegex.exec(text)) !== null) {
+			const candidate = m[1].trim();
+			try {
+				const obj = JSON.parse(candidate);
+				if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+					const name = String(obj.name || "").trim();
+					if (toolsSet.has(name)) {
+						const rawArgs = obj.arguments ?? obj.parameters ?? {};
+						let args = rawArgs;
+						if (typeof rawArgs === "string") {
+							try { args = JSON.parse(rawArgs); } catch {}
+						}
+						if (typeof args === "object" && args !== null && !Array.isArray(args)) {
+							const otherText = (text.slice(0, m.index) + text.slice(m.index + m[0].length)).trim();
+							if (otherText.length <= 200) {
+								matches.push({
+									start: m.index,
+									end: m.index + m[0].length,
+									name,
+									arguments: args,
+									raw: m[0],
+								});
+								break;
+							}
+						}
+					}
+				}
+			} catch {}
+		}
+
+		// 코드 블록이 없으면 맨 JSON 확인
+		if (matches.length === 0) {
+			let searchIdx = 0;
+			while (searchIdx < text.length) {
+				const found = findBalancedJson(text, searchIdx);
+				if (!found) break;
+				try {
+					const obj = JSON.parse(found.json);
+					if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+						const name = String(obj.name || "").trim();
+						if (toolsSet.has(name)) {
+							const rawArgs = obj.arguments ?? obj.parameters ?? {};
+							let args = rawArgs;
+							if (typeof rawArgs === "string") {
+								try { args = JSON.parse(rawArgs); } catch {}
+							}
+							if (typeof args === "object" && args !== null && !Array.isArray(args)) {
+								const otherText = (text.slice(0, found.start) + text.slice(found.end)).trim();
+								if (otherText.length <= 200) {
+									matches.push({
+										start: found.start,
+										end: found.end,
+										name,
+										arguments: args,
+										raw: found.json,
+									});
+									break;
+								}
+							}
+						}
+					}
+				} catch {}
+				searchIdx = found.start + 1;
+			}
+		}
+	}
+
+	matches.sort((a, b) => a.start - b.start);
+
+	const toolCalls: any[] = [];
+	let remainingText = "";
+	let lastIndex = 0;
+	let counter = 0;
+
+	for (const match of matches) {
+		remainingText += text.slice(lastIndex, match.start);
+		lastIndex = match.end;
+		counter++;
+		toolCalls.push({
+			type: "toolCall",
+			id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${counter}`,
+			name: match.name,
+			arguments: match.arguments,
+			recovered: true,
+		});
+	}
+	remainingText += text.slice(lastIndex);
+
+	return { toolCalls, remainingText };
+}
+
+/** 답에 섞인 생각 글(<think>...</think> 또는 여는 태그 없는 </think> 앞부분)을 분리 */
+export function stripThinking(text: string): { thinking: string; text: string } {
+	if (!text) return { thinking: "", text: "" };
+	const thinkingParts: string[] = [];
+	let cleanText = text;
+
+	// Case 1: 여는 태그 없이 </think> 만 있는 경우
+	if (!cleanText.includes("<think>") && cleanText.includes("</think>")) {
+		const idx = cleanText.indexOf("</think>");
+		const th = cleanText.slice(0, idx).trim();
+		if (th) thinkingParts.push(th);
+		cleanText = cleanText.slice(idx + "</think>".length);
+	} else {
+		// Case 2: <think>...</think> 태그 (또는 닫히지 않은 <think>)
+		cleanText = cleanText.replace(/<think>([\s\S]*?)(?:<\/think>|$)/gi, (_m, p1) => {
+			const th = String(p1 || "").trim();
+			if (th) thinkingParts.push(th);
+			return "";
+		});
+	}
+
+	return {
+		thinking: thinkingParts.join("\n\n").trim(),
+		text: cleanText.trim(),
+	};
+}
+
+/** assistant 메시지의 샌 도구 호출을 복원하고 생각 글을 분리 */
+export function recoverAssistantMessage(
+	message: any,
+	availableTools?: Set<string> | string[],
+): { modified: boolean; recoveredCount: number; message: any } {
+	if (message?.role !== "assistant") return { modified: false, recoveredCount: 0, message };
+
+	const content = Array.isArray(message.content) ? message.content : [];
+	const hasToolCalls = content.some((c: any) => c?.type === "toolCall");
+
+	// 텍스트 블록 수집
+	let fullText = "";
+	const nonTextBlocks: any[] = [];
+	for (const block of content) {
+		if (block?.type === "text") {
+			fullText += (fullText ? "\n" : "") + (block.text || "");
+		} else {
+			nonTextBlocks.push(block);
+		}
+	}
+
+	// 1) 도구 호출 추출 (toolCall 블록이 하나도 없을 때만)
+	let recoveredToolCalls: any[] = [];
+	let textAfterTools = fullText;
+	if (!hasToolCalls) {
+		const extracted = extractToolCalls(fullText, availableTools);
+		recoveredToolCalls = extracted.toolCalls;
+		textAfterTools = extracted.remainingText;
+	}
+
+	// 2) 생각 글 걷어내기
+	const stripped = stripThinking(textAfterTools);
+	const thinkingText = stripped.thinking;
+	const finalText = stripped.text;
+
+	const toolRecovered = recoveredToolCalls.length > 0;
+	const thinkingRemoved = !!thinkingText || finalText !== fullText;
+
+	if (!toolRecovered && !thinkingRemoved) {
+		return { modified: false, recoveredCount: 0, message };
+	}
+
+	const newContent: any[] = [];
+
+	// 기존 thinking 블록
+	for (const b of nonTextBlocks) {
+		if (b?.type === "thinking") newContent.push(b);
+	}
+	// 새로 추출된 thinking
+	if (thinkingText) {
+		newContent.push({ type: "thinking", thinking: thinkingText });
+	}
+
+	// 기타 블록 (image 등)
+	for (const b of nonTextBlocks) {
+		if (b?.type !== "thinking" && b?.type !== "toolCall") newContent.push(b);
+	}
+
+	// 텍스트 블록
+	if (finalText) {
+		newContent.push({ type: "text", text: finalText });
+	}
+
+	// 기존 toolCall 블록
+	for (const b of nonTextBlocks) {
+		if (b?.type === "toolCall") newContent.push(b);
+	}
+	// 복원된 toolCall 블록
+	for (const tc of recoveredToolCalls) {
+		newContent.push(tc);
+	}
+
+	const newMessage = {
+		...message,
+		content: newContent,
+	};
+
+	if (toolRecovered) {
+		newMessage.stopReason = "toolUse";
+	}
+
+	return {
+		modified: true,
+		recoveredCount: recoveredToolCalls.length,
+		message: newMessage,
+	};
 }
 
 /** 세션 메시지에서 도구 호출·실패·반복 등을 집계 (30줄 안쪽) */
 export function summarizeToolUsage(messages: any[]): string[] {
 	let toolCalls = 0;
+	let recoveredCalls = 0;
 	const byName: Record<string, number> = {};
 	let toolErrors = 0;
 	let editNotFoundSame = 0;
@@ -1082,6 +1403,7 @@ export function summarizeToolUsage(messages: any[]): string[] {
 			for (const p of content) {
 				if (p?.type === "toolCall") {
 					toolCalls++;
+					if (p.recovered || String(p.id || "").includes("rec")) recoveredCalls++;
 					const name = String(p.name || "");
 					byName[name] = (byName[name] || 0) + 1;
 					if (name === "todo") todoCalls++;
@@ -1110,6 +1432,7 @@ export function summarizeToolUsage(messages: any[]): string[] {
 	const lines: string[] = [];
 	lines.push("── 세션 집계 ──");
 	lines.push(` 도구 호출: ${toolCalls}회${top.length ? ` (${top.map(([n, c]) => `${n} ${c}회`).join(", ")})` : ""}`);
+	lines.push(` 받아낸 호출: ${recoveredCalls}개`);
 	lines.push(` 실패한 도구 결과: ${toolErrors}개 (edit 찾지못함/같은글 ${editNotFoundSame}, 인자검증 ${argValidationErrors}, 키트막음 ${kitBlocked}, 그밖 ${otherErrors})`);
 	lines.push(` 도구처럼 보이는 글 답: ${answerToolLike}개 / 같은 도구·인자 3회 초과 반복: ${repeats}개`);
 	lines.push(` todo 호출: ${todoCalls}회 / 답의 [N단계 완료]: ${stepDone}회`);
@@ -1700,5 +2023,34 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_start", async (_event: unknown, ctx: any) => {
 		if (shown && ctx.hasUI) show(ctx, shown, undefined);
+	});
+
+	// 작은 모델 방어: 글로 샌 도구 호출 받아내기 및 생각 글 걷어내기
+	let recoveredNotified = false;
+	pi.on("session_start", async () => {
+		recoveredNotified = false;
+	});
+
+	pi.on("message_end", async (event: any, ctx: any) => {
+		if (!smallModel()) return;
+		const msg = event?.message;
+		if (msg?.role !== "assistant") return;
+
+		const active = new Set<string>((pi as any).getActiveTools?.() || []);
+		const allTools = (pi as any).getAllTools?.() || [];
+		const toolsList = allTools.filter((t: any) => !active.size || active.has(t.name)).map((t: any) => t.name);
+		const available = toolsList.length ? new Set<string>(toolsList) : new Set(["bash", "read", "edit", "write"]);
+
+		const res = recoverAssistantMessage(msg, available);
+		if (!res.modified) return;
+
+		if (res.recoveredCount > 0 && !recoveredNotified) {
+			recoveredNotified = true;
+			try {
+				ctx?.ui?.notify?.("도구 호출 글을 도구로 바꿔 실행했습니다 (서버가 도구 호출을 따로 주지 않음 — /doctor 도구)", "info");
+			} catch {}
+		}
+
+		return { message: res.message };
 	});
 }

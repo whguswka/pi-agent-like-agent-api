@@ -44,7 +44,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { cleanPath, isPlanDoc, isPlanName, projectRel, type WorkDir } from "./lib/paths.ts";
 import { localPython, NB_FIND_PY, runProc } from "./lib/python.ts";
-import { nbRun, oneDialog, readTarget, shown, shq, type Target, target, userAsk } from "./lib/relay.ts";
+import { isTaskRequest, isVerbalAnswer, msgText, nbRun, oneDialog, readTarget, shouldBounceTextOnly, shown, shq, smallModel, type Target, target, TEXT_ONLY_BOUNCE_PROMPT, userAsk } from "./lib/relay.ts";
 import { rulesOn, writtenText } from "./lib/rules.ts";
 import { base, parseShell, strip, writtenPaths } from "./lib/shell.ts";
 
@@ -1215,6 +1215,77 @@ export default function (pi: ExtensionAPI) {
 			}, 0),
 		);
 	});
+	// 작은 모델 방어: 글로만 답하고 끝났을 때 한 번 되돌리기
+	let textOnlyBounced = false;
+	// 사용자 요청마다 다시 한 번 (pi 의 이벤트 이름은 input. 확장이 보낸 글은 새 요청이 아님)
+	pi.on("input", async (event: any) => {
+		if (event?.source !== "extension") textOnlyBounced = false;
+	});
+	pi.on("session_start", async () => {
+		textOnlyBounced = false;
+	});
+
+	(globalThis as any).__piTextOnlyBounce = (ctx: any) => {
+		if (!smallModel()) return false;
+		if (textOnlyBounced || !ctx?.hasUI) return false;
+		const G = globalThis as any;
+		if (G.__piMode === "plan" || G.__piMode === "ask" || G.__piReview) return false;
+
+		let messages: any[] = [];
+		try {
+			messages = ctx.sessionManager?.buildSessionProjection?.().messages || [];
+		} catch {}
+		if (!messages.length) return false;
+
+		let lastUserIdx = -1;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i]?.role === "user") {
+				lastUserIdx = i;
+				break;
+			}
+		}
+		if (lastUserIdx === -1) return false;
+
+		const userMsg = messages[lastUserIdx];
+		const userText = msgText(userMsg);
+
+		let toolCalls = 0;
+		let lastAssistantText = "";
+		for (let i = lastUserIdx + 1; i < messages.length; i++) {
+			const m = messages[i];
+			if (m?.role === "assistant") {
+				lastAssistantText = msgText(m);
+				const content = Array.isArray(m.content) ? m.content : [];
+				for (const p of content) {
+					if (p?.type === "toolCall") toolCalls++;
+				}
+			}
+		}
+
+		if (
+			!shouldBounceTextOnly({
+				userText,
+				assistantText: lastAssistantText,
+				toolCallCount: toolCalls,
+				hasUI: ctx?.hasUI,
+				mode: G.__piMode,
+				isReview: !!G.__piReview,
+				alreadyBounced: textOnlyBounced,
+				isSmallModel: true,
+			})
+		)
+			return false;
+
+		if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return false;
+
+		textOnlyBounced = true;
+		try {
+			ctx.ui?.notify?.("글로만 설명하여 도구를 사용하도록 되돌립니다 (요청마다 한 번)", "info");
+		} catch {}
+		pi.sendUserMessage(userAsk(TEXT_ONLY_BOUNCE_PROMPT, "(도구로 하기)"));
+		return true;
+	};
+
 	// 완료 점검·목표 확인이 끝난 뒤 할 일 목록 표시 맞추기 (modes.ts): 함께 pi 에게 보내면 뒤의 것이 '이미 처리 중' 이 됨. 앞의 둘이 보냈으면 쉬지 않으므로 그 요청이 끝날 때 다시
 	pi.on("agent_settled", async (_event: unknown, ctx: any) => {
 		setTimeout(async () => {
@@ -1224,8 +1295,12 @@ export default function (pi: ExtensionAPI) {
 			goalSent = false;
 			if (C.round === 1 || sent) return;
 			try {
-				// 아무것도 보내지 않았을 때만 /planauto 가 다음을 물음 (보냈으면 그 요청이 끝날 때 다시 옴)
-				if (!(globalThis as any).__piTodoBounce?.(ctx)) (globalThis as any).__piPlanAutoSettled?.(ctx);
+				// 아무것도 보내지 않았을 때만 할 일 목록 되돌리기 -> 글로만 답했을 때 되돌리기 -> /planauto
+				if (!(globalThis as any).__piTodoBounce?.(ctx)) {
+					if (!(globalThis as any).__piTextOnlyBounce?.(ctx)) {
+						(globalThis as any).__piPlanAutoSettled?.(ctx);
+					}
+				}
 			} catch {}
 		}, 0);
 	});

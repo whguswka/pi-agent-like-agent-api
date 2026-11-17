@@ -801,6 +801,7 @@ condition: "(?i)\\b(drop|truncate)\\s+table\\b"
 | `plan_execute_model` | (pi 의 기본 모델) | 승인한 계획을 진행할 모델 (모델 id, 또는 `provider/id`). id 만 적으면 계획을 세운 모델과 제공자가 같을 때만 바꿈. `"same"` 이면 계획을 세운 모델 그대로 ([3-5](#3-5-작업-모드-plan-mode)) |
 | `todo_open` | `false` | `true` 면 새 작업이 생길 때 작업판을 편집기 탭에 엶 (세션에 한 번, 조용히. 언제든 `/todo open`, [3-5](#3-5-작업-모드-plan-mode)) |
 | `review_model` | (지금 모델) | `/review` 에 쓸 모델 (모델 id, 또는 `provider/id`). id 만 적으면 지금 모델과 같은 제공자에서. `"same"` 이면 지금 모델 그대로 ([3-5](#3-5-작업-모드-plan-mode)) |
+| `model_profile` | `"small"` | 작은 모델 방어: 글로 샌 도구 호출과 생각 글 자동 처리, 작업 지시를 말로만 설명하면 한 번 되돌림 (`"small"` 켬, `"default"`·`"off"` 끔. 기본은 켬) |
 
 - 작업 기록([5장 메모리](#메모리))은 `/recall off` 로 끕니다 (`~/.pi/agent/work-log/settings.json` 에 적힘). 문서 찾기([3-9](#3-9-설치된-라이브러리의-설명-찾기-docs))의 문서 폴더는 환경 변수 `PI_DOCS_DIR` 로 바꿉니다 (기본 `~/pi-docs`).
 - git 기준점 제안([3-6](#3-6-되돌리기-undo))을 어디서도 받지 않으려면 `~/.pi/agent/git-offer.json` 에 `{"enabled": false}` 를 적습니다 ('아니요' 한 폴더 목록 `declined` 도 이 파일에 있음. 환경 변수 `PI_GIT_OFFER=0` 도 됨). 묻는 창은 2분 안에 답이 없으면 그냥 넘어가고 다음 세션에 다시 묻습니다.
