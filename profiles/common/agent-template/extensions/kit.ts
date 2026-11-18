@@ -43,9 +43,116 @@ const read = (p: string) => {
 		return "";
 	}
 };
-const version = () => read(join(kitHome, "VERSION")).trim() || "?";
+const version = () => read(join(process.env.PI_KIT_HOME || kitHome, "VERSION")).trim() || "?";
+// 프로세스가 처음 확장을 읽을 때의 VERSION 을 globalThis 에 한 번 기억 (확장을 다시 만들어도 덮어쓰지 않음)
+const G = globalThis as any;
+G.__piKitLoadedVersion ||= version();
+
+export const getLoadedVersion = () => (globalThis as any).__piKitLoadedVersion || "?";
+
+export function checkVersionChange(ctx?: any): string | null {
+	const loaded = (globalThis as any).__piKitLoadedVersion || "?";
+	const disk = version();
+	if (loaded === "?" || disk === "?" || disk === loaded) return null;
+	const warned: Set<string> = ((globalThis as any).__piKitWarnedVersions ||= new Set<string>());
+	if (warned.has(disk)) return null;
+	warned.add(disk);
+	const msg = `새 버전 ${disk} 이 깔렸습니다. 이 pi 는 ${loaded} 으로 돌고 있습니다. pi 를 끄고 다시 켜세요.`;
+	ctx?.ui?.notify?.(msg, "warning");
+	return msg;
+}
+
+export function doctorVersionSummary(): string {
+	const disk = version();
+	const loaded = (globalThis as any).__piKitLoadedVersion || "?";
+	if (loaded !== "?" && disk !== "?" && disk !== loaded) {
+		return `${disk} (이 pi 는 ${loaded} 으로 도는 중 — 다시 켜세요)`;
+	}
+	return disk;
+}
+
 export const isBridge = () => read(join(agentDir, "models.json")).includes("127.0.0.1:8765");
 export { isTaskRequest, isVerbalAnswer, msgText, shouldBounceTextOnly, smallModel, TEXT_ONLY_BOUNCE_PROMPT };
+
+/** JSON 문자열을 안전히 파싱 */
+function safeJson(s: string): any {
+	try {
+		return JSON.parse(s);
+	} catch {
+		return undefined;
+	}
+}
+
+type CompactThinkingState = { originalLevel: string | null; targetLevel: string | null };
+declare global { var __piCompactThinking: CompactThinkingState | undefined; }
+
+function readBridgeConfig(): any {
+	return safeJson(read(process.env.PI_COPILOT_USER_CONFIG || join(agentDir, "bridge.json")));
+}
+function getCompactThinkingConfig(): string {
+	const cfg = readBridgeConfig();
+	const v = cfg?.compact_thinking;
+	if (v === "keep") return "keep";
+	if (typeof v === "string" && v) return v;
+	return "off";
+}
+export function doctorCompactThinkingSummary(pi?: { getThinkingLevel?: () => string }): string {
+	const cfg = getCompactThinkingConfig();
+	const current = pi?.getThinkingLevel?.() ?? "off";
+	const target = cfg === "keep" ? "변경 안 함" : cfg || "off";
+	if (!cfg || cfg === "off") return `요약할 때 생각 수준: off (설정 compact_thinking)`;
+	return `요약할 때 생각 수준: ${target} (설정 compact_thinking: ${cfg}, 지금: ${current})`;
+}
+
+const settingsFile = join(agentDir, "settings.json");
+
+export function isFullscreenTui(argv: string[] = process.argv, settings?: any): boolean {
+	for (let i = 0; i < argv.length; i++) {
+		if (argv[i] === "--tui-mode" && argv[i + 1] === "fullscreen") return true;
+		if (argv[i] === "--tui-mode=fullscreen") return true;
+	}
+	const s = settings !== undefined ? settings : safeJson(read(settingsFile));
+	return s?.tuiMode === "fullscreen";
+}
+
+export function shouldNotifyCopyHint(params?: {
+	platform?: string;
+	env?: Record<string, string | undefined>;
+	argv?: string[];
+	settings?: any;
+	bridgeConfig?: any;
+	hasUI?: boolean;
+}): boolean {
+	const platform = params?.platform ?? process.platform;
+	if (platform !== "linux") return false;
+
+	const env = params?.env ?? process.env;
+	if (env.DISPLAY || env.WAYLAND_DISPLAY) return false;
+	if (env.TERM_PROGRAM !== "vscode") return false;
+
+	if (params?.hasUI === false) return false;
+
+	const bridge = params?.bridgeConfig !== undefined ? params.bridgeConfig : safeJson(read(process.env.PI_COPILOT_USER_CONFIG || join(agentDir, "bridge.json")));
+	if (bridge?.copy_hint === false) return false;
+
+	const argv = params?.argv ?? process.argv;
+	const settings = params?.settings;
+	return isFullscreenTui(argv, settings);
+}
+
+export const COPY_HINT_MESSAGE =
+	"code-server 터미널에서는 끌어서 고른 글이 클립보드에 들어가지 않습니다. Shift 를 누른 채 끌어 고른 뒤 Ctrl+C 로 복사하세요 (설정 Copy On Selection 을 켜면 고르기만 해도 복사).";
+
+export function notifyCopyHint(ctx: any, params?: Parameters<typeof shouldNotifyCopyHint>[0]): boolean {
+	const G = globalThis as any;
+	if (G.__piCopyHintNotified) return false;
+	const hasUI = params?.hasUI !== undefined ? params.hasUI : ctx?.hasUI ?? true;
+	if (!hasUI) return false;
+	if (!shouldNotifyCopyHint({ ...params, hasUI })) return false;
+	G.__piCopyHintNotified = true;
+	ctx?.ui?.notify?.(COPY_HINT_MESSAGE, "info");
+	return true;
+}
 const names = (dir: string, pick: (n: string) => string | null) => {
 	try {
 		return readdirSync(dir).map(pick).filter((x): x is string => !!x).sort();
@@ -276,6 +383,7 @@ function helpLines(): string[] {
 		" 위키  /wiki (상태) · /wiki init 으로 만들기 · ingest <raw/ 파일·폴더> · ask <질문> · save · lint (Obsidian 으로 보기)",
 		" 환경  /kit env 지금 실행 위치의 Python·패키지·GPU·CUDA 버전을 조사해 지침에 적기 (그 버전에 맞춰 일함)",
 		" 로그  /watch <로그> 긴 학습 지켜보기 (아래 줄에 진행, 끝나면 벨·알림) · /watch 상태 · /watch 보내기 끝부분을 pi 에게 · /watch 끄기",
+		` 역할  /role (지금 역할과 바꾸는 법) · /role 리뷰(review) · /role 개발(develop) · /role 끔(off).  내 설정: ${A}/bridge.json 의 role`,
 	];
 	if (bridge) {
 		lines.push(
@@ -318,7 +426,7 @@ function run(cmd: string, args: string[], ms: number): Promise<string> {
 }
 
 async function doctorLines(): Promise<string[]> {
-	const head = `── 상태 요약 (버전 ${version()}) ── 닫기: /doctor 다시 입력 또는 요청 보내기`;
+	const head = `── 상태 요약 (버전 ${doctorVersionSummary()}) ── 닫기: /doctor 다시 입력 또는 요청 보내기`;
 	let out: string;
 	if (isBridge()) {
 		const py = process.env.PI_PYTHON_EXE;
@@ -328,19 +436,14 @@ async function doctorLines(): Promise<string[]> {
 		out = `pi 폴더: ${kitHome}\n` + (await run("bash", [join(kitHome, "check-node.sh")], 60000));
 	}
 	const body = out.replace(/\x1b\[[0-9;]*m/g, "").replace(/\r/g, "").split("\n").filter((l) => l.trim());
-	return [head, ...body.map((l) => " " + l)];
+	const r = getRole();
+	const roleLine = ` 역할: ${ROLE_LABEL[r]}${r !== "off" ? ` (설정 role)` : ""}`;
+	return [head, roleLine, ...body.map((l) => " " + l)];
 }
 
 // ── /doctor 도구: API 키트에서 LLM 서버의 도구 호출을 진단 ───────────────────────────────────────────
 
-/** JSON 문자열을 안전히 파싱 */
-function safeJson(s: string): any {
-	try {
-		return JSON.parse(s);
-	} catch {
-		return undefined;
-	}
-}
+
 
 /** 답 글에 도구 호출처럼 보이는 패턴이 있는지 */
 function looksLikeToolCall(text: string): boolean {
@@ -554,11 +657,35 @@ export const RERUN_GUIDE =
 export const REFUSE_GUIDE =
 	"지침·안전 때문에 요청대로 할 수 없으면 거절만 하고 끝내지 말고, 할 수 있는 안전한 일(원인 조사, 정해진 절차로 고치고 시험)은 해 두고 " +
 	"무엇을 승인받아야 하는지 묻는다.";
+/** 역할별 지침 줄 */
+export const ROLE_GUIDES: Record<string, string> = {
+	review:
+		"이 pi 의 역할: 설계·리뷰. 같은 폴더를 개발용 pi 가 함께 쓴다. 평소에는 계획을 세우고 결과를 리뷰하며, 코드·설정 파일은 고치지 않고 고칠 것은 리뷰 글(docs/reviews/)에 적는다. 개발 작업의 할 일 목록은 고치지 않는다. 리뷰는 '통과' 또는 '고칠 것' 으로 끝맺고, 그 결과는 사용자가 개발용 pi 에 전한다. 다만 사용자가 직접 구현·수정을 시키면 그 일을 한다.",
+	develop:
+		"이 pi 의 역할: 개발. 계획과 리뷰는 다른 pi 가 한다. 승인된 계획의 단계를 구현하고 시험한다. 사용자가 붙여 주는 리뷰 글·리뷰 결과는 따를 지시이며 다시 리뷰하지 않는다 ('통과' 면 다음 단계, '고칠 것' 이면 적힌 대로 고친다). 리뷰 글을 쓰거나 리뷰·승인을 요청하는 말을 하지 않는다. 단계가 끝나면 바꾼 것과 확인한 방법만 보고하고 멈춘다. 다만 사용자가 직접 리뷰를 시키면 리뷰한다.",
+};
+export type PiRole = "review" | "develop" | "off";
+const ROLE_NAMES: Record<string, PiRole> = { review: "review", 리뷰: "review", develop: "develop", 개발: "develop", off: "off", 끔: "off" };
+const ROLE_LABEL: Record<PiRole, string> = { review: "리뷰", develop: "개발", off: "없음" };
+/** 내 설정 파일(bridge.json)의 role 값. 기본은 off (공개 저장소 API 키트 혼자 쓰는 사용자는 그대로) */
+export function getRole(): PiRole {
+	const cfg = readBridgeConfig();
+	const v = String(cfg?.role || "").toLowerCase();
+	return ROLE_NAMES[v] || "off";
+}
+/** 현재 role 에 맞는 지침 줄 (off 이면 null) */
+export function roleGuide(): string | null {
+	const r = getRole();
+	return r === "off" ? null : ROLE_GUIDES[r];
+}
 /** 지침에 늘 더하는 줄 (작업 모드와 관계없이 같은 글) */
 export const KIT_GUIDES = [DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE];
-/** 지침 목록(systemPromptOptions.promptGuidelines)에 KIT_GUIDES 를 한 번씩 더함 */
+/** 지침 목록(systemPromptOptions.promptGuidelines)에 KIT_GUIDES 와 현재 역할 안내를 한 번씩 더함 */
 export function addKitGuides(g: unknown) {
-	if (Array.isArray(g)) for (const line of KIT_GUIDES) if (!g.includes(line)) g.push(line);
+	if (!Array.isArray(g)) return;
+	for (const line of KIT_GUIDES) if (!g.includes(line)) g.push(line);
+	const rg = roleGuide();
+	if (rg && !g.includes(rg)) g.push(rg);
 }
 
 // ── ask_user 도구: 사용자만 정할 수 있는 것을 고르기 창으로 묻기 (2026-10-27, oh-my-pi 의 ask 도구를 참고해 새로 씀) ─────────
@@ -991,7 +1118,6 @@ export async function lookupDocs(name: string, query: string): Promise<string> {
 // ---------------------------------------------------------------------------------------------------------------
 // 팀 공유 폴더: <폴더>/skills/<이름>/SKILL.md, <폴더>/prompts/<이름>.md 를 settings.json 의 skills·prompts 목록에 등록
 // ---------------------------------------------------------------------------------------------------------------
-const settingsFile = join(agentDir, "settings.json");
 const norm = (p: string) => p.split("\\").join("/").replace(/\/+$/, "").toLowerCase();
 /** 입력한 폴더 -> 절대 경로 (~, Git Bash 형식 /c/..., 역슬래시도 받음) */
 function folder(arg: string, cwd: string): string {
@@ -1519,6 +1645,7 @@ function relayMaxChars(provider: string | undefined): number | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
+	((globalThis as any).__piKitLoadedVersion ||= version());
 	let shown: string | null = null; // 지금 띄운 것 ("kit" | "doctor")
 	const show = (ctx: any, what: string, lines: string[] | undefined) => {
 		// 한 덩어리로 넘김: pi 화면은 줄 목록을 10줄까지만 보여 줌 (/doctor 요약이 잘림)
@@ -1543,20 +1670,118 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("before_agent_start", async (event: any) => addKitGuides(event?.systemPromptOptions?.promptGuidelines));
+	function bridgeConfigPath() {
+		return process.env.PI_COPILOT_USER_CONFIG || join(agentDir, "bridge.json");
+	}
+	function readBridgeJson(): any {
+		try {
+			return JSON.parse(readFileSync(bridgeConfigPath(), "utf8").replace(/^\uFEFF/, "")) || {};
+		} catch {
+			return {};
+		}
+	}
+	function writeBridgeJson(v: any) {
+		writeFileSync(bridgeConfigPath(), JSON.stringify(v, null, 2) + "\n");
+	}
+	pi.registerCommand("role", {
+		description: "pi 역할 바꾸기: /role 리뷰(review) · /role 개발(develop) · /role 끔(off). 다른 설정은 그대로, 다음 요청부터 적용",
+		handler: async (args, ctx) => {
+			const raw = String(args || "").trim();
+			const current = getRole();
+			if (!raw) {
+				const label = ROLE_LABEL[current];
+				const cfg = readBridgeJson();
+				const set = cfg.role || "(없음: off)";
+				return show(ctx, "kit", [
+					`── pi 역할 ──`,
+					` 지금: ${label} (설정 role: ${set})`,
+					` /role 리뷰 또는 /role review   → 설계·리뷰 역할`,
+					` /role 개발 또는 /role develop  → 개발 역할`,
+					` /role 끔 또는 /role off       → 역할 나누지 않음 (기본)`,
+					`설정 파일 ${tilde(bridgeConfigPath())} 의 role 키만 바꾸고, 다음 요청부터 적용됩니다.`,
+				]);
+			}
+			const next = ROLE_NAMES[raw.toLowerCase()];
+			if (!next) return ctx.ui.notify(`모르는 역할입니다: "${raw}". /role 리뷰 · /role 개발 · /role 끔`, "warning");
+			const cfg = readBridgeJson();
+			cfg.role = next;
+			writeBridgeJson(cfg);
+			ctx.ui.notify(`역할을 ${ROLE_LABEL[next]}(으)로 바꿨습니다. 다음 요청부터 적용됩니다 (설정 파일: ${tilde(bridgeConfigPath())}).`, "info");
+		},
+	});
+
+	pi.on("before_agent_start", async (event: any) => {
+		const g = event?.systemPromptOptions?.promptGuidelines;
+		addKitGuides(g);
+		// 역할 메모 파일 내용을 역할 지침 줄 다음에 넣음 (파일이 없거나 비면 넣지 않음, 너무 길면 앞부분만)
+		if (Array.isArray(g) && roleGuide()) {
+			// 이 pi 의 로컬 설정 폴더에만 있는 메모 (jupyter 모드의 PC pi 는 PC 쪽, API 키트는 노트북 쪽이라 두 pi 가 섞이지 않음)
+			const notes = read(join(agentDir, "role-notes.md")).trim();
+			if (notes && !g.includes(notes)) {
+				const max = 1500;
+				g.push(notes.length > max ? `${notes.slice(0, max - 10)}\n(… role-notes.md 앞부분만)` : notes);
+			}
+		}
+	});
 
 	// /kit env 로 지침에 적은 실행 환경은 pi 를 시작할 때 읽으므로, 지금 대화에는 다음 요청 앞에 붙여 바로 알린다
 	// (/reload 는 Copilot 새 대화를 열어 느리므로 쓰지 않음. /remember 와 같은 방식)
 	const E: { note: string } = ((globalThis as any).__piKitEnv ||= { note: "" });
-	pi.on("session_start", async (event: any) => {
+	pi.on("session_start", async (event: any, ctx: any) => {
 		if (event?.reason !== "reload") E.note = "";
+		checkVersionChange(ctx);
+		notifyCopyHint(ctx);
 	});
-	pi.on("input", async (event: any) => {
+
+	interface ThinkingPi {
+		getThinkingLevel?: () => string;
+		setThinkingLevel?: (level: string) => void;
+	}
+	const thinkingPi = pi as ThinkingPi;
+	const CT = (globalThis.__piCompactThinking ||= { originalLevel: null, targetLevel: null });
+
+	// 되돌릴 때 지금 수준이 키트가 낮춘 값 그대로일 때만 되돌림 (요약 중에 사용자가 바꿨으면 그 선택을 둠).
+	//  thinking_level_select 이벤트로 가리지 않음: pi 는 그 이벤트를 기다리지 않고(void) 보내서, 키트가 바꾼 것도 늦게 와 사용자 변경으로 잘못 읽힐 수 있음
+	function restoreCompactThinkingLevel() {
+		const { originalLevel, targetLevel } = CT;
+		CT.originalLevel = null;
+		CT.targetLevel = null;
+		if (!originalLevel) return;
+		const get = thinkingPi.getThinkingLevel;
+		const set = thinkingPi.setThinkingLevel;
+		if (!get || !set || get() !== targetLevel) return;
+		set(originalLevel);
+	}
+
+	function setCompactThinkingLevelForSummary() {
+		const cfg = getCompactThinkingConfig();
+		if (cfg === "keep") return;
+		const get = thinkingPi.getThinkingLevel;
+		const set = thinkingPi.setThinkingLevel;
+		if (!get || !set) return;
+		const current = get();
+		// 지금 생각을 끈 상태면 요약에서 켜지 않음. 이미 바꿀 수준이면 할 것 없음
+		if (current === "off" || current === cfg) return;
+		if (CT.originalLevel === null) CT.originalLevel = current;
+		set(cfg);
+		// 모델이 그 수준을 못 쓰면 pi 가 가까운 수준으로 맞춤: 실제로 들어간 값을 기억해야 되돌릴 때 비교가 맞음
+		CT.targetLevel = get();
+	}
+
+	pi.on("input", async (event: any, ctx: any) => {
+		if (event?.source !== "extension") {
+			checkVersionChange(ctx);
+			restoreCompactThinkingLevel();
+		}
 		if (!E.note || !event.text || event.text.startsWith("/")) return;
 		const text = `${E.note}\n\n${event.text}`;
 		E.note = "";
 		return transformInput(event.text, text);
 	});
+
+	pi.on("session_before_compact", async () => setCompactThinkingLevelForSummary());
+	pi.on("session_compact", async () => restoreCompactThinkingLevel());
+	pi.on("session_compact_failed", async (_event: any) => restoreCompactThinkingLevel());
 
 	async function env(ctx: any) {
 		const wd = workDir();
@@ -1980,6 +2205,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.ui.notify("상태를 확인하는 중입니다 (몇 초 걸림)...", "info");
 			const lines = await doctorLines();
+			lines.push(doctorCompactThinkingSummary(thinkingPi));
 			if (!isBridge()) lines.push("도구 호출 진단: /doctor 도구");
 			show(ctx, "doctor", lines);
 		},

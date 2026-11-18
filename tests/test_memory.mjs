@@ -310,6 +310,51 @@ check("jupyter 모드 연결 전: 기록·알림 없음", (await prompt()) === u
 	check("/remember PC: 모든 프로젝트는 PC 의 ~/.pi/agent/AGENTS.md (그대로)", !pcP[1][1].remote && pcP[1][1].abs.replace(/\\/g, "/").endsWith("/AGENTS.md") && !pcP[1][0].includes("노트북"), pcP);
 }
 
+// /remember '이 pi 에만' 저장 (role 이 off 가 아닐 때)
+{
+	const roleAgentDir = join(tmp, "agent-role");
+	mkdirSync(roleAgentDir, { recursive: true });
+	writeFileSync(join(roleAgentDir, "bridge.json"), JSON.stringify({ role: "review" }));
+	const oldAgentDir2 = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = roleAgentDir;
+	const roleProj = join(tmp, "proj-role").split("\\").join("/");
+	mkdirSync(roleProj, { recursive: true });
+	globalThis.__piWorkDir = { remote: false, cwd: roleProj };
+	delete globalThis.__piRemember;
+	const onR = {};
+	const cmdsR = {};
+	m.default({ on: (e, f) => (onR[e] ||= []).push(f), registerCommand: (n, def) => (cmdsR[n] = def), sendUserMessage: () => {} });
+	const ctxR = {
+		hasUI: true,
+		isIdle: () => true,
+		ui: {
+			notify: () => {},
+			setWidget: () => {},
+			confirm: async () => true,
+			select: async (_t, o) => o.find((x) => x.includes("이 pi 에만")) || o[0],
+		},
+	};
+	const emitR = async (e, ev = {}) => { for (const f of onR[e] || []) await f(ev, ctxR); };
+	await emitR("session_start", { reason: "new" });
+	const roleNotesFile = join(roleAgentDir, "role-notes.md");
+	try { rmSync(roleNotesFile, { force: true }); } catch {}
+	await cmdsR.remember.handler("이 pi 는 항상 pytest -q 로 테스트한다", ctxR);
+	check("/remember '이 pi 에만': role review 면 agentDir/role-notes.md 에 저장",
+		existsSync(roleNotesFile) && readFileSync(roleNotesFile, "utf8").trim().includes("- 이 pi 는 항상 pytest -q 로 테스트한다"),
+		existsSync(roleNotesFile) ? readFileSync(roleNotesFile, "utf8") : "(파일 없음)");
+	// role off 면 '이 pi 에만' 자리가 없음
+	writeFileSync(join(roleAgentDir, "bridge.json"), JSON.stringify({ role: "off" }));
+	const offPlaces = m.memoryPlaces({ remote: false, cwd: roleProj });
+	check("/remember: role off 면 '이 pi 에만' 자리가 없음 (2개)", offPlaces.length === 2 && !offPlaces.some((o) => o[0].includes("이 pi 에만")), offPlaces);
+	// jupyter 모드여도 '이 pi 에만' 은 이 pi 의 로컬 설정 폴더 (노트북 ~/.pi/agent 는 같은 노트북 API 키트의 설정 폴더라 거기 두면 섞임)
+	writeFileSync(join(roleAgentDir, "bridge.json"), JSON.stringify({ role: "review" }));
+	const nbRolePlaces = m.memoryPlaces({ remote: true, cwd: "/home/jovyan/work/p", home: "/home/jovyan" });
+	const nbLocal = nbRolePlaces[2]?.[1];
+	check("/remember '이 pi 에만': jupyter 모드여도 노트북이 아니라 이 pi 의 로컬 role-notes.md",
+		nbRolePlaces.length === 3 && nbRolePlaces[0][1].remote && nbLocal && !nbLocal.remote && nbLocal.abs.replace(/\\/g, "/") === join(roleAgentDir, "role-notes.md").replace(/\\/g, "/"), nbRolePlaces);
+	process.env.PI_CODING_AGENT_DIR = oldAgentDir2;
+}
+
 if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
 rmSync(tmp, { recursive: true, force: true });

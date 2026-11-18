@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
 import { join, resolve } from "node:path";
-import { writeFileSync, rmSync, mkdtempSync, symlinkSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, rmSync, mkdtempSync, symlinkSync, existsSync, mkdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { startLeakProxy } from "./stubs/leak-proxy.mjs";
 
@@ -18,9 +18,12 @@ process.env.PI_CODING_AGENT_DIR = testAgentDir;
 const kitMod = await jiti.import("../profiles/common/agent-template/extensions/kit.ts");
 const {
 	parseEnv, putEnv, DONE_GUIDE, CODE_FILE_GUIDE, READ_DOCS_GUIDE, WAIT_GUIDE, CAUSE_GUIDE, RERUN_GUIDE, REFUSE_GUIDE,
-	KIT_GUIDES, addKitGuides, promptSections, contextReport, diagnoseToolCalling, summarizeToolUsage,
-	smallModel, extractToolCalls, stripThinking, recoverAssistantMessage, isTaskRequest, isVerbalAnswer, shouldBounceTextOnly, isBridge
+	KIT_GUIDES, addKitGuides, ROLE_GUIDES, getRole, roleGuide, promptSections, contextReport, diagnoseToolCalling, summarizeToolUsage,
+	smallModel, extractToolCalls, stripThinking, recoverAssistantMessage, isTaskRequest, isVerbalAnswer, shouldBounceTextOnly, isBridge,
+	checkVersionChange, doctorVersionSummary, doctorCompactThinkingSummary, getLoadedVersion,
+	isFullscreenTui, shouldNotifyCopyHint, notifyCopyHint, COPY_HINT_MESSAGE
 } = kitMod;
+const kitDefault = kitMod.default;
 let fails = 0;
 const check = (name, cond, detail = "") => {
 	console.log((cond ? "OK   " : "FAIL ") + name + (cond ? "" : "  -> " + JSON.stringify(detail)));
@@ -663,6 +666,568 @@ try {
 		check("실제 pi: 브리지(127.0.0.1:8765)면 바꾸지 않음", res3.fileCreated === false);
 	} catch (e) {
 		check("실제 pi 실행 시험", false, `미확인: ${e.message}`);
+	}
+}
+
+// ── 시험 1: 버전 바뀜 알림 ───────────────────────────────────────────
+{
+	const origKitHome = process.env.PI_KIT_HOME;
+	const tmpKitHome = mkdtempSync(join(process.cwd(), "tmp-test-ver-"));
+	try {
+		process.env.PI_KIT_HOME = tmpKitHome;
+		const createMockPi = () => {
+			const handlers = {};
+			return {
+				on(event, fn) { (handlers[event] ||= []).push(fn); },
+				async emit(event, arg1, arg2) {
+					for (const fn of handlers[event] || []) await fn(arg1, arg2);
+				},
+				registerCommand() {},
+				registerTool() {},
+			};
+		};
+		const createMockCtx = () => {
+			const notifications = [];
+			return {
+				hasUI: true,
+				ui: {
+					notify(msg, level) { notifications.push({ msg, level }); },
+					setWidget() {},
+					confirm() { return true; },
+				},
+				notifications,
+			};
+		};
+
+		// 1) 초기화: 디스크 버전 2026-11-17.3
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-17.3\n");
+		delete globalThis.__piKitLoadedVersion;
+		delete globalThis.__piKitWarnedVersions;
+
+		const pi1 = createMockPi();
+		kitDefault(pi1);
+		check("버전 바뀜: 처음 로드 시 기억한 버전", getLoadedVersion() === "2026-11-17.3", getLoadedVersion());
+
+		// 2) 기억한 버전과 디스크 버전이 같으면 알림 없음
+		const ctx1 = createMockCtx();
+		await pi1.emit("session_start", {}, ctx1);
+		await pi1.emit("input", { source: "user", text: "안녕" }, ctx1);
+		check("버전 바뀜: 기억한 버전과 디스크 버전이 같으면 알림 없음", ctx1.notifications.length === 0, ctx1.notifications);
+
+		// extension source 의 input 은 검사하지 않음
+		const ctxExt = createMockCtx();
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-18.1\n");
+		await pi1.emit("input", { source: "extension", text: "확장 메시지" }, ctxExt);
+		check("버전 바뀜: source가 extension이면 알리지 않음", ctxExt.notifications.length === 0, ctxExt.notifications);
+
+		// 3) 다르면 한 번 (같은 새 버전으로 다시 요청해도 한 번)
+		const ctx2 = createMockCtx();
+		await pi1.emit("input", { source: "user", text: "요청" }, ctx2);
+		check("버전 바뀜: 다르면 한 번 경고",
+			ctx2.notifications.length === 1
+			&& ctx2.notifications[0].level === "warning"
+			&& ctx2.notifications[0].msg === "새 버전 2026-11-18.1 이 깔렸습니다. 이 pi 는 2026-11-17.3 으로 돌고 있습니다. pi 를 끄고 다시 켜세요.",
+			ctx2.notifications
+		);
+
+		const ctx3 = createMockCtx();
+		await pi1.emit("input", { source: "user", text: "또 다른 요청" }, ctx3);
+		await pi1.emit("session_start", {}, ctx3);
+		check("버전 바뀜: 같은 새 버전으로 다시 요청해도 한 번만", ctx3.notifications.length === 0, ctx3.notifications);
+
+		// 4) 또 다른 버전이면 다시 한 번
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-19.1\n");
+		const ctx4 = createMockCtx();
+		await pi1.emit("session_start", {}, ctx4);
+		check("버전 바뀜: 또 다른 버전이면 다시 한 번",
+			ctx4.notifications.length === 1
+			&& ctx4.notifications[0].level === "warning"
+			&& ctx4.notifications[0].msg === "새 버전 2026-11-19.1 이 깔렸습니다. 이 pi 는 2026-11-17.3 으로 돌고 있습니다. pi 를 끄고 다시 켜세요.",
+			ctx4.notifications
+		);
+
+		// 5) 확장을 다시 만들어도(두 번째 인스턴스) 기억한 버전 유지
+		const pi2 = createMockPi();
+		kitDefault(pi2);
+		check("버전 바뀜: 확장을 다시 만들어도 기억한 버전 유지", getLoadedVersion() === "2026-11-17.3", getLoadedVersion());
+		const ctx5 = createMockCtx();
+		await pi2.emit("input", { source: "user", text: "두 번째 인스턴스" }, ctx5);
+		check("버전 바뀜: 두 번째 인스턴스에서도 이미 알린 2026-11-19.1 은 다시 알리지 않음", ctx5.notifications.length === 0, ctx5.notifications);
+
+		// 6) '?' 이면 없음
+		delete globalThis.__piKitWarnedVersions;
+		writeFileSync(join(tmpKitHome, "VERSION"), ""); // 빈 파일 -> version() === "?"
+		const ctxQ1 = createMockCtx();
+		await pi2.emit("input", { source: "user", text: "물음표 테스트" }, ctxQ1);
+		check("버전 바뀜: 디스크가 '?' 이면 없음", ctxQ1.notifications.length === 0, ctxQ1.notifications);
+
+		globalThis.__piKitLoadedVersion = "?";
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-20.1\n");
+		const ctxQ2 = createMockCtx();
+		await pi2.emit("input", { source: "user", text: "물음표 테스트2" }, ctxQ2);
+		check("버전 바뀜: 기억한 버전이 '?' 이면 없음", ctxQ2.notifications.length === 0, ctxQ2.notifications);
+
+		// 7) /doctor 줄
+		globalThis.__piKitLoadedVersion = "2026-11-17.3";
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-18.1\n");
+		const docDiff = doctorVersionSummary();
+		check("버전 바뀜: /doctor 버전 줄 (다를 때)", docDiff === "2026-11-18.1 (이 pi 는 2026-11-17.3 으로 도는 중 — 다시 켜세요)", docDiff);
+
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-17.3\n");
+		const docSame = doctorVersionSummary();
+		check("버전 바뀜: /doctor 버전 줄 (같을 때)", docSame === "2026-11-17.3", docSame);
+
+		globalThis.__piKitLoadedVersion = "?";
+		writeFileSync(join(tmpKitHome, "VERSION"), "2026-11-18.1\n");
+		const docQ = doctorVersionSummary();
+		check("버전 바뀜: /doctor 버전 줄 ('?' 일 때)", docQ === "2026-11-18.1", docQ);
+
+	} finally {
+		process.env.PI_KIT_HOME = origKitHome;
+		rmSync(tmpKitHome, { recursive: true, force: true });
+	}
+}
+
+// ── 시험 2: 복사하는 법 알림 ───────────────────────────────────────────
+{
+	const createMockCtx = (hasUI = true) => {
+		const notifications = [];
+		return {
+			hasUI,
+			ui: {
+				notify(msg, level) { notifications.push({ msg, level }); },
+				setWidget() {},
+				confirm() { return true; },
+			},
+			notifications,
+		};
+	};
+
+	const baseEnv = { TERM_PROGRAM: "vscode" };
+	const baseArgv = ["node", "pi", "--tui-mode", "fullscreen"];
+
+	// 1) 기본 조건 만족 시 true
+	check("복사 힌트: linux + vscode + no display + fullscreen argv(1) -> true",
+		shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: baseArgv, hasUI: true }) === true
+	);
+
+	// 2) platform 조건: linux 아님 (win32, darwin)
+	check("복사 힌트: win32 면 false",
+		shouldNotifyCopyHint({ platform: "win32", env: baseEnv, argv: baseArgv }) === false
+	);
+	check("복사 힌트: darwin 면 false",
+		shouldNotifyCopyHint({ platform: "darwin", env: baseEnv, argv: baseArgv }) === false
+	);
+
+	// 3) DISPLAY 있음
+	check("복사 힌트: DISPLAY 있으면 false",
+		shouldNotifyCopyHint({ platform: "linux", env: { ...baseEnv, DISPLAY: ":0" }, argv: baseArgv }) === false
+	);
+
+	// 4) WAYLAND_DISPLAY 있음
+	check("복사 힌트: WAYLAND_DISPLAY 있으면 false",
+		shouldNotifyCopyHint({ platform: "linux", env: { ...baseEnv, WAYLAND_DISPLAY: "wayland-0" }, argv: baseArgv }) === false
+	);
+
+	// 5) TERM_PROGRAM !== vscode
+	check("복사 힌트: TERM_PROGRAM 없음 false",
+		shouldNotifyCopyHint({ platform: "linux", env: {}, argv: baseArgv }) === false
+	);
+	check("복사 힌트: TERM_PROGRAM xterm false",
+		shouldNotifyCopyHint({ platform: "linux", env: { TERM_PROGRAM: "xterm" }, argv: baseArgv }) === false
+	);
+
+	// 6) argv 두 꼴
+	// a: --tui-mode fullscreen
+	check("복사 힌트: argv 꼴 1 (--tui-mode fullscreen)",
+		isFullscreenTui(["node", "pi", "--tui-mode", "fullscreen"]) === true
+	);
+	// b: --tui-mode=fullscreen
+	check("복사 힌트: argv 꼴 2 (--tui-mode=fullscreen)",
+		isFullscreenTui(["node", "pi", "--tui-mode=fullscreen"]) === true
+		&& shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: ["node", "pi", "--tui-mode=fullscreen"] }) === true
+	);
+	// c: settings.json 의 tuiMode 가 fullscreen
+	check("복사 힌트: settings tuiMode fullscreen",
+		isFullscreenTui(["node", "pi"], { tuiMode: "fullscreen" }) === true
+		&& shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: ["node", "pi"], settings: { tuiMode: "fullscreen" } }) === true
+	);
+	// d: fullscreen 아님
+	check("복사 힌트: fullscreen 아님 (regular)",
+		isFullscreenTui(["node", "pi", "--tui-mode", "regular"], { tuiMode: "regular" }) === false
+		&& shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: ["node", "pi", "--tui-mode", "regular"], settings: { tuiMode: "regular" } }) === false
+	);
+
+	// 7) copy_hint 설정
+	check("복사 힌트: copy_hint false 면 false",
+		shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: baseArgv, bridgeConfig: { copy_hint: false } }) === false
+	);
+	check("복사 힌트: copy_hint true 면 true",
+		shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: baseArgv, bridgeConfig: { copy_hint: true } }) === true
+	);
+	check("복사 힌트: copy_hint 기본값(없음)은 true",
+		shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: baseArgv, bridgeConfig: {} }) === true
+	);
+
+	// 8) hasUI false
+	check("복사 힌트: hasUI false 면 false",
+		shouldNotifyCopyHint({ platform: "linux", env: baseEnv, argv: baseArgv, hasUI: false }) === false
+	);
+
+	// 9) 프로세스마다 한 번 (notifyCopyHint)
+	delete globalThis.__piCopyHintNotified;
+	const ctxA = createMockCtx(true);
+	const notif1 = notifyCopyHint(ctxA, { platform: "linux", env: baseEnv, argv: baseArgv, hasUI: true });
+	check("복사 힌트: 첫 notifyCopyHint 실행 시 true 및 알림 1회",
+		notif1 === true
+		&& ctxA.notifications.length === 1
+		&& ctxA.notifications[0].level === "info"
+		&& ctxA.notifications[0].msg === COPY_HINT_MESSAGE,
+		ctxA.notifications
+	);
+
+	const ctxB = createMockCtx(true);
+	const notif2 = notifyCopyHint(ctxB, { platform: "linux", env: baseEnv, argv: baseArgv, hasUI: true });
+	check("복사 힌트: 두 번째 호출 시 프로세스당 1회이므로 false 및 알림 없음",
+		notif2 === false && ctxB.notifications.length === 0,
+		ctxB.notifications
+	);
+
+	// 10) platform/환경변수/argv 실제 변경 후 되돌리기 + pi session_start 연동
+	const origPlatform = process.platform;
+	const origEnvDisplay = process.env.DISPLAY;
+	const origEnvWayland = process.env.WAYLAND_DISPLAY;
+	const origTerm = process.env.TERM_PROGRAM;
+	const origArgv = [...process.argv];
+
+	try {
+		delete globalThis.__piCopyHintNotified;
+		Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+		delete process.env.DISPLAY;
+		delete process.env.WAYLAND_DISPLAY;
+		process.env.TERM_PROGRAM = "vscode";
+		process.argv = ["node", "pi", "--tui-mode", "fullscreen"];
+
+		const createMockPi = () => {
+			const handlers = {};
+			return {
+				on(event, fn) { (handlers[event] ||= []).push(fn); },
+				async emit(event, arg1, arg2) {
+					for (const fn of handlers[event] || []) await fn(arg1, arg2);
+				},
+				registerCommand() {},
+				registerTool() {},
+			};
+		};
+
+		const pi = createMockPi();
+		kitDefault(pi);
+
+		// hasUI = false 일 때 session_start
+		const ctxNoUI = createMockCtx(false);
+		await pi.emit("session_start", {}, ctxNoUI);
+		check("복사 힌트: pi session_start 에서 hasUI false 면 알리지 않음", ctxNoUI.notifications.length === 0);
+
+		// hasUI = true 일 때 session_start
+		const ctxWithUI = createMockCtx(true);
+		await pi.emit("session_start", {}, ctxWithUI);
+		check("복사 힌트: pi session_start 에서 조건 맞으면 알림 1회",
+			ctxWithUI.notifications.length === 1
+			&& ctxWithUI.notifications[0].level === "info"
+			&& ctxWithUI.notifications[0].msg === COPY_HINT_MESSAGE
+		);
+
+		// 다시 session_start 호출해도 이미 알렸으므로 없음
+		const ctxAgain = createMockCtx(true);
+		await pi.emit("session_start", {}, ctxAgain);
+		check("복사 힌트: pi session_start 다시 호출해도 프로세스당 1회", ctxAgain.notifications.length === 0);
+
+	} finally {
+		Object.defineProperty(process, "platform", { value: origPlatform, configurable: true });
+		if (origEnvDisplay !== undefined) process.env.DISPLAY = origEnvDisplay; else delete process.env.DISPLAY;
+		if (origEnvWayland !== undefined) process.env.WAYLAND_DISPLAY = origEnvWayland; else delete process.env.WAYLAND_DISPLAY;
+		if (origTerm !== undefined) process.env.TERM_PROGRAM = origTerm; else delete process.env.TERM_PROGRAM;
+		process.argv = origArgv;
+	}
+}
+
+// ── 시험 3: 대화 요약(compaction) 동안 생각 수준 바꾸기/되돌리기 ───────────────────────────────────────────
+{
+	function writeBridgeCompact(value) {
+		writeFileSync(join(testAgentDir, "bridge.json"), JSON.stringify({ compact_thinking: value }));
+	}
+	function createThinkingMock(level = "xhigh") {
+		let current = level;
+		const handlers = {};
+		return {
+			on(event, fn) { (handlers[event] ||= []).push(fn); },
+			async emit(event, arg1, arg2) {
+				for (const fn of handlers[event] || []) await fn(arg1, arg2);
+			},
+			getThinkingLevel: () => current,
+			setThinkingLevel: (v) => { current = v; },
+			registerCommand() {},
+			registerTool() {},
+		};
+	}
+	function resetCompactState() {
+		delete globalThis.__piCompactThinking;
+	}
+
+	// 1) xhigh → off → xhigh
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("xhigh");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking off: 요약 전 xhigh → off", pi.getThinkingLevel() === "off");
+		await pi.emit("session_compact", {});
+		check("compact_thinking off: 요약 후 원래 수준 xhigh 로 되돌림", pi.getThinkingLevel() === "xhigh");
+	}
+
+	// 2) 실패 이벤트에서도 되돌림
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("high");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking off (failed): 요약 전 high → off", pi.getThinkingLevel() === "off");
+		await pi.emit("session_compact_failed", { aborted: false });
+		check("compact_thinking off (failed): 실패 후 원래 수준 high 로 되돌림", pi.getThinkingLevel() === "high");
+	}
+
+	// 3) 지금 수준이 off 면 바꾸지 않음
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("off");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking off: 지금 off 면 바꾸지 않음", pi.getThinkingLevel() === "off");
+		await pi.emit("session_compact", {});
+		check("compact_thinking off: 지금 off 면 되돌릴 것 없음", pi.getThinkingLevel() === "off");
+	}
+
+	// 4) keep 이면 바꾸지 않음
+	{
+		resetCompactState();
+		writeBridgeCompact("keep");
+		const pi = createThinkingMock("xhigh");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking keep: 바꾸지 않음", pi.getThinkingLevel() === "xhigh");
+		await pi.emit("session_compact", {});
+		check("compact_thinking keep: 그대로", pi.getThinkingLevel() === "xhigh");
+	}
+
+	// 5) low → low → 원래 수준
+	{
+		resetCompactState();
+		writeBridgeCompact("low");
+		const pi = createThinkingMock("high");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking low: 요약 전 high → low", pi.getThinkingLevel() === "low");
+		await pi.emit("session_compact", {});
+		check("compact_thinking low: 요약 후 high 로 되돌림", pi.getThinkingLevel() === "high");
+	}
+
+	// 6) 사용자가 compaction 중에 수준을 직접 바꾸면 되돌리지 않음
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("xhigh");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking 사용자 변경: 요약 전 xhigh → off", pi.getThinkingLevel() === "off");
+		pi.setThinkingLevel("low");
+		await pi.emit("thinking_level_select", { level: "low" });
+		await pi.emit("session_compact", {});
+		check("compact_thinking 사용자 변경: 사용자가 바꾼 low 를 덮어쓰지 않음", pi.getThinkingLevel() === "low");
+	}
+
+	// 6b) 실제 pi 처럼 수준을 바꿀 때마다 thinking_level_select 를 기다리지 않고 늦게 보내도, 키트가 바꾼 것은 되돌림
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("xhigh");
+		const set0 = pi.setThinkingLevel;
+		pi.setThinkingLevel = (v) => { set0(v); setTimeout(() => void pi.emit("thinking_level_select", { level: v }), 0); };
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		await new Promise((r) => setTimeout(r, 10));
+		await pi.emit("session_compact", {});
+		check("compact_thinking: 수준 바뀜 이벤트가 늦게 와도 키트가 낮춘 것은 되돌림", pi.getThinkingLevel() === "xhigh", pi.getThinkingLevel());
+	}
+
+	// 6c) 지금 off 인데 설정이 low 여도 요약에서 생각을 켜지 않음
+	{
+		resetCompactState();
+		writeBridgeCompact("low");
+		const pi = createThinkingMock("off");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking low: 지금 off 면 요약에서 켜지 않음", pi.getThinkingLevel() === "off", pi.getThinkingLevel());
+		await pi.emit("session_compact", {});
+	}
+
+	// 7) 안전장치: 요약이 끝나지 않아 기억이 남으면 사용자 입력 때 되돌림
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("xhigh");
+		kitDefault(pi);
+		await pi.emit("session_before_compact", {});
+		check("compact_thinking 안전장치: 요약 전 xhigh → off", pi.getThinkingLevel() === "off");
+		await pi.emit("input", { source: "user", text: "안녕" }, {});
+		check("compact_thinking 안전장치: 사용자 입력 때 원래 수준으로 되돌림", pi.getThinkingLevel() === "xhigh");
+	}
+
+	// 8) /doctor 상태 요약 줄
+	{
+		resetCompactState();
+		writeBridgeCompact("off");
+		const pi = createThinkingMock("xhigh");
+		const line = doctorCompactThinkingSummary(pi);
+		check("compact_thinking /doctor: 기본 off 일 때 줄", line === "요약할 때 생각 수준: off (설정 compact_thinking)", line);
+
+		writeBridgeCompact("keep");
+		const keepLine = doctorCompactThinkingSummary({ getThinkingLevel: () => "xhigh" });
+		check("compact_thinking /doctor: keep 이면 변경 안 함", keepLine.includes("변경 안 함") && keepLine.includes("compact_thinking: keep"), keepLine);
+
+		writeBridgeCompact("low");
+		const lowLine = doctorCompactThinkingSummary({ getThinkingLevel: () => "high" });
+		check("compact_thinking /doctor: low 설정이면 low 및 현재 수준", lowLine.includes("low") && lowLine.includes("지금: high"), lowLine);
+	}
+}
+
+// ── 역할 (role) 시험 ───────────────────────────────────────────
+{
+	function writeBridgeRole(role) {
+		const base = { compact_thinking: "off" };
+		if (role !== undefined) base.role = role;
+		writeFileSync(join(testAgentDir, "bridge.json"), JSON.stringify(base));
+	}
+	function resetRoleGlobal() {
+		delete globalThis.__piKitLoadedVersion;
+		delete globalThis.__piKitWarnedVersions;
+	}
+	function createMockPiWithCommands() {
+		const handlers = {};
+		const cmds = {};
+		const pi = {
+			on: (e, f) => { (handlers[e] ||= []).push(f); },
+			registerCommand: (n, def) => { cmds[n] = def; },
+			registerTool: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+		};
+		return { pi, handlers, cmds };
+	}
+
+	resetRoleGlobal();
+	writeBridgeRole(undefined);
+	check("role: 기본값은 off", getRole() === "off");
+	check("roleGuide: off 이면 null", roleGuide() === null);
+
+	writeBridgeRole("review");
+	check("role: bridge.json role=review", getRole() === "review");
+	check("roleGuide: review 이면 리뷰 역할 문구", roleGuide() === ROLE_GUIDES.review);
+
+	writeBridgeRole("develop");
+	check("role: bridge.json role=develop", getRole() === "develop");
+	check("roleGuide: develop 이면 개발 역할 문구", roleGuide() === ROLE_GUIDES.develop);
+
+	writeBridgeRole("리뷰");
+	check("role: 한글 '리뷰' 도 review", getRole() === "review");
+
+	// addKitGuides
+	{
+		writeBridgeRole("off");
+		const g = ["기존"];
+		addKitGuides(g);
+		check("addKitGuides: role off 면 기존 7개만", g.length === 8 && g.includes("기존") && g.includes(DONE_GUIDE) && !g.includes(ROLE_GUIDES.review) && !g.includes(ROLE_GUIDES.develop), g.length);
+
+		writeBridgeRole("review");
+		const gr = [];
+		addKitGuides(gr);
+		check("addKitGuides: role review 면 역할 가이드 포함", gr.includes(DONE_GUIDE) && gr.includes(ROLE_GUIDES.review) && !gr.includes(ROLE_GUIDES.develop), gr);
+
+		writeBridgeRole("develop");
+		const gd = [];
+		addKitGuides(gd);
+		check("addKitGuides: role develop 면 역할 가이드 포함", gd.includes(DONE_GUIDE) && gd.includes(ROLE_GUIDES.develop) && !gd.includes(ROLE_GUIDES.review), gd);
+	}
+
+	// before_agent_start 에서 role-notes.md 도 함께 들어감
+	{
+		resetRoleGlobal();
+		writeBridgeRole("review");
+		const { pi, handlers } = createMockPiWithCommands();
+		kitDefault(pi);
+		const roleNotesFile = join(testAgentDir, "role-notes.md");
+		const noteText = "- 이 pi 는 항상 pytest -q 로 테스트한다";
+		writeFileSync(roleNotesFile, noteText + "\n");
+		const ev = { systemPromptOptions: { promptGuidelines: [] } };
+		await handlers.before_agent_start?.[0]?.(ev, {});
+		check("before_agent_start: role review + role-notes.md 이면 역할 가이드와 메모 둘 다 들어감",
+			ev.systemPromptOptions.promptGuidelines.includes(ROLE_GUIDES.review) && ev.systemPromptOptions.promptGuidelines.some((l) => l.includes(noteText)),
+			ev.systemPromptOptions.promptGuidelines);
+
+		writeBridgeRole("off");
+		const ev2 = { systemPromptOptions: { promptGuidelines: [] } };
+		await handlers.before_agent_start?.[0]?.(ev2, {});
+		check("before_agent_start: role off 면 역할 가이드와 메모 모두 없음",
+			!ev2.systemPromptOptions.promptGuidelines.includes(ROLE_GUIDES.review) && !ev2.systemPromptOptions.promptGuidelines.some((l) => l.includes(noteText)),
+			ev2.systemPromptOptions.promptGuidelines);
+
+		rmSync(roleNotesFile, { force: true });
+	}
+
+	// /role 명령
+	{
+		resetRoleGlobal();
+		writeFileSync(join(testAgentDir, "bridge.json"), JSON.stringify({ compact_thinking: "keep", other_key: "x" }));
+		const cmds = {};
+		kitDefault({ on: () => {}, registerCommand: (n, def) => { cmds[n] = def; }, registerTool: () => {}, getActiveTools: () => [], getAllTools: () => [] });
+		const ctx = {
+			hasUI: true,
+			ui: { notify: (msg, level = "info") => { ctx.notes.push({ msg, level }); }, setWidget: () => {} },
+			notes: [],
+		};
+		await cmds.role.handler("review", ctx);
+		const cfg = JSON.parse(readFileSync(join(testAgentDir, "bridge.json"), "utf8"));
+		check("/role 리뷰: role 만 바꾸고 다른 키는 그대로", cfg.role === "review" && cfg.compact_thinking === "keep" && cfg.other_key === "x", cfg);
+		check("/role 리뷰: 알림에 다음 요청부터 적용", ctx.notes.some((n) => n.level === "info" && n.msg.includes("다음 요청부터 적용")), ctx.notes);
+
+		await cmds.role.handler("모름", ctx);
+		check("/role 모름: 알림 경고", ctx.notes.at(-1).level === "warning", ctx.notes.at(-1));
+	}
+
+	// /doctor 역할 줄
+	{
+		async function runDoctor() {
+			const cmdsD = {};
+			kitDefault({ on: () => {}, registerCommand: (n, def) => { cmdsD[n] = def; }, registerTool: () => {}, getActiveTools: () => [], getAllTools: () => [] });
+			const ctxD = {
+				hasUI: true,
+				ui: { notify: (t, l) => {}, setWidget: (k, v) => { ctxD.widget = v; } },
+				model: { provider: "vllm", id: "Qwen/Qwen3-8B" },
+				sessionManager: { buildSessionProjection: () => ({ messages: [] }) },
+				widget: null,
+			};
+			await cmdsD.doctor.handler("", ctxD);
+			return (ctxD.widget?.[0] || "").split("\n");
+		}
+		writeBridgeRole("review");
+		const lines = await runDoctor();
+		check("/doctor: role review 면 '역할: 리뷰' 줄", lines.some((l) => l.includes("역할: 리뷰")), lines);
+
+		writeBridgeRole("off");
+		const linesOff = await runDoctor();
+		check("/doctor: role off 면 '역할: 없음' 줄", linesOff.some((l) => l.includes("역할: 없음")), linesOff);
 	}
 }
 

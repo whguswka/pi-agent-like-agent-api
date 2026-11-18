@@ -81,16 +81,57 @@ const label = (t: Target) => (t.remote ? `노트북 ${t.abs}` : tildePath(t.abs)
 const cut = (s: string, n = 60) => (s.length > n ? s.slice(0, n) + "…" : s);
 const one = (s: string) => s.replace(/\s+/g, " ").trim();
 const agentDirOf = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-/** 기억할 곳: jupyter 모드면 프로젝트와 공통 지침 모두 노트북, /local·PC 면 둘 다 PC */
+const safeJson = (s: string): any => {
+	try {
+		return JSON.parse(s.replace(/^\uFEFF/, ""));
+	} catch {
+		return undefined;
+	}
+};
+const bridgeConfigPath = () => process.env.PI_COPILOT_USER_CONFIG || join(agentDirOf(), "bridge.json");
+export type MemoryRole = "review" | "develop" | "off";
+const ROLE_NAMES: Record<string, MemoryRole> = { review: "review", 리뷰: "review", develop: "develop", 개발: "develop", off: "off", 끔: "off" };
+/** bridge.json 의 role 값 (기본 off) */
+export function getBridgeRole(): MemoryRole {
+	try {
+		const v = String(safeJson(readFileSync(bridgeConfigPath(), "utf8"))?.role || "").toLowerCase();
+		return ROLE_NAMES[v] || "off";
+	} catch {
+		return "off";
+	}
+}
+/** '이 pi 에만' 메모 파일: 언제나 이 pi 프로세스의 로컬 설정 폴더 (jupyter 모드여도 노트북으로 보내지 않음).
+ *  노트북의 ~/.pi/agent 는 같은 노트북 API 키트의 설정 폴더라, 거기 두면 PC pi 의 메모를 API 키트가 읽어 역할이 다시 섞임 */
+export function roleNotesTarget(_wd: WorkDir = workDir()): Target {
+	return target(join(agentDirOf(), "role-notes.md"), { remote: false, cwd: process.cwd() });
+}
+/** 역할 메모 파일 내용 (없거나 비면 null) */
+export async function readRoleNotes(wd?: WorkDir): Promise<string | null> {
+	const t = roleNotesTarget(wd || workDir());
+	try {
+		const b = await readTarget(t);
+		if (!b) return null;
+		const text = b.toString("utf8").trim();
+		return text || null;
+	} catch {
+		return null;
+	}
+}
+/** 기억할 곳: jupyter 모드면 프로젝트와 공통 지침 모두 노트북, /local·PC 면 둘 다 PC. role 이 off 가 아니면 로컬 "이 pi 에만" 추가 */
 export function memoryPlaces(wd: WorkDir = workDir()): [string, Target][] {
 	const project = target("AGENTS.md", wd);
 	const global = wd.remote
 		? notebookTarget(".pi/agent/AGENTS.md", wd)
 		: target(join(agentDirOf(), "AGENTS.md"), { remote: false, cwd: process.cwd() });
-	return [
+	const opts: [string, Target][] = [
 		[`이 프로젝트만: ${label(project)}`, project],
 		[`모든 프로젝트: ${label(global)}`, global],
 	];
+	if (getBridgeRole() !== "off") {
+		const local = roleNotesTarget(wd);
+		opts.push([`이 pi 에만: ${label(local)}`, local]);
+	}
+	return opts;
 }
 
 // ── 작업 기록 ─────────────────────────────────────────────────

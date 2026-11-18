@@ -878,6 +878,8 @@ export const TODO_PLAN_MODE =
 //  단계마다의 시각이 모두 어림이 됨). 목록을 고친 뒤 다른 도구가 이만큼 쓰이면, 그래도 고치지 않으면 TODO_NUDGE_AGAIN 번째에 한 번 더
 export const TODO_NUDGE_AT = 3;
 export const TODO_NUDGE_AGAIN = 8;
+/** todo_confirm 에서 '등록하지 않음' 을 고른 뒤 todo 결과 (그 요청 동안 같은 글) */
+export const TODO_CONFIRM_SKIPPED = "사용자가 이 목록을 작업판에 올리지 않기로 했습니다. 이번 요청에서는 todo 를 다시 부르지 말고 그대로 진행하세요.";
 // 강제 (2026-11-06 사용자: 성능이 낮은 모델 위주라 지침·알림만으로는 안 됨). TODO_NUDGE_AGAIN 번째부터 쓰기·실행을 막고, 답 이만큼을 막아도 고치지 않으면 그 요청 동안 풀어 줌.
 //  요청 끝에 표시가 안 맞으면 요청마다 한 번 돌려보냄. 끄기: /hooks off todo (내 설정 파일의 "todo_enforce": false)
 export const TODO_GATE_TRIES = 2;
@@ -1149,7 +1151,18 @@ export function todoWidget(s: TodoState & { no?: number }): string {
 
 const agentDirOf = () => process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 export const todoDir = () => join(agentDirOf(), "todo");
-/** 프로젝트마다 파일 이름: 작업 폴더의 끝 두 이름 + 경로의 짧은 해시 (이름이 같은 다른 폴더와 섞이지 않게). 노트북 폴더는 nb- */
+/** 경로 정규화: 역슬래시→슬래시, 끝 슬래시 제거(루트는 '/' 유지) */
+const normCwd = (cwd: string) => String(cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+/** Linux 절대 경로인지 (정규화 뒤). UNC(\/\/서버/...)나 Windows 드라이브 형식은 아님 */
+const isLinuxAbs = (p: string) => p.startsWith("/") && !p.startsWith("//") && !/^[A-Za-z]:\//.test(p);
+/** 같은 작업 폴더인지. 둘 다 Linux 절대 경로이고 같으면 remote 값이 달라도 같음. Windows 경로는 지금처럼 remote 도 같아야 함 */
+export function sameWhere(a: { cwd: string; remote: boolean }, b: { cwd: string; remote: boolean }): boolean {
+	const na = normCwd(a.cwd), nb = normCwd(b.cwd);
+	const samePath = na === nb;
+	return isLinuxAbs(na) && isLinuxAbs(nb) ? samePath : samePath && a.remote === b.remote;
+}
+/** 프로젝트마다 파일 이름: 작업 폴더의 끝 두 이름 + 경로의 짧은 해시 (이름이 같은 다른 폴더와 섞이지 않게). 노트북 폴더는 nb-
+ *  (예전 프로젝트별 목록 파일 이름과 한 pi 안의 위치 바뀜 판정에만 씀. 작업판의 같은 위치 판정은 sameWhere. 파일 이름이 바뀌지 않게 그대로 둠) */
 export function todoKey(cwd: string, remote: boolean): string {
 	const p = cwd.replace(/\\/g, "/").replace(/\/+$/, "");
 	const ci = !remote && process.platform === "win32";
@@ -1168,8 +1181,8 @@ export function todoKey(cwd: string, remote: boolean): string {
 export function todoWhere(w: WorkDir = workDir()) {
 	const raw = String(w.cwd || process.cwd());
 	const notebook = notebookMode(w);
-	const cwd = notebook ? raw.replace(/\\/g, "/").replace(/\/+$/, "") || "/" : raw;
-	const name = raw.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean).slice(-2).join("/") || cwd;
+	const cwd = notebook ? normCwd(raw) : raw;
+	const name = normCwd(raw).split("/").filter(Boolean).slice(-2).join("/") || cwd;
 	return { cwd, remote: notebook, key: todoKey(cwd, notebook), project: `${notebook ? "노트북 " : ""}${name}` };
 }
 const safeJson = (x: unknown) => JSON.stringify(x).replace(/</g, "\\u003c");
@@ -1191,6 +1204,8 @@ export type Task = TodoState & {
 	state: TaskState;
 	closed: number | null;
 	manual?: boolean;
+	/** 마지막으로 이 작업을 진행한 키트 (api/pc). 예전 작업판에는 없을 수 있음. */
+	by?: "api" | "pc";
 	alias?: string[];
 	lastTop?: string[];
 	/** 계획 단계 리뷰 관문. 예전 작업판에는 없으며 그대로 읽을 수 있다. */
@@ -1299,16 +1314,16 @@ export function reopenStep(t: Task, step: number, now: number): boolean {
 	t.updated = now;
 	return true;
 }
-/** 새 작업 (#번호는 작업판 안에서 하나씩 늘어남) */
+/** 새 작업 (#번호는 작업판 안에서 하나씩 늘어남). 만든 키트를 by 에 적는다 */
 export function addTask(b: Board, s: TodoState, now: number): Task {
-	const t: Task = { ...s, id: `${now.toString(36)}-${b.next}`, no: b.next++, state: "doing", closed: null };
+	const t: Task = { ...s, id: `${now.toString(36)}-${b.next}`, no: b.next++, state: "doing", closed: null, by: kitKind() };
 	finishIfDone(t, now);
 	b.tasks.push(t);
 	return t;
 }
-/** 같은 작업의 목록을 바꿈 (번호·상태는 그대로. 단계가 다시 열리면 저절로 완료된 작업은 다시 진행) */
+/** 같은 작업의 목록을 바꿈 (번호·상태·by 는 그대로. 단계가 다시 열리면 저절로 완료된 작업은 다시 진행) */
 export function putTask(t: Task, s: TodoState, now: number) {
-	const keep = { id: t.id, no: t.no, state: t.state, closed: t.closed };
+	const keep = { id: t.id, no: t.no, state: t.state, closed: t.closed, by: t.by };
 	Object.assign(t, s, keep);
 	if (t.state === "done" && !t.manual && !todoSummary(t).all) [t.state, t.closed] = ["doing", null];
 	finishIfDone(t, now);
@@ -1646,7 +1661,18 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
       started: starts.length ? Math.min.apply(null, starts) : null, ended: all ? Math.max.apply(null, items.map(function (x) { return x.ended || 0; })) : null };
   }
   function opened(t) { return t.state === "doing" || t.state === "paused"; }
-  function pkey(t) { return (t.remote ? "nb:" : "pc:") + t.cwd; }
+  function sameWhere(a, b) {
+    var na = String(a.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+    var nb = String(b.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+    var linuxA = na.startsWith("/") && !na.startsWith("//") && !/^[A-Za-z]:\//.test(na);
+    var linuxB = nb.startsWith("/") && !nb.startsWith("//") && !/^[A-Za-z]:\//.test(nb);
+    return na === nb && (linuxA && linuxB ? true : a.remote === b.remote);
+  }
+  function pkey(t) {
+    var n = String(t.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+    var linux = n.startsWith("/") && !n.startsWith("//") && !/^[A-Za-z]:\//.test(n);
+    return (linux ? "lx:" : (t.remote ? "nb:" : "pc:")) + n;
+  }
   function badge(t, s) {
 	if (t.gate) return '<span class="bd ' + (t.gate.state === "ok" ? "done" : "warn") + '">' +
 	  (t.gate.state === "wait" ? "리뷰 대기" : t.gate.state === "fix" ? "리뷰에서 고칠 것" : "리뷰 통과") + " (" + t.gate.step + "단계" + (t.gate.by ? " · " + esc(t.gate.by) : "") + ")</span>";
@@ -1789,6 +1815,8 @@ export default function (pi: ExtensionAPI) {
 	let curSince = 0; // 지금 작업이 된 때 (그 뒤 사용자가 새 요청을 보내기 전에 다시 쓴 목록은 새 작업이 아니라 같은 작업을 바꿔 씀)
 	let lastInputAt = 0; // 사용자가 마지막으로 요청을 보낸 때
 	let lastReq = ""; // 사용자가 마지막으로 보낸 요청의 첫 줄 (작업 이름)
+	let askedTodoConfirm = false; // 이번 요청에서 새 작업 등록을 물었음
+	let todoConfirmSkip = false; // 이번 요청에서 '등록하지 않음'을 고름 (todo 는 같은 글만 돌려줌)
 	let planReq = ""; // 계획 모드에서 처음 보낸 요청 (승인한 계획 작업의 이름. /plan <요청> 으로 보낸 것도)
 	let planModelPrev: any = null; // plan_model 로 바꾸기 전 모델 (승인 없이 계획 모드를 끄면 되돌림)
 	// '새 대화로 진행' 을 고른 계획 (/plan --new 를 보내면 새 세션에서 진행). n 단계 수, task 작업판에 둘 목록, refine 지금 작업을 고침
@@ -1809,6 +1837,7 @@ export default function (pi: ExtensionAPI) {
 	let gateNotice = ""; // 요청 끝의 리뷰 대기 알림은 관문 상태마다 한 번
 	const sameEditByPath = new Map<string, number>(); // 사용자 요청마다 같은 글 edit 를 경로별로 센다
 	const todoEnforce = () => userConfig().todo_enforce !== false;
+	const todoConfirm = () => userConfig().todo_confirm !== false;
 	const reviewGateEnabled = () => userConfig().review_gate === true;
 	/** 이 pi 가 그 관문을 건 쪽인지: 막기·[리뷰 통과] 안내·요청 끝 알림은 그 pi 에서만 (리뷰하는 다른 pi 는 같은 작업판을 봐도 막지 않음) */
 	const gateMine = (t: Task | null | undefined) => !!t?.gate && (t.gate.holder ? t.gate.holder === kitKind() : reviewGateEnabled() || !!t.range);
@@ -1857,10 +1886,7 @@ export default function (pi: ExtensionAPI) {
 		const t = cur();
 		ctx.ui.setWidget("pi-kit-plan", t?.items.length ? [todoWidget(t)] : undefined);
 	};
-	const here = (t: Task | null) => {
-		const w = todoWhere();
-		return !!t && t.cwd === w.cwd && t.remote === w.remote;
-	};
+	const here = (t: Task | null) => !!t && sameWhere(t, todoWhere());
 	const waitingGate = (): Task | null =>
 		activeBoard().tasks
 			.filter((t) => here(t) && t.source === "plan" && t.gate?.state === "wait")
@@ -1968,14 +1994,23 @@ export default function (pi: ExtensionAPI) {
 			return null;
 		}
 	};
-	/** 새 작업을 지금 작업으로 (하던 작업은 쉬는 중으로 작업판에 남음). 쉬게 한 작업을 돌려준다 */
-	const newTask = async (ctx: any, s: TodoState): Promise<Task | null> => {
+	/** 새 작업을 지금 작업으로. 하던 작업이 같은 키트가 진행 중이면 쉬는 중으로, 다른 키트가 진행 중이면 그대로 둔다. */
+	const newTask = async (ctx: any, s: TodoState): Promise<{ paused: Task | null; note: string }> => {
 		const now = Date.now();
 		let paused: Task | null = null;
+		let note = "";
 		await edit(ctx, (b) => {
 			const old = curId ? b.tasks.find((t) => t.id === curId) : undefined;
-			if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped, paused] = ["paused", null, old];
-			[curId, curSince] = [addTask(b, s, now).id, now];
+			if (old?.state === "doing" && !todoSummary(old).all) {
+				if (old.by && old.by !== kitKind()) {
+					note = `앞 작업 #${old.no} 은 다른 키트가 진행 중이라 그대로 둠`;
+				} else {
+					[old.state, old.stopped, paused] = ["paused", null, old];
+					note = `앞 작업 #${old.no} 은 쉬는 중으로 작업판에 남김`;
+				}
+			}
+			const t = addTask(b, s, now);
+			[curId, curSince] = [t.id, now];
 		});
 		// 내 설정 "todo_open": true 면 새 작업이 생길 때 (세션에 한 번) 작업판을 연다 (화면이 있으면 브라우저 창, code-server 터미널에서는 편집기 탭).
 		//  저절로 열 때는 알림 없음: 창·탭이 저절로 열리는 것이 이미 표시이고, 실패해도 전처럼 창이 안 열리는 뿐이므로 조용히 넘긴다 (필요하면 언제든 /todo open)
@@ -1983,9 +2018,9 @@ export default function (pi: ExtensionAPI) {
 			const opened = openTodo(todoFile()); // 저절로 열 때는 결과가 어떻게 끝나든 알림을 내지 않는다 (Promise 결과는 버림)
 			if (opened) autoOpened = true; // 여는 방법이 있었으면 한 번 연 셈 (성패와 무관하게 세션에 한 번만 시도)
 		}
-		return paused;
+		return { paused, note };
 	};
-	/** 지금 작업의 목록을 바꿈 (작업판에서 없어졌으면 새 작업으로) */
+	/** 지금 작업의 목록을 바꿈 (작업판에서 없어졌으면 새 작업으로). 이 키트가 진행 중으로 표시 */
 	const updateTask = async (ctx: any, s: TodoState, alias: string[] = []) => {
 		let found = false;
 		await edit(ctx, (b) => {
@@ -1994,8 +2029,9 @@ export default function (pi: ExtensionAPI) {
 			found = true;
 			putTask(t, s, Date.now());
 			if (alias.length) [t.alias, t.lastTop] = [[...new Set([...(t.alias || []), ...alias.map(textKey)])].slice(-60), alias.map(textKey)];
+			t.by = kitKind();
 		});
-		if (!found) await newTask(ctx, s);
+		if (!found) return newTask(ctx, s);
 	};
 	// /plan·/mode 는 목록을 닫지 않음: 진행하던 계획을 계획 모드에서 다듬으면 그 목록에 이어 붙임 (replanTodo). 끝난 목록은 다음 요청 때 닫힘.
 	//  2026-11-04 전에는 승인한 계획의 목록을 닫아서, 다듬은 계획을 승인하면 끝난 단계까지 처음부터 다시 셈
@@ -2045,9 +2081,14 @@ export default function (pi: ExtensionAPI) {
 			} catch {}
 		} else if (lastWhereKey !== todoWhere().key) await syncBoard(ctx, event.source !== "extension");
 		if (event.source !== "extension" && text.trim()) {
-			[lastReq, lastInputAt] = [cut(text.trim().split("\n")[0], 100), Date.now()];
+			// /remember 로 지침을 더한 요청 앞에 붙은 안내를 작업 이름에서 뺀다
+			// (기억한 글에 괄호가 들어 있을 수 있어 '…)' 다음 빈 줄까지를 뗌: 회사 2026-11-18 '단계 완료시(1, 2, 3...)')
+			const userText = text.replace(/^\(사용자가 \/remember 로 지침에 더한 내용입니다\. 지금부터 지켜 주세요: [\s\S]*?\)\n\n/, "");
+			[lastReq, lastInputAt] = [cut(userText.trim().split("\n")[0], 100), Date.now()];
 			[workSince, listTouched, bounced, gateTries, gateOff] = [0, false, false, 0, false];
 			sameEditByPath.clear();
+			askedTodoConfirm = false;
+			todoConfirmSkip = false;
 		}
 		const t = cur();
 		if (event.source !== "extension" && text.trim() && t?.source === "plan" && t.gate && t.gate.state !== "wait" && gateMine(t)) {
@@ -2133,7 +2174,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		// 목록을 오래 고치지 않으면 쓰기·실행을 막음 (읽기는 그대로). 알림은 무시할 수 있어 (2026-11-06)
-		if (mode !== "plan" && sinceTodo >= TODO_NUDGE_AGAIN && !todoInAnswer && !gateOff && changesThings(tool, input)) {
+		if (mode !== "plan" && sinceTodo >= TODO_NUDGE_AGAIN && !todoInAnswer && !gateOff && !todoConfirmSkip && changesThings(tool, input)) {
 			const t = cur();
 			if (t?.items.length && isOpen(t) && !todoSummary(t).all && todoEnforce()) {
 				if (gateSeq !== answerSeq) {
@@ -2184,7 +2225,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_result", async (event: any) => {
 		// 승인한 계획의 목록에도 (2026-11-04 실제 Copilot: "[N단계 완료]" 는 마지막 답에 한꺼번에 적어 진행 중에는 0/8 그대로)
 		const t = cur();
-		if (event.toolName === "todo" || review?.phase === "running" || !t?.items.length || !isOpen(t) || todoSummary(t).all || mode === "plan") return;
+		if (event.toolName === "todo" || todoConfirmSkip || review?.phase === "running" || !t?.items.length || !isOpen(t) || todoSummary(t).all || mode === "plan") return;
 		sinceTodo++;
 		if (changesThings(String(event.toolName || ""), event.input)) workSince++;
 		if (sinceTodo !== TODO_NUDGE_AT && sinceTodo !== TODO_NUDGE_AGAIN) return;
@@ -2243,7 +2284,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (bounced || lastEnd !== "stop" || workSince < 1 || !ctx?.hasUI || mode === "plan" || review || (globalThis as any).__piReview) return;
 		const t = cur();
-		if (!t?.items.length || !isOpen(t) || todoSummary(t).all || !(listTouched || curSince >= lastInputAt) || !todoEnforce()) return;
+		if (todoConfirmSkip || !t?.items.length || !isOpen(t) || todoSummary(t).all || !(listTouched || curSince >= lastInputAt) || !todoEnforce()) return;
 		if (typeof ctx.isIdle === "function" && !ctx.isIdle()) return;
 		bounced = true;
 		ctx.ui.notify("일을 한 뒤로 할 일 목록이 고쳐지지 않아 표시만 맞추게 합니다 (요청마다 한 번. 끄기: /hooks off todo)", "info");
@@ -2257,6 +2298,7 @@ export default function (pi: ExtensionAPI) {
 		await edit(ctx, (b) => {
 			const x = b.tasks.find((y) => y.id === t.id);
 			if (!x) return false;
+			// 다른 키트가 만든·진행하던 작업도 이어서 할 수 있음 (계획은 원래 키트, 개발은 API 키트). 이어서 한 키트가 by 가 됨
 			if (range) {
 				passReviewGate(x, now, "새 범위");
 				x.range = range;
@@ -2266,6 +2308,7 @@ export default function (pi: ExtensionAPI) {
 			const old = curId && curId !== x.id ? b.tasks.find((y) => y.id === curId) : undefined;
 			if (old?.state === "doing" && !todoSummary(old).all) [old.state, old.stopped] = ["paused", null];
 			[x.state, x.closed, x.stopped, x.updated] = ["doing", null, null, now];
+			x.by = kitKind();
 			delete x.manual;
 			[curId, curSince] = [x.id, now];
 		});
@@ -2478,6 +2521,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!changed) return false;
 			finishIfDone(x, now);
+			x.by = kitKind();
 		});
 		if (changed) listUpdated();
 	});
@@ -2806,6 +2850,8 @@ export default function (pi: ExtensionAPI) {
 			// 계획 모드에서는 목록을 바꾸지 않음 (2026-11-04: 진행하던 8단계 계획을 다듬는 동안 모델이 '끝난 두 단계 + 계획 보완' 3줄을 보내면
 			//  목록이 그것으로 바뀜). 승인한 계획이 목록이 됨
 			if (mode === "plan") return reply(TODO_PLAN_MODE);
+			// 이번 요청에서 '등록하지 않음'을 고르면 작업판을 고치지 않고 같은 글만 돌려준다
+			if (todoConfirmSkip) return reply(TODO_CONFIRM_SKIPPED);
 			const read = readTodo(params?.text);
 			let lines = read.lines;
 			if (!lines.length) return reply(TODO_HELP);
@@ -2844,15 +2890,52 @@ export default function (pi: ExtensionAPI) {
 			const gateStep = prev?.source === "plan" && (prev.range || reviewGateEnabled())
 				? afterTop.findIndex((status, i) => status === "done" && gateAt({ ...prev!, items: next.items }, i + 1, reviewGateEnabled()) && (beforeTop[i] !== "done" || (prev.gate?.state === "fix" && prev.gate.step === i + 1))) + 1
 				: 0;
-			// 겹치는 단계가 없거나 남은 단계를 이어 가지 않는 목록: 사용자가 새 요청을 보낸 뒤면 새 작업 (하던 작업은 쉬는 중으로 작업판에 남음),
+			// 겹치는 단계가 없거나 남은 단계를 이어 가지 않는 목록: 사용자가 새 요청을 보낸 뒤면 새 작업
 			//  같은 요청 안이면 같은 작업을 바꿔 씀 (막 끝낸 목록에 단계를 더하면 그 작업을 다시 엶. 끝난 작업은 다음 요청 때 지금 작업에서 빠짐)
-			let paused: Task | null = null;
+			let taskResult: { paused: Task | null; note: string } = { paused: null, note: "" };
 			let mixed = false;
 			const sameTask = !!prev && (!!prev.range || sameReq || (next.updates > 1 && keeps));
+			// 새 작업 등록을 확인하는 창 (todo_confirm 설정이 켜져 있고 화면이 있을 때)
+			const willCreate = !sameTask && !plan;
+			if (willCreate && todoConfirm() && ctx.hasUI && !askedTodoConfirm) {
+				askedTodoConfirm = true;
+				const topLines = lines.filter((l) => l.level === 0);
+				const topItems = topLines.slice(0, 6).map((l) => `- ${l.text}`).join("\n");
+				const ellipsis = topLines.length > 6 ? "\n- …" : "";
+				const title = prev
+					? `지금 작업 #${prev.no} 이(가) 있는데 새 작업으로 등록할까요?\n${topItems}${ellipsis}`
+					: `새 작업으로 등록할까요?\n${topItems}${ellipsis}`;
+				const OPT_NEW = "a) 등록 (이 요청에서 다시 묻지 않음)";
+				const OPT_OVERWRITE = "b) 지금 작업에 덮어쓰기";
+				const OPT_SKIP = "c) 등록하지 않음 (이 요청에서 작업판에 등록하지 않음)";
+				// 덮어쓰기는 승인한 계획이면 맨 위 단계 수가 같을 때만 (단계 수가 다르면 계획 진행·리뷰 관문의 단계가 어긋남)
+				const tops = (xs: { level: number }[]) => xs.filter((x) => x.level === 0).length;
+				const canOverwrite = !!prev && (prev.source !== "plan" || tops(prev.items) === tops(lines));
+				const opts = [OPT_NEW, ...(canOverwrite ? [OPT_OVERWRITE] : []), OPT_SKIP];
+				const pick = await ctx.ui.select(title, opts);
+				if (pick === OPT_OVERWRITE && canOverwrite) {
+					// 덮어쓰기: 현재 작업을 이 목록으로 고친다
+					await updateTask(ctx, next, alias);
+					listUpdated();
+					const s = todoSummary(cur());
+					const notes = todoNotes(read, prev, next);
+					return reply(
+						`할 일 목록을 고쳤습니다 (끝남 ${s.done}/${s.total}${s.current ? `, 하는 중: ${s.current}` : ""})` +
+							(notes.length ? `\n확인할 것: ${notes.join(" / ")}` : ""),
+					);
+				}
+				if (pick === OPT_SKIP || !pick) {
+					todoConfirmSkip = true;
+					// 작업판에 등록하지 않음. 지금 작업(curId)은 그대로 두고 (하던 작업을 놓지 않게) 이 요청 동안 목록 재촉
+					//  (도구 결과 안내·쓰기 막기·요청 끝 되돌림)만 끈다: todoConfirmSkip 을 각 재촉에서 봄. 다음 사용자 요청에서 풀림
+					return reply(TODO_CONFIRM_SKIPPED);
+				}
+				// a) 등록 선택 시 아래 newTask 로직이 이어진다
+			}
 			if (sameTask) await updateTask(ctx, next, alias);
 			else {
 				mixed = !!prev && next.updates > 1; // 앞 작업의 단계를 섞어 보냄
-				paused = await newTask(ctx, mergeTodo(null, lines, Date.now(), { ...meta, source: "todo" }));
+				taskResult = await newTask(ctx, mergeTodo(null, lines, Date.now(), { ...meta, source: "todo" }));
 			}
 			if (sameTask && gateStep > 0) {
 				await edit(ctx, (b) => {
@@ -2863,9 +2946,13 @@ export default function (pi: ExtensionAPI) {
 			listUpdated();
 			const s = todoSummary(cur());
 			const notes = todoNotes(read, sameTask ? prev : null, sameTask ? next : null);
+			const paused = taskResult.paused;
+			const newTaskNote = taskResult.note
+				? ` · 새 작업 #${cur()?.no} (${taskResult.note}${mixed ? ". 앞 작업의 단계는 작업판에 있으니 이 목록에는 이 작업의 단계만 적어 주세요" : ""}. 앞 작업을 끝낼 일이면 사용자가 /todo 완료 ${(paused as Task)?.no})`
+				: "";
 			return reply(
 				`할 일 목록을 고쳤습니다 (끝남 ${s.done}/${s.total}${s.current ? `, 하는 중: ${s.current}` : ""})` +
-					(paused ? ` · 새 작업 #${cur()?.no} (앞 작업 #${(paused as Task).no} 은 쉬는 중으로 작업판에 남김${mixed ? ". 앞 작업의 단계는 작업판에 있으니 이 목록에는 이 작업의 단계만 적어 주세요" : ""}. 앞 작업을 끝낼 일이면 사용자가 /todo 완료 ${(paused as Task).no})` : "") +
+					newTaskNote +
 					(notes.length ? `\n확인할 것: ${notes.join(" / ")}` : ""),
 			);
 		},
@@ -2898,9 +2985,19 @@ export default function (pi: ExtensionAPI) {
 				if (!t) return ctx.ui.notify(sub === "clear" || sub === "지우기" ? "지금 작업이 없습니다 (/todo 로 진행 중 작업)" : `작업 #${n0 || "?"} 이(가) 작업판에 없습니다. ${usage}`, "warning");
 				if (sub === "이어서" || sub === "계속" || sub === "resume") {
 					if (!here(t)) {
-						// 폴더는 같은데 위치(노트북 작업인지)만 다름: 이 pi 가 노트북에서 도는 것을 알아보지 못함 (2026-11-17 회사 보고)
-						const hint = t.cwd.replace(/\\/g, "/").replace(/\/+$/, "") === todoWhere().cwd.replace(/\\/g, "/").replace(/\/+$/, "") ? " 같은 폴더인데 이 pi 가 노트북 작업으로 알아보지 못했습니다: pi 를 끄고 다시 켜 보세요 (~/tools/pi/bin/pi)." : "";
-						return ctx.ui.notify(`작업 #${t.no} 은(는) 다른 폴더의 작업입니다 (${t.project}: ${t.cwd}). 그 폴더에서 pi 를 켜고 /todo 이어서 ${t.no}.${hint}`, "warning");
+						const mine = todoWhere();
+						const linuxTask = isLinuxAbs(normCwd(t.cwd));
+						const linuxMe = process.platform !== "win32";
+						// 그 폴더로 가서 켜는 명령 (이 pi 가 Linux 이고 작업도 Linux 경로일 때. PC 의 jupyter 모드는 pi --jupyter 로 켜므로 붙이지 않음).
+						//  같은 Linux 경로면 sameWhere 가 같은 곳으로 보므로 여기 오지 않음 (11-17.2 의 '같은 폴더인데 …' 힌트는 필요 없어짐)
+						const cdHint = linuxMe && linuxTask ? `\n그 폴더에서 켜기: cd ${normCwd(t.cwd)} && pi` : "";
+						// project 에는 이미 '노트북 ' 이 붙어 있음 (todoWhere)
+						return ctx.ui.notify(
+							`작업 #${t.no} 은(는) 다른 폴더의 작업입니다.\n` +
+								`  작업: ${t.project} (${t.cwd})\n` +
+								`  이 pi: ${mine.project} (${mine.cwd})${cdHint}`,
+							"warning",
+						);
 					}
 					const parsed = resumeRange(t, more.join(" "));
 					if (parsed.error) return ctx.ui.notify(parsed.error, "warning");

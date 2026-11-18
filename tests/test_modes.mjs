@@ -5,6 +5,11 @@ import { join as join0 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "../runtime/node_modules/jiti/lib/jiti.mjs";
 
+// 시험은 기본적으로 PC 환경에서 돈다. 외부에서 NB_PREFIX/PI_API_KIT 를 주면 모든 시험이 노트북 모드로 흐려지므로 맨 처음에 잠시 끄고, 끝에 복구
+const savedNB = process.env.NB_PREFIX, savedKit = process.env.PI_API_KIT;
+delete process.env.NB_PREFIX;
+delete process.env.PI_API_KIT;
+
 // typebox: modes.ts 의 todo 도구 (pi 런타임에 들어 있는 것)
 const jiti = createJiti(import.meta.url, { alias: { typebox: fileURLToPath(new URL("../runtime/node_modules/typebox/build/index.mjs", import.meta.url)) } });
 const m = await jiti.import("../profiles/common/agent-template/extensions/modes.ts");
@@ -117,6 +122,8 @@ const widgets = [];
 let idle = true;
 let setModelResult = true; // pi.setModel 은 인증이 없으면 false
 const modelSets = [];
+let selectPick = 0; // ctx.ui.select 가 고를 옵션 인덱스 (시험 중 바꿈)
+let selectCalls = []; // ctx.ui.select 호출 기록
 m.default({
 	on: (e, f) => (on[e] ||= []).push(f), registerCommand: (n, def) => (cmds[n] = def), sendUserMessage: (text, opts) => sent.push({ text, opts, at: modelSets.length }),
 	setModel: async (mm) => (modelSets.push(mm), setModelResult), registerTool: (t) => (tools[t.name] = t),
@@ -125,7 +132,7 @@ const todoBounce1 = globalThis.__piTodoBounce; // 뒤에서 확장을 한 번 �
 const ctx = {
 	hasUI: true,
 	isIdle: () => idle,
-	ui: { notify: (t, lv) => (notes.push(t), levels.push(lv)), setStatus() {}, setWidget: (k, v) => widgets.push({ k, v }), select: async (_t, opts) => opts[0], confirm: async () => true },
+	ui: { notify: (t, lv) => (notes.push(t), levels.push(lv)), setStatus() {}, setWidget: (k, v) => widgets.push({ k, v }), select: async (title, opts) => (selectCalls.push({ title: String(title).split("\n")[0], opts }), opts[selectPick]), confirm: async () => true },
 };
 const tick = () => new Promise((r) => setTimeout(r, 20));
 // 확장이 setTimeout 으로 따로 하는 일(보내기, 계획서·설정 읽기, 모델 바꾸기)은 보낸 글이 늘 때까지 기다림 (5초까지).
@@ -414,6 +421,10 @@ const k1 = m.todoKey("C:\\Users\\a\\work\\lab", false);
 check("파일 이름: 작업 폴더의 끝 두 이름 + 짧은 해시 (Windows 는 대소문자 같음), 노트북은 nb-, 쓸 수 없는 글자는 _",
 	/^work-lab-[0-9a-f]{8}$/.test(k1) && (process.platform !== "win32" || m.todoKey("c:/users/A/Work/LAB/", false).endsWith(k1.slice(-8))) && m.todoKey("/home/jovyan/work/lab", true).startsWith("nb-work-lab-")
 	&& m.todoKey("C:/w/a b:c*", false).startsWith("w-a_b_c_-") && m.todoKey("C:/x/한글 폴더", false).startsWith("x-한글_폴더-"), [k1, m.todoKey("C:/w/a b:c*", false)]);
+check("같은 Linux 절대 경로는 remote 가 달라도 같은 곳 (PC/노트북 공유 폴더)",
+	m.sameWhere({ cwd: "/home/jovyan/work/lab", remote: false }, { cwd: "/home/jovyan/work/lab", remote: true })
+	&& !m.sameWhere({ cwd: "C:/work/lab", remote: false }, { cwd: "C:/work/lab", remote: true })
+	&& !m.sameWhere({ cwd: "/home/jovyan/work/lab", remote: false }, { cwd: "/home/jovyan/other", remote: false }));
 const tricky = m.mergeTodo(null, m.parseTodo("- [~] </script><b>x</b>"), 1, meta);
 const bt = m.emptyBoard();
 m.addTask(bt, tricky, 1);
@@ -577,7 +588,7 @@ check("/todo 이어서 (없는 번호): 알림만", notes.at(-1).includes("작�
 const other = m.editBoard((b) => void m.addTask(b, m.mergeTodo(null, m.parseTodo("- [ ] 남의 폴더 일"), 50, { ...meta, cwd: "C:/elsewhere", project: "elsewhere" }), 50));
 const otherNo = other.tasks.at(-1).no;
 await cmds.todo.handler(`이어서 ${otherNo}`, ctx);
-check("/todo 이어서 (다른 폴더의 작업): 바꾸지 않고 그 폴더에서 하라고 알림", notes.at(-1).includes("다른 폴더의 작업") && notes.at(-1).includes("C:/elsewhere") && doing().no === 1, notes.at(-1));
+check("/todo 이어서 (다른 폴더의 작업): 바꾸지 않고 작업 쪽·이 pi 위치를 알림", notes.at(-1).includes("다른 폴더의 작업") && notes.at(-1).includes("  작업: ") && notes.at(-1).includes("이 pi:") && notes.at(-1).includes("C:/elsewhere") && doing().no === 1, notes.at(-1));
 await cmds.todo.handler(`폐기 ${otherNo}`, ctx);
 await cmds.todo.handler("완료 2", ctx);
 const bb = board();
@@ -595,6 +606,42 @@ check("끝난 작업은 다음 요청 때 입력창 위에서 닫히고 작업�
 await cmds.todo.handler("이어서 2", ctx);
 await cmds.todo.handler("clear", ctx);
 check("/todo clear: 지금 작업을 폐기 (작업판 완료 탭에 '폐기')", board().tasks.find((t) => t.no === 2).state === "dropped" && widgets.at(-1).v === undefined, board().tasks.map((t) => [t.no, t.state]));
+
+// 2026-11-18: 공유 폴더 위치 판정, 이어서 경고, 키트별 진행 기록
+{
+	const linuxCwd = "/home/jovyan/work/lab";
+	const linuxTask = m.editBoard((b) => void m.addTask(b, m.mergeTodo(null, m.parseTodo("- [ ] 리눅스 공유 일"), 70, { ...meta, cwd: linuxCwd, project: "lab" }), 70));
+	const linuxNo = linuxTask.tasks.at(-1).no;
+	await cmds.todo.handler(`이어서 ${linuxNo}`, ctx);
+	// cd 줄은 이 pi 가 Linux 일 때만 (Windows 의 PC 키트는 jupyter 모드를 pi --jupyter 로 켬)
+	const cdOk = process.platform === "win32" ? !notes.at(-1).includes("cd ") : notes.at(-1).includes(`cd ${linuxCwd} && pi`);
+	check("/todo 이어서 (다른 Linux 폴더의 작업): 작업·이 pi 위치를 알림, 이 pi 가 Linux 면 cd 명령도",
+		notes.at(-1).includes("다른 폴더의 작업") && notes.at(-1).includes(linuxCwd) && notes.at(-1).includes("이 pi:") && cdOk, notes.at(-1));
+	await cmds.todo.handler(`폐기 ${linuxNo}`, ctx);
+}
+await on.input[0]({ text: "by 기록 시험", source: "interactive" }, ctx);
+await tools.todo.execute("by1", { text: "- [~] by 확인 단계" }, undefined, undefined, ctx);
+check("새 작업은 by=pc 로 기록", doing().by === "pc", doing());
+{
+	// 앞 작업의 by 를 "api" 로 바꾸면 (다른 키트가 진행 중인 것처럼) 새 작업을 만들 때 쉬게 하지 않음
+	const crossId = doing().id;
+	m.editBoard((b) => { const t = b.tasks.find((x) => x.id === crossId); if (t) t.by = "api"; });
+	await tick();
+	await on.input[0]({ text: "pc 쪽 새 일", source: "interactive" }, ctx);
+	const pcRes = await tools.todo.execute("pc1", { text: "- [~] pc 단계" }, undefined, undefined, ctx);
+	const apiTask = board().tasks.find((t) => t.id === crossId);
+	check("다른 키트가 진행 중일 때 새 작업: 앞 작업은 그대로 두고 새 작업을 만듦",
+		apiTask.by === "api" && apiTask.state === "doing" && doing().no !== apiTask.no && pcRes.content[0].text.includes("다른 키트가 진행 중이라 그대로 둠"), [apiTask, doing(), pcRes.content[0].text]);
+	// 같은 PC 키트의 doing 작업을 바로 쉬게 하는 것은 기존 시험에서 이미 확인 ("/todo 이어서 1" 과 Copilot 급한 일 시험)
+	// 여기서는 by 가 다른 키트면 쉬게 하지 않는지만 명확히 본다
+	// 다른 키트가 진행하던 작업도 이어서 할 수 있어야 함 (계획은 원래 키트, 개발은 API 키트가 /todo 이어서 N). 이어서 한 키트가 by
+	const pcNo = doing().no;
+	await cmds.todo.handler(`이어서 ${apiTask.no}`, ctx);
+	const back = board().tasks.find((t) => t.id === crossId);
+	check("다른 키트가 진행하던 작업도 /todo 이어서 N 으로 이어서 함 (by 는 이어서 한 키트로)",
+		doing().id === crossId && back.by === "pc" && back.state === "doing" && board().tasks.find((t) => t.no === pcNo).state === "paused", [back, notes.at(-1)]);
+}
+
 // 2026-11-04 실제 Copilot: 급한 일의 목록에 앞 작업의 끝난 단계 하나를 섞어 보냄 -> 겹친다고 같은 작업으로 보면 앞 작업의 목록이 급한 일로 바뀜
 await tick();
 await on.input[0]({ text: "보고서 만들기", source: "interactive" }, ctx);
@@ -1284,7 +1331,70 @@ rmSync(TW, { recursive: true, force: true });
 	rmSync(GA, { recursive: true, force: true });
 	rmSync(GP, { recursive: true, force: true });
 }
+// 2026-11-18: todo_confirm 설정과 등록·덮어쓰기·등록하지 않음 시험
+{
+	const TC = mkdtempSync(join(tmpdir(), "modes-tc-"));
+	const oldCfg = process.env.PI_COPILOT_USER_CONFIG;
+	process.env.PI_COPILOT_USER_CONFIG = join(TC, "bridge.json");
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({ todo_confirm: false }));
+	globalThis.__piWorkDir = { remote: false, cwd: TC };
+	await on.session_start[0]({}, ctx);
+	await tick();
+	await on.input[0]({ text: "확인 끔 테스트", source: "interactive" }, ctx);
+	const before = board().tasks.filter((t) => t.state !== "done" && t.state !== "dropped").length;
+	selectCalls.length = 0;
+	res = await tools.todo.execute("tc-off", { text: "- [ ] 확인 꺼짐 단계" }, undefined, undefined, ctx);
+	check("todo_confirm false: 묻지 않고 바로 새 작업 등록", !selectCalls.some((c) => c.title.includes("새 작업으로 등록할까요?")) && board().tasks.filter((t) => t.state !== "done" && t.state !== "dropped").length === before + 1, [selectCalls, board().tasks.map((t) => [t.no, t.state])]);
+
+	// 다시 켜고 등록하지 않음
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({ todo_confirm: true }));
+	await on.session_start[0]({}, ctx);
+	await tick();
+	await on.input[0]({ text: "등록하지 않음 테스트", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	const skipCur = doing()?.no;
+	selectPick = 2; // c) 등록하지 않음
+	res = await tools.todo.execute("tc-skip", { text: "- [ ] 등록 안 함 단계" }, undefined, undefined, ctx);
+	const afterSkip = board().tasks.filter((t) => t.state !== "done" && t.state !== "dropped").length;
+	check("todo_confirm: 등록하지 않음을 고르면 작업이 늘지 않고 같은 글만 돌려줌",
+		afterSkip === before + 1 && res.content[0].text.includes("올리지 않기로 했습니다"), [res.content[0].text, afterSkip, board().tasks.map((t) => [t.no, t.state])]);
+	// 같은 요청에서 두 번째 todo 도 등록하지 않음
+	res = await tools.todo.execute("tc-skip2", { text: "- [ ] 또 등록 안 함" }, undefined, undefined, ctx);
+	check("todo_confirm: 등록하지 않음 상태에서 같은 요청의 todo 는 다시 묻지 않고 같은 글 돌려줌",
+		res.content[0].text.includes("올리지 않기로 했습니다") && board().tasks.filter((t) => t.state !== "done" && t.state !== "dropped").length === before + 1, res.content[0].text);
+	// 하던 작업은 놓지 않고 (지금 작업 그대로), 그 요청 동안 목록 재촉(도구 결과 안내·요청 끝 되돌림)이 없음
+	const nudgesAfterSkip = [];
+	for (let i = 0; i < 9; i++) nudgesAfterSkip.push(await tr2("bash"));
+	check("todo_confirm: 등록하지 않음 뒤에도 지금 작업은 그대로, 그 요청 동안 목록 재촉 없음",
+		doing()?.no === skipCur && nudgesAfterSkip.every((x) => x === undefined) && !globalThis.__piTodoBounce?.(ctx), [skipCur, doing()?.no, nudgesAfterSkip]);
+
+	// 새 요청에서는 다시 묻고, 덮어쓰기 선택
+	await on.input[0]({ text: "덮어쓰기 테스트", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	selectPick = 1; // b) 지금 작업에 덮어쓰기
+	const curNo = doing().no;
+	res = await tools.todo.execute("tc-over", { text: "- [~] 덮어쓴 단계" }, undefined, undefined, ctx);
+	check("todo_confirm: 지금 작업에 덮어쓰기를 고르면 새 작업이 아니라 지금 작업을 고침",
+		doing().no === curNo && doing().items[0].text === "덮어쓴 단계" && !res.content[0].text.includes("새 작업"), [doing(), res.content[0].text]);
+
+	// /remember 안내가 작업 이름에서 빠지는지 확인 (todo_confirm 이 켜진 상태에서)
+	// 기억한 글에 괄호가 있어도 (회사 2026-11-18 '단계 완료시(1, 2, 3...)')
+	await on.input[0]({ text: "(사용자가 /remember 로 지침에 더한 내용입니다. 지금부터 지켜 주세요: 단계 완료시(1, 2, 3...) 보고 / 커밋은 한국어로)\n\n새 요청이에요", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	selectPick = 0; // a) 등록
+	res = await tools.todo.execute("tc-remember", { text: "- [ ] 단계 가\n- [ ] 단계 나" }, undefined, undefined, ctx);
+	check("todo_confirm + /remember: 새 작업 등록 전에 묻고, /remember 안내가 작업 이름에서 빠짐",
+		selectCalls.some((c) => c.title.includes("새 작업으로 등록할까요?")) && doing().request === "새 요청이에요", [doing()?.request, selectCalls.at(-1)]);
+
+	selectPick = 0;
+	process.env.PI_COPILOT_USER_CONFIG = oldCfg || undefined;
+	rmSync(TC, { recursive: true, force: true });
+}
+
 rmSync(AGENT0, { recursive: true, force: true });
+
+if (savedNB === undefined) delete process.env.NB_PREFIX; else process.env.NB_PREFIX = savedNB;
+if (savedKit === undefined) delete process.env.PI_API_KIT; else process.env.PI_API_KIT = savedKit;
 
 console.log(fails ? `\n실패 ${fails}개` : "\n모두 통과");
 process.exit(fails ? 1 : 0);
