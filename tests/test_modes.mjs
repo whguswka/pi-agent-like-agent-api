@@ -432,6 +432,19 @@ const html = m.boardHtml(bt, "board.data.js");
 check("작업판 HTML: 처음 작업판을 담고(</script> 같은 글은 바꿔 담음), 옆의 board.data.js 를 다시 읽음, 진행·완료 탭, 밖의 파일·서버는 쓰지 않음",
 	html.includes('var FILE = "board.data.js"') && html.includes("\\u003c/script>\\u003cb>") && !/https?:\/\//.test(html) && !html.includes("localhost") && (html.match(/<\/script>/g) || []).length === 2
 	&& html.includes('data-tab="open"') && html.includes('data-tab="closed"') && m.boardDataJs(bt).startsWith("window.__piBoard && window.__piBoard({") && m.boardHtml(null, "x.js").includes("window.__PI_BOARD_INIT = null"));
+// 작업판 스크립트는 TypeScript 템플릿 문자열 안이라 역슬래시가 한 번 풀림: 실제로 읽히는지 (2026-11-18 정규식이 '//' 주석이 되어 작업판이 빈 채로 열림)
+{
+	const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((x) => x[1]);
+	let parseErr = "";
+	for (const s of scripts) {
+		try {
+			new Function(s);
+		} catch (e) {
+			parseErr = String(e);
+		}
+	}
+	check("작업판 HTML: 스크립트에 문법 오류가 없음", scripts.length > 0 && !parseErr, parseErr);
+}
 // 작업판의 작업 (2026-11-04 사용자: 급한 일로 바꾸면 하던 일을 잊음 -> 모든 작업을 작업판에, 입력창 위에는 지금 작업만)
 const b1 = m.emptyBoard();
 const ta = m.addTask(b1, m.mergeTodo(null, m.parseTodo("- [~] 가\n- [ ] 나"), 10, meta), 10);

@@ -1661,17 +1661,16 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
       started: starts.length ? Math.min.apply(null, starts) : null, ended: all ? Math.max.apply(null, items.map(function (x) { return x.ended || 0; })) : null };
   }
   function opened(t) { return t.state === "doing" || t.state === "paused"; }
-  function sameWhere(a, b) {
-    var na = String(a.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
-    var nb = String(b.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
-    var linuxA = na.startsWith("/") && !na.startsWith("//") && !/^[A-Za-z]:\//.test(na);
-    var linuxB = nb.startsWith("/") && !nb.startsWith("//") && !/^[A-Za-z]:\//.test(nb);
-    return na === nb && (linuxA && linuxB ? true : a.remote === b.remote);
+  // (이 글은 TypeScript 템플릿 문자열 안이라 역슬래시가 한 번 풀림: 정규식 대신 문자열 함수로. 2026-11-18 역슬래시 정규식이 '//' 주석이 되어 작업판이 비었음)
+  function normCwd(c) {
+    var s = String(c || "").split(String.fromCharCode(92)).join("/");
+    while (s.length > 1 && s.charAt(s.length - 1) === "/") s = s.slice(0, -1);
+    return s || "/";
   }
+  function isLinuxAbs(s) { return s.charAt(0) === "/" && s.charAt(1) !== "/"; }
   function pkey(t) {
-    var n = String(t.cwd || "").replace(/\\/g, "/").replace(/\/+$/, "") || "/";
-    var linux = n.startsWith("/") && !n.startsWith("//") && !/^[A-Za-z]:\//.test(n);
-    return (linux ? "lx:" : (t.remote ? "nb:" : "pc:")) + n;
+    var n = normCwd(t.cwd);
+    return (isLinuxAbs(n) ? "lx:" : (t.remote ? "nb:" : "pc:")) + n;
   }
   function badge(t, s) {
 	if (t.gate) return '<span class="bd ' + (t.gate.state === "ok" ? "done" : "warn") + '">' +
