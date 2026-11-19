@@ -1344,6 +1344,90 @@ rmSync(TW, { recursive: true, force: true });
 	rmSync(GA, { recursive: true, force: true });
 	rmSync(GP, { recursive: true, force: true });
 }
+// 2026-11-18.1: 켤 때 다른 키트가 진행하던 doing 작업을 지금 작업으로 잡지 않음
+{
+	// 이 시험은 지금 작업판(AGENT0/todo)에 직접 3개의 doing 작업을 넣고, API 키트로 켜서 확인한 뒤 제거
+	const crossBoard = m.loadBoard();
+	const pcT = m.addTask(crossBoard, m.mergeTodo(null, m.parseTodo("- [ ] pc 가\n- [ ] pc 나"), 100, { ...meta, cwd: TW, request: "pc 작업" }), 100);
+	pcT.by = "pc";
+	const apiT = m.addTask(crossBoard, m.mergeTodo(null, m.parseTodo("- [ ] api 가\n- [ ] api 나"), 200, { ...meta, cwd: TW, request: "api 작업" }), 200);
+	apiT.by = "api";
+	const noneT = m.addTask(crossBoard, m.mergeTodo(null, m.parseTodo("- [ ] none 가\n- [ ] none 나"), 300, { ...meta, cwd: TW, request: "none 작업" }), 300);
+	m.saveBoard(crossBoard, 300);
+	const oldKit3 = process.env.PI_API_KIT;
+	process.env.PI_API_KIT = "1";
+	widgets.length = 0;
+	await on.session_start[0]({}, ctx);
+	check("켤 때 by=pc 인 doing 작업은 지금 작업이 아님 (다른 키트가 진행 중)", doing()?.no !== pcT.no);
+	check("켤 때 by가 없는 doing 작업은 지금 작업으로 잡힘", doing()?.no === noneT.no);
+	await cmds.todo.handler(`이어서 ${apiT.no}`, ctx);
+	const afterResume = board().tasks.find((t) => t.no === apiT.no);
+	check("/todo 이어서 N 으로 다른 키트 작업을 가져오면 by가 이 키트(api)로 바뀜", doing().no === apiT.no && afterResume?.by === "api");
+	// 시험용 작업 제거
+	m.editBoard((b) => { b.tasks = b.tasks.filter((t) => t.request !== "pc 작업" && t.request !== "api 작업" && t.request !== "none 작업"); });
+	process.env.PI_API_KIT = oldKit3 === undefined ? undefined : oldKit3;
+	if (process.env.PI_API_KIT === undefined) delete process.env.PI_API_KIT;
+}
+
+// 2026-11-18.2: 맨 위 단계 글이 바뀌면 확인 (두 단계 이상 겹쳐야 같은 작업으로 봄)
+{
+	const TS = mkdtempSync(join(tmpdir(), "modes-step-"));
+	const oldCfg = process.env.PI_COPILOT_USER_CONFIG;
+	process.env.PI_COPILOT_USER_CONFIG = join(TS, "bridge.json");
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({ todo_confirm: true }));
+	globalThis.__piWorkDir = { remote: false, cwd: TS };
+	await on.session_start[0]({}, ctx);
+	await tick();
+
+	// 요청 1: 세 단계 작업 등록 (새 작업 등록 확인 창이 뜸)
+	await on.input[0]({ text: "단계 바꿈 시험", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	selectPick = 0; // a) 등록
+	res = await tools.todo.execute("step-init", { text: "- [ ] 단계 가\n- [ ] 단계 나\n- [ ] 단계 다" }, undefined, undefined, ctx);
+	const curNo = doing().no;
+	check("단계 바꿈: 첫 todo 등록", doing().items.map((it) => it.text).join("|") === "단계 가|단계 나|단계 다" && doing().no === curNo, [doing(), res.content[0].text]);
+
+	// 요청 2: 가운데 단계만 바꾸면 묻고 '단계를 바꿈' 선택 시 갱신
+	await on.input[0]({ text: "단계 바꿈 두 번째", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	selectPick = 0; // a) 단계를 바꿈
+	res = await tools.todo.execute("step-change1", { text: "- [ ] 단계 가\n- [ ] 단계 라\n- [ ] 단계 다" }, undefined, undefined, ctx);
+	check("단계 바꿈: 맨 위 단계 글이 바뀌면 묻고 '단계를 바꿈' 선택 시 갱신",
+		selectCalls.some((c) => c.title.includes("단계를 바꿀까요?")) && doing().no === curNo && doing().items.map((it) => it.text).join("|") === "단계 가|단계 라|단계 다", [selectCalls, doing()]);
+
+	// 같은 요청에서 또 바꿈 -> 묻지 않고 반영
+	res = await tools.todo.execute("step-change2", { text: "- [ ] 단계 가\n- [ ] 단계 마\n- [ ] 단계 다" }, undefined, undefined, ctx);
+	check("단계 바꿈: 같은 요청에서 다시 바꾸면 묻지 않고 반영",
+		selectCalls.length === 1 && doing().no === curNo && doing().items.map((it) => it.text).join("|") === "단계 가|단계 마|단계 다", [selectCalls, doing()]);
+
+	// 요청 3: 다시 바꿔서 '새 작업' 선택 -> 새 작업이 생김
+	await on.input[0]({ text: "단계 바꿈 세 번째", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	selectPick = 1; // b) 새 작업으로 등록
+	res = await tools.todo.execute("step-change3", { text: "- [ ] 단계 가\n- [ ] 단계 바\n- [ ] 단계 다" }, undefined, undefined, ctx);
+	check("단계 바꿈: 새 요청에서 다시 바꾸면 다시 묻고 '새 작업' 선택 시 새 작업이 생김",
+		selectCalls.some((c) => c.title.includes("단계를 바꿀까요?")) && doing().no !== curNo && doing().items.map((it) => it.text).join("|") === "단계 가|단계 바|단계 다", [selectCalls, doing()]);
+
+	// 요청 4: '바꾸지 않음' 선택 시 작업판 안 고치고 취소 안내
+	await on.input[0]({ text: "단계 바꿈 취소", source: "interactive" }, ctx);
+	selectCalls.length = 0;
+	selectPick = 2; // c) 바꾸지 않음
+	const beforeCancel = doing().items.map((it) => it.text).join("|");
+	res = await tools.todo.execute("step-cancel", { text: "- [ ] 단계 가\n- [ ] 단계 사\n- [ ] 단계 다" }, undefined, undefined, ctx);
+	check("단계 바꿈: '바꾸지 않음' 선택 시 작업판 안 고치고 취소 안내",
+		res.content[0].text.includes("단계를 바꾸지 않기로 했습니다") && doing().items.map((it) => it.text).join("|") === beforeCancel, [res.content[0].text, doing()]);
+
+	// '바꾸지 않음' 뒤 같은 요청 todo 는 작업판에 반영 안 됨
+	selectCalls.length = 0;
+	res = await tools.todo.execute("step-cancel2", { text: "- [ ] 단계 가\n- [ ] 단계 아\n- [ ] 단계 다" }, undefined, undefined, ctx);
+	check("단계 바꿈: '바꾸지 않음' 뒤 같은 요청 todo 는 작업판에 반영 안 됨",
+		res.content[0].text.includes("단계를 바꾸지 않기로 했습니다") && selectCalls.length === 0 && doing().items.map((it) => it.text).join("|") === beforeCancel, [res.content[0].text, doing()]);
+
+	selectPick = 0;
+	process.env.PI_COPILOT_USER_CONFIG = oldCfg || undefined;
+	rmSync(TS, { recursive: true, force: true });
+}
+
 // 2026-11-18: todo_confirm 설정과 등록·덮어쓰기·등록하지 않음 시험
 {
 	const TC = mkdtempSync(join(tmpdir(), "modes-tc-"));

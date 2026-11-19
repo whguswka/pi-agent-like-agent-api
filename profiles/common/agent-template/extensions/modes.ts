@@ -880,6 +880,8 @@ export const TODO_NUDGE_AT = 3;
 export const TODO_NUDGE_AGAIN = 8;
 /** todo_confirm 에서 '등록하지 않음' 을 고른 뒤 todo 결과 (그 요청 동안 같은 글) */
 export const TODO_CONFIRM_SKIPPED = "사용자가 이 목록을 작업판에 올리지 않기로 했습니다. 이번 요청에서는 todo 를 다시 부르지 말고 그대로 진행하세요.";
+/** 단계 바꿈 확인에서 '바꾸지 않음' 을 고른 뒤 todo 결과 */
+const TODO_STEP_CONFIRM_CANCELLED = "사용자가 단계를 바꾸지 않기로 했습니다. 지금 작업의 단계는 그대로입니다. 진행은 답에 [N단계 완료] 로 알려 주세요.";
 // 강제 (2026-11-06 사용자: 성능이 낮은 모델 위주라 지침·알림만으로는 안 됨). TODO_NUDGE_AGAIN 번째부터 쓰기·실행을 막고, 답 이만큼을 막아도 고치지 않으면 그 요청 동안 풀어 줌.
 //  요청 끝에 표시가 안 맞으면 요청마다 한 번 돌려보냄. 끄기: /hooks off todo (내 설정 파일의 "todo_enforce": false)
 export const TODO_GATE_TRIES = 2;
@@ -1815,7 +1817,8 @@ export default function (pi: ExtensionAPI) {
 	let lastInputAt = 0; // 사용자가 마지막으로 요청을 보낸 때
 	let lastReq = ""; // 사용자가 마지막으로 보낸 요청의 첫 줄 (작업 이름)
 	let askedTodoConfirm = false; // 이번 요청에서 새 작업 등록을 물었음
-	let todoConfirmSkip = false; // 이번 요청에서 '등록하지 않음'을 고름 (todo 는 같은 글만 돌려줌)
+	let todoConfirmSkip = false; // 이번 요청에서 '등록하지 않음'·'바꾸지 않음'을 고름 (todo 는 같은 글만 돌려주고 목록 재촉을 끔)
+	let todoSkipText = TODO_CONFIRM_SKIPPED; // 그때 todo 가 돌려줄 글 (고른 창에 맞춰)
 	let planReq = ""; // 계획 모드에서 처음 보낸 요청 (승인한 계획 작업의 이름. /plan <요청> 으로 보낸 것도)
 	let planModelPrev: any = null; // plan_model 로 바꾸기 전 모델 (승인 없이 계획 모드를 끄면 되돌림)
 	// '새 대화로 진행' 을 고른 계획 (/plan --new 를 보내면 새 세션에서 진행). n 단계 수, task 작업판에 둘 목록, refine 지금 작업을 고침
@@ -1941,8 +1944,9 @@ export default function (pi: ExtensionAPI) {
 			if (moved.length) editBoard((b) => void (b.tasks = b.tasks.filter((t) => !moved.includes(t.id))));
 		}
 		if (switched || !cur() || !here(cur())) {
+			const me = kitKind();
 			const t = activeBoard()
-				.tasks.filter((x) => x.state === "doing" && here(x) && (!todoSummary(x).all || !!x.gate))
+				.tasks.filter((x) => x.state === "doing" && here(x) && (!x.by || x.by === me) && (!todoSummary(x).all || !!x.gate))
 				.sort((a, b) => b.updated - a.updated)[0];
 			// 세션 중에 다른 pi(같은 노트북의 다른 키트)가 바꾼 작업을 지금 작업으로 잡을 때는 시작 시각을 0 으로:
 			//  지금 요청이 그 작업을 연 요청이 아니므로 새 요청의 규칙(keepsTask)으로 같은 작업인지 가린다
@@ -2850,7 +2854,7 @@ export default function (pi: ExtensionAPI) {
 			//  목록이 그것으로 바뀜). 승인한 계획이 목록이 됨
 			if (mode === "plan") return reply(TODO_PLAN_MODE);
 			// 이번 요청에서 '등록하지 않음'을 고르면 작업판을 고치지 않고 같은 글만 돌려준다
-			if (todoConfirmSkip) return reply(TODO_CONFIRM_SKIPPED);
+			if (todoConfirmSkip) return reply(todoSkipText);
 			const read = readTodo(params?.text);
 			let lines = read.lines;
 			if (!lines.length) return reply(TODO_HELP);
@@ -2878,6 +2882,19 @@ export default function (pi: ExtensionAPI) {
 			}
 			const meta = { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq };
 			const next = mergeTodo(prev, lines, Date.now(), { ...meta, source: prev?.source === "plan" ? "plan" : "todo" });
+			const topKeys = (s: TodoState) => s.items.filter((it) => it.level === 0).map((it) => textKey(it.text));
+			const topDiff = (() => {
+				const a = prev ? topKeys(prev) : [];
+				const b = topKeys(next);
+				if (a.length === b.length && a.every((x, i) => x === b[i])) return null;
+				const added = b.filter((x) => !a.includes(x));
+				const removed = a.filter((x) => !b.includes(x));
+				const renamed: string[] = [];
+				for (let i = 0; i < Math.min(a.length, b.length); i++) {
+					if (a[i] !== b[i] && !added.includes(b[i]) && !removed.includes(a[i])) renamed.push(`${a[i]} → ${b[i]}`);
+				}
+				return { added, removed, renamed };
+			})();
 			if (prev?.range) {
 				const tops = topIndexes(prev);
 				for (let n = 0; n < tops.length; n++) if (n + 1 < prev.range.from || n + 1 > prev.range.to) {
@@ -2893,7 +2910,7 @@ export default function (pi: ExtensionAPI) {
 			//  같은 요청 안이면 같은 작업을 바꿔 씀 (막 끝낸 목록에 단계를 더하면 그 작업을 다시 엶. 끝난 작업은 다음 요청 때 지금 작업에서 빠짐)
 			let taskResult: { paused: Task | null; note: string } = { paused: null, note: "" };
 			let mixed = false;
-			const sameTask = !!prev && (!!prev.range || sameReq || (next.updates > 1 && keeps));
+			let sameTask = !!prev && (!!prev.range || sameReq || (next.updates > 1 && keeps));
 			// 새 작업 등록을 확인하는 창 (todo_confirm 설정이 켜져 있고 화면이 있을 때)
 			const willCreate = !sameTask && !plan;
 			if (willCreate && todoConfirm() && ctx.hasUI && !askedTodoConfirm) {
@@ -2925,11 +2942,37 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (pick === OPT_SKIP || !pick) {
 					todoConfirmSkip = true;
+					todoSkipText = TODO_CONFIRM_SKIPPED;
 					// 작업판에 등록하지 않음. 지금 작업(curId)은 그대로 두고 (하던 작업을 놓지 않게) 이 요청 동안 목록 재촉
 					//  (도구 결과 안내·쓰기 막기·요청 끝 되돌림)만 끈다: todoConfirmSkip 을 각 재촉에서 봄. 다음 사용자 요청에서 풀림
 					return reply(TODO_CONFIRM_SKIPPED);
 				}
 				// a) 등록 선택 시 아래 newTask 로직이 이어진다
+			}
+			// 맨 위(level 0) 단계 글이 바뀌면 사용자에게 확인 (진행 표시·하위 단계만 바뀌면 묻지 않음)
+			const willChangeSteps = sameTask && topDiff && !plan;
+			if (willChangeSteps && todoConfirm() && ctx.hasUI && !askedTodoConfirm) {
+				askedTodoConfirm = true;
+				const titleLines = [
+					prev?.by && prev.by !== kitKind() ? "(다른 키트가 진행하던 작업)" : "",
+					`지금 작업 #${prev.no} 의 단계를 바꿀까요?`,
+					...(topDiff.added.length ? [`+ ${topDiff.added.slice(0, 3).join(", ")}${topDiff.added.length > 3 ? " …" : ""}`] : []),
+					...(topDiff.removed.length ? [`- ${topDiff.removed.slice(0, 3).join(", ")}${topDiff.removed.length > 3 ? " …" : ""}`] : []),
+					...(topDiff.renamed.length ? [`~ ${topDiff.renamed.slice(0, 3).join(", ")}${topDiff.renamed.length > 3 ? " …" : ""}`] : []),
+				].filter(Boolean);
+				const title = titleLines.join("\n");
+				const OPT_CHANGE = "a) 단계를 바꿈";
+				const OPT_NEW = "b) 새 작업으로 등록";
+				const OPT_CANCEL = "c) 바꾸지 않음";
+				const pick = await ctx.ui.select(title, [OPT_CHANGE, OPT_NEW, OPT_CANCEL]);
+				if (pick === OPT_CANCEL || !pick) {
+					todoConfirmSkip = true;
+					todoSkipText = TODO_STEP_CONFIRM_CANCELLED;
+					return reply(TODO_STEP_CONFIRM_CANCELLED);
+				}
+				if (pick === OPT_NEW) {
+					sameTask = false;
+				}
 			}
 			if (sameTask) await updateTask(ctx, next, alias);
 			else {
