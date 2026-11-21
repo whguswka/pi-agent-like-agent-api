@@ -1057,8 +1057,8 @@ check("요청 끝: 목록이 다 끝났으면 돌려보내지 않음", sentN() =
 res = await (async () => { await ask("표시 결과 시험"); return tools.todo.execute("e7", { text: "- [x] 결과 하나\n- [ ] 결과 둘\n그냥 글" }, undefined, undefined, ctx); })();
 const res2 = await tools.todo.execute("e8", { text: "- [ ] 결과 하나\n- [ ] 결과 둘 (끝남)" }, undefined, undefined, ctx);
 const res3 = await tools.todo.execute("e9", { text: "- [x] 결과 하나" }, undefined, undefined, ctx);
-check("todo 결과: 넣지 못한 줄, 다시 안 끝난 단계·뗀 표시, 줄어든 단계 수를 그대로 적음",
-	res.content[0].text.includes("확인할 것: 목록 모양이 아니라 넣지 않은 줄 1개: '그냥 글'") && res2.content[0].text.includes("끝났던 단계 1개") && res2.content[0].text.includes("진행 표시 1개") && res3.content[0].text.includes("2개에서 1개로"), [res, res2, res3].map((r) => r.content[0].text));
+check("todo 결과: 넣지 못한 줄, 다시 안 끝난 단계·뗀 표시, 뺀 단계 안내를 적음",
+	res.content[0].text.includes("확인할 것: 목록 모양이 아니라 넣지 않은 줄 1개: '그냥 글'") && res2.content[0].text.includes("끝났던 단계 1개") && res2.content[0].text.includes("진행 표시 1개") && res3.content[0].text.includes("목록에서 뺀 단계 1개(끝남 1)"), [res, res2, res3].map((r) => r.content[0].text));
 await cmds.todo.handler("clear", ctx);
 if (cfgOld === null) rmSync(CFG, { force: true });
 else wr(CFG, cfgOld);
@@ -1486,6 +1486,264 @@ rmSync(TW, { recursive: true, force: true });
 	selectPick = 0;
 	process.env.PI_COPILOT_USER_CONFIG = oldCfg || undefined;
 	rmSync(TC, { recursive: true, force: true });
+}
+
+// 2026-11-20: 뺀 단계 기록 (dropped · reopened · replaced) 과 표시·저장
+{
+	// 1) mergeTodo 수준
+	let r0 = m.mergeTodo(null, m.parseTodo("- [~] 가\n  - [x] 가1\n  - [~] 가2\n  - [ ] 가3\n- [x] 나\n- [~] 다\n- [ ] 라"), 1000, meta);
+	// r0: 가1은 시작 없이 바로 끝남(approx=true, started=1000, ended=1000), 가2(doing, started=1000), 가3(todo), 나(done, approx=true, started=1000, ended=1000), 다(doing, started=1000), 라(todo)
+	// 가1을 더 명확한 시각(1000~2000)으로 만들기 위해 먼저 가2 진행 및 가1 유지
+	let r1 = m.mergeTodo(r0, m.parseTodo("- [~] 가\n  - [x] 가1\n  - [x] 가2\n  - [ ] 가3\n- [x] 나\n- [~] 다\n- [ ] 라"), 2000, meta);
+	// 이제 r1 에서:
+	// - 가1(done, 1000~1000, approx), 가2(done, 1000~2000), 가3(todo)
+	// - 나(done, 1000~1000, approx) -> [~] 로 다시 염 (reopened)
+	// - 다(doing, 1000~) -> 번호 자리 3번에 완전히 다른 글 '전혀 다른 단계' (replaced)
+	// - 라(todo) -> 뺌 (기록 안 됨)
+	// - 가2 를 목록에서 뺌 (dropped, path: '가', 원래 시각 1000~2000)
+	// - 가1 을 [ ] 로 다시 염 (reopened, path: '가')
+	let r2 = m.mergeTodo(r1, m.parseTodo("- [~] 가\n  - [ ] 가1\n  - [ ] 가3\n- [~] 나\n- [~] 전혀 다른 단계"), 3000, meta);
+	const rm2 = r2.removed || [];
+	const byText = (t) => rm2.find((x) => x.text === t);
+	check("mergeTodo 뺀 단계: 끝난 하위 단계 뺌(dropped, path·원래 시각), 끝남->할일/하는중(reopened, 단계 다시 시작·새 시각), 같은 번호 다른 글(dropped, 새 단계 시각 새로), todo 뺌은 기록 없음",
+		rm2.length === 4
+		&& byText("가1")?.why === "reopened" && byText("가1")?.path === "가" && byText("가1")?.ended === 1000 && byText("가1")?.approx === true
+		&& r2.items[1].status === "todo" && r2.items[1].started === null && r2.items[1].ended === null
+		&& byText("가2")?.why === "dropped" && byText("가2")?.path === "가" && byText("가2")?.status === "done" && byText("가2")?.started === 1000 && byText("가2")?.ended === 2000 && !byText("가2")?.approx
+		&& byText("나")?.why === "reopened" && byText("나")?.status === "done" && byText("나")?.ended === 1000 && r2.items[3].status === "doing" && r2.items[3].started === 3000
+		&& byText("다")?.why === "dropped" && byText("다")?.status === "doing" && byText("다")?.started === 1000 && byText("다")?.ended === 3000
+		&& r2.items[4].text === "전혀 다른 단계" && r2.items[4].started === 3000
+		&& !rm2.some((x) => x.text === "라") && !rm2.some((x) => x.text === "가"), [rm2, r2.items]);
+
+	// doing 단계를 뺌 -> ended = 그때 시각, 조금 고친 글(포함·Dice>=0.5) -> 기록 없음·시각 이어 감, 다음 갱신에서 removed 이어 받음
+	const r3 = m.mergeTodo(r2, m.parseTodo("- [~] 가\n  - [ ] 가1\n  - [ ] 가3\n- [~] 나 단계 확인하기\n- [~] 전혀 다른 단계"), 4000, meta);
+	const r4 = m.mergeTodo(r3, m.parseTodo("- [~] 가\n  - [ ] 가1\n  - [ ] 가3\n- [~] 나 단계 확인 및 검증\n- [~] 전혀 다른 단계"), 5000, meta);
+	const r5 = m.mergeTodo(r4, m.parseTodo("- [~] 가\n  - [ ] 가1\n  - [ ] 가3\n- [~] 나 단계 확인 및 검증"), 6000, meta);
+	check("조금 고친 글(포함·Dice>=0.5)은 기록 없이 시각 이어 감, doing 뺌은 ended=그때, 다음 갱신에 앞 removed 이어 받음",
+		r3.removed?.length === 4 && r3.items[3].started === 3000
+		&& r4.removed?.length === 4 && r4.items[3].started === 3000
+		&& r5.removed?.length === 5 && r5.removed.at(-1)?.text === "전혀 다른 단계" && r5.removed.at(-1)?.status === "doing" && r5.removed.at(-1)?.ended === 6000 && r5.removed.at(-1)?.started === 3000, [r3.removed?.length, r4.items[3], r5.removed]);
+
+	// 2단계 이상 하위 path ('가 > 나') 와 상위 단계 제외
+	const deep0 = m.mergeTodo(null, m.parseTodo("- [~] 대단계\n  - [~] 중단계\n    - [x] 소단계\n- [ ] 끝남 유지"), 100, meta);
+	const deep1 = m.mergeTodo(deep0, m.parseTodo("- [ ] 끝남 유지"), 200, meta);
+	check("다단계 하위 path ('대단계 > 중단계') 기록 및 상위 단계 제외",
+		deep1.removed?.length === 1 && deep1.removed[0].text === "소단계" && deep1.removed[0].path === "대단계 > 중단계" && deep1.removed[0].ended === 100, deep1.removed);
+
+	// 50개 상한 (TODO_MAX=60 이내 55개 넣고 하나씩 빼기)
+	let cap = m.mergeTodo(null, m.parseTodo("- [~] 기준\n" + Array.from({ length: 55 }, (_, i) => `- [x] 빼기${i}`).join("\n")), 1000, meta);
+	for (let i = 0; i < 55; i++) {
+		const keep = cap.items.filter((it) => it.text !== `빼기${i}`).map((it) => `- [${it.status === "done" ? "x" : it.status === "doing" ? "~" : " "}] ${it.text}`).join("\n");
+		cap = m.mergeTodo(cap, m.parseTodo(keep), 2000 + i, meta);
+	}
+	check(`뺀 단계 상한: 작업마다 최근 ${m.REMOVED_MAX}개까지 (오래된 것부터 버림)`,
+		cap.removed?.length === m.REMOVED_MAX && cap.removed[0].text === "빼기5" && cap.removed.at(-1)?.text === "빼기54", [cap.removed?.length, cap.removed?.[0], cap.removed?.at(-1)]);
+
+	// replanTodo: 다듬은 계획에서 빠진 끝난 단계 -> dropped
+	const rp0 = m.planTodo(["계획1", "계획2", "계획3"], 1000, meta);
+	m.stepDone(rp0, 1, 2000);
+	const rp1 = m.replanTodo(rp0, ["계획2", "계획3", "계획4"], 3000, meta);
+	check("replanTodo: 다듬은 계획에서 빠진 끝난 단계는 dropped 로 기록",
+		rp1.removed?.length === 1 && rp1.removed[0].text === "계획1" && rp1.removed[0].why === "dropped" && rp1.removed[0].ended === 2000, rp1.removed);
+
+	// todo 도구 수준 (가짜 pi)
+	const TR = mkdtempSync(join(tmpdir(), "modes-rm-"));
+	const oldCfg = process.env.PI_COPILOT_USER_CONFIG;
+	process.env.PI_COPILOT_USER_CONFIG = join(TR, "bridge.json");
+	writeFileSync(process.env.PI_COPILOT_USER_CONFIG, JSON.stringify({ todo_confirm: false }));
+	globalThis.__piWorkDir = { remote: false, cwd: TR };
+	await on.session_start[0]({}, ctx);
+	await tick();
+
+	// 4번 길: 같은 요청에서 겹치는 글이 없는 목록 -> 같은 작업에 dropped 기록 + 안내 줄
+	await on.input[0]({ text: "뺀 단계 도구 시험", source: "interactive" }, ctx);
+	await tools.todo.execute("rm1", { text: "- [x] 첫 단계\n- [~] 둘째 단계\n- [ ] 셋째 단계" }, undefined, undefined, ctx);
+	const rmTaskNo = doing().no;
+	await new Promise((r) => setTimeout(r, 1100)); // 최소 1초 이상 차이로 durText 확인
+	res = await tools.todo.execute("rm2", { text: "- [~] 완전히 새로운 목록\n- [ ] 다음" }, undefined, undefined, ctx);
+	const rmTask = doing();
+	check("todo 도구: 같은 요청에서 겹치는 글이 없어도 같은 작업에 dropped 기록 및 안내 줄",
+		rmTask.no === rmTaskNo && rmTask.removed?.length === 2 && rmTask.removed.every((x) => x.why === "dropped")
+		&& res.content[0].text.includes("목록에서 뺀 단계 2개(끝남 1, 하던 중 1)는 작업 기록에 남겼습니다. 다시 넣지 않아도 됩니다."), [rmTask, res.content[0].text]);
+
+	// 입력창 위 머리줄 · /todo 글 · 작업판 HTML (스크립트 문법 포함) · board.json 왕복
+	const wLine = m.todoWidget(rmTask).split("\n")[0];
+	notes.length = 0;
+	await cmds.todo.handler("", ctx);
+	const rmBoard = m.loadBoard();
+	const rmHtml = m.boardHtml(rmBoard, "board.data.js");
+	const rmWithMissingStarted = m.boardHtml({
+		v: 2, next: 2, updated: 5000,
+		tasks: [{ ...rmTask, removed: [{ text: "시작 모름", path: "상위", level: 1, status: "done", started: null, ended: 5000, at: 5000, why: "dropped" }, { text: "어림", level: 0, status: "done", started: 1000, ended: 3000, approx: true, at: 5000, why: "reopened" }, { text: "되돌림", level: 0, status: "doing", started: 1000, ended: 4000, at: 5000, why: "reset" }] }],
+	}, "board.data.js");
+	const renderBoardHtml = (htmlStr) => {
+		const scripts = [...htmlStr.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((x) => x[1]);
+		let parseErr = "";
+		for (const sc of scripts) {
+			try { new Function(sc); } catch (e) { parseErr = String(e); }
+		}
+		if (parseErr || scripts.length < 2) return { parseErr, listHtml: "" };
+		const els = {};
+		const el = (id) => (els[id] ||= { textContent: "", className: "", innerHTML: "", value: "", addEventListener() {} });
+		const win = {};
+		const doc = { title: "", getElementById: el, querySelectorAll: () => [], addEventListener() {}, createElement: () => ({}), head: { appendChild() {} } };
+		new Function("window", "document", "setInterval", scripts[0] + "\n" + scripts[1])(win, doc, () => 0);
+		return { parseErr, listHtml: el("list").innerHTML };
+	};
+	const rendered1 = renderBoardHtml(rmHtml);
+	const rendered2 = renderBoardHtml(rmWithMissingStarted);
+	check("입력창 위 머리줄·/todo·작업판 HTML·board.json 왕복·스크립트 문법",
+		wLine.includes("· 뺀 단계 2개 (") && m.todoWidget(rmTask).split("\n").length === 3
+		&& notes.at(-1).includes("· 뺀 단계 2개 (")
+		&& rmBoard.tasks.find((t) => t.no === rmTaskNo)?.removed?.length === 2
+		&& !rendered1.parseErr && !rendered2.parseErr
+		&& rendered1.listHtml.includes("뺀 단계 2개 · 쓴 시간 ") && rendered1.listHtml.includes("<del>첫 단계</del>")
+		&& rendered2.listHtml.includes("상위 &gt; ") && rendered2.listHtml.includes("다시 엶") && rendered2.listHtml.includes("되돌림")
+		&& rendered2.listHtml.includes("~2초") && rendered2.listHtml.includes(">?<"),
+		{ wLine, note: notes.at(-1), parseErr: rendered1.parseErr || rendered2.parseErr, list1: rendered1.listHtml.slice(0, 300), list2: rendered2.listHtml.slice(0, 300) });
+
+	// 새 요청 뒤 새 작업 -> 앞 작업에는 기록 없음 (쉬는 중으로 남음)
+	await tick();
+	await on.input[0]({ text: "전혀 다른 새 요청", source: "interactive" }, ctx);
+	const prevRemovedCount = doing().removed.length;
+	res = await tools.todo.execute("rm3", { text: "- [~] 다른 작업 A\n- [ ] 다른 작업 B" }, undefined, undefined, ctx);
+	const oldTask = board().tasks.find((t) => t.no === rmTaskNo);
+	check("새 요청 뒤 새 작업: 앞 작업은 쉬는 중이고 removed 가 늘지 않음, 새 도구 결과에 안내 줄 없음",
+		doing().no !== rmTaskNo && oldTask.state === "paused" && oldTask.removed.length === prevRemovedCount && !res.content[0].text.includes("목록에서 뺀 단계"), [oldTask, res.content[0].text]);
+
+	// range 밖 단계는 되돌려지며 removed 에 기록되지 않음
+	const rpTask = m.editBoard((b) => void m.addTask(b, m.planTodo(["범위1", "범위2", "범위3"], 1000, { ...meta, cwd: TR, request: "범위와 뺀단계" }), 1000)).tasks.at(-1);
+	m.editBoard((b) => { m.stepDone(b.tasks.find((t) => t.no === rpTask.no), 1, 2000); });
+	await cmds.todo.handler(`이어서 ${rpTask.no} 2`, ctx);
+	res = await tools.todo.execute("rm-range", { text: "- [ ] 범위1\n- [x] 범위2\n- [ ] 범위3" }, undefined, undefined, ctx);
+	const afterRange = board().tasks.find((t) => t.no === rpTask.no);
+	check("range 밖 단계(1단계 done -> [ ])는 앞 목록대로 되돌려지며 removed 에 기록되지 않음",
+		afterRange.items[0].status === "done" && !afterRange.removed?.length && !res.content[0].text.includes("목록에서 뺀 단계"), [afterRange, res.content[0].text]);
+
+	// 계획 진행 중 (fitPlan 뒤 mergeTodo) 에서도 하위 단계를 빼면 removed 에 기록됨
+	const fpTask = m.editBoard((b) => void m.addTask(b, m.planTodo(["계획A", "계획B", "계획C"], 1000, { ...meta, cwd: TR, request: "계획 진행 뺀단계" }), 1000)).tasks.at(-1);
+	await cmds.todo.handler(`이어서 ${fpTask.no}`, ctx);
+	await tools.todo.execute("rm-plan1", { text: "- [x] 계획A\n- [~] 계획B\n  - [x] 세부1\n  - [~] 세부2\n- [ ] 계획C" }, undefined, undefined, ctx);
+	res = await tools.todo.execute("rm-plan2", { text: "- [x] 계획A\n- [~] 계획B\n  - [~] 세부2\n- [ ] 계획C" }, undefined, undefined, ctx);
+	const afterFit = board().tasks.find((t) => t.no === fpTask.no);
+	check("계획 진행 중(fitPlan 뒤 mergeTodo): 빠진 끝난 하위 단계가 removed 에 기록됨",
+		afterFit.removed?.length === 1 && afterFit.removed[0].text === "세부1" && afterFit.removed[0].path === "계획B" && res.content[0].text.includes("목록에서 뺀 단계 1개"), [afterFit.removed, res.content[0].text]);
+
+	await cmds.todo.handler("clear", ctx);
+
+	// ── 뺀 단계 여섯 가지(A~F) 고침 시험 ──
+
+	// F: 같은 구간을 가진 두 기록 -> 합계는 한 구간 길이, 겹치지 않는 두 구간은 합
+	const fDup = m.unionDuration([
+		{ started: 1000, ended: 23000 },
+		{ started: 1000, ended: 23000 },
+	]);
+	const fSeparate = m.unionDuration([
+		{ started: 1000, ended: 5000 },
+		{ started: 6000, ended: 10000 },
+	]);
+	const fOverlap = m.unionDuration([
+		{ started: 1000, ended: 5000 },
+		{ started: 3000, ended: 8000 },
+	]);
+	check("F: 뺀 단계 구간 합집합 시간 (같은 구간 중복 1회, 분리 구간 합)",
+		fDup.ms === 22000 && fDup.known === 2
+		&& fSeparate.ms === 8000 && fSeparate.known === 2
+		&& fOverlap.ms === 7000 && fOverlap.known === 2);
+
+	// A: 작업판 작업 카드의 '시작'·'걸린 시간'이 뺀 단계의 이른 시작을 반영
+	const testBoardA = {
+		v: 2, next: 3, updated: 30000,
+		tasks: [
+			{
+				v: 1, id: "task-no-rm", no: 11, state: "doing", project: "projA", cwd: TR, remote: false, source: "todo", request: "기록없음",
+				created: 1000, updated: 20000, updates: 1, closed: null, stopped: 20000,
+				items: [{ level: 0, text: "단일단계", status: "done", started: 10000, ended: 20000 }],
+			},
+			{
+				v: 1, id: "task-with-rm", no: 12, state: "doing", project: "projA", cwd: TR, remote: false, source: "todo", request: "기록있음",
+				created: 5000, updated: 30000, updates: 2, closed: null, stopped: 30000,
+				items: [{ level: 0, text: "현재단계", status: "done", started: 20000, ended: 30000 }],
+				removed: [
+					{ text: "뺀단계1", level: 0, status: "done", started: 2000, ended: 8000, at: 8000, why: "dropped" },
+					{ text: "뺀단계2", level: 0, status: "done", started: 2000, ended: 8000, at: 8000, why: "dropped" },
+				],
+			},
+		],
+	};
+	const renderedA = renderBoardHtml(m.boardHtml(testBoardA, "board.data.js"));
+	check("A: 작업판 카드의 '시작'·'걸린 시간'이 뺀 단계의 이른 시작 반영 (removed 없는 작업은 그대로)",
+		!renderedA.parseErr
+		&& renderedA.listHtml.includes("<b>걸린 시간</b>10초") // task-no-rm: 20000 - 10000 = 10000ms = 10초
+		&& renderedA.listHtml.includes("<b>걸린 시간</b>28초") // task-with-rm: 30000 - 2000 = 28000ms = 28초
+		&& renderedA.listHtml.includes("뺀 단계 2개 · 쓴 시간 6초"), // F의 작업판 요약 줄: 8000-2000 = 6초
+		renderedA.listHtml);
+
+	// C: 끝난 1·2·3·4 단계 중 1·2를 빼고 "3) x, 4) y" 처럼 보냄 -> 둘 다 dropped, 새 1번은 시각 없음. 조금 고친 글은 시각 이어 감
+	const cInit = m.mergeTodo(null, m.parseTodo("- [x] 단계1\n- [x] 단계2\n- [x] 단계3\n- [ ] 단계4"), 1000, meta);
+	const cCut = m.mergeTodo(cInit, m.parseTodo("3) 새로운x\n4) 단계4"), 2000, meta);
+	const cNear = m.mergeTodo(cInit, m.parseTodo("- [x] 단계1\n- [x] 단계2\n- [x] 단계3 (고침)\n- [ ] 단계4"), 2000, meta);
+	check("C: 1·2 빼고 3·4만 보냄 -> 옛 1·2는 dropped, 새 단계는 시각 없음, 조금 고친 글은 시각 이어 감",
+		cCut.removed?.length === 3
+		&& cCut.removed.every((r) => r.why === "dropped")
+		&& cCut.removed.some((r) => r.text === "단계1") && cCut.removed.some((r) => r.text === "단계2")
+		&& cCut.items[0].text === "새로운x" && cCut.items[0].started === null
+		&& (!cNear.removed || cNear.removed.length === 0)
+		&& cNear.items[2].text === "단계3 (고침)" && cNear.items[2].started === 1000);
+
+	// D: 끝남 -> [~] -> reopened 기록 + 그 단계 started = 이번 갱신 시각. 끝남 -> [ ] 는 기존대로
+	const dInit = m.mergeTodo(null, m.parseTodo("- [x] 끝났던단계A\n- [x] 끝났던단계B"), 1000, meta);
+	const dReopen = m.mergeTodo(dInit, m.parseTodo("- [~] 끝났던단계A\n- [ ] 끝났던단계B"), 3000, meta);
+	check("D: 끝남 -> [~] 면 reopened 기록 및 started=이번 갱신 시각, 끝남 -> [ ] 면 started 비움",
+		dReopen.removed?.length === 2
+		&& dReopen.removed.every((r) => r.why === "reopened")
+		&& dReopen.items[0].status === "doing" && dReopen.items[0].started === 3000 && dReopen.items[0].ended === null && !dReopen.items[0].approx
+		&& dReopen.items[1].status === "todo" && dReopen.items[1].started === null && dReopen.items[1].ended === null);
+
+	// E: 하는 중 -> [ ] -> reset 기록 (ended = 갱신 시각), 작업판에 '되돌림'. 하는 중 -> 하는 중 은 기록 없음
+	const eInit = m.mergeTodo(null, m.parseTodo("- [~] 하던단계A\n- [~] 하던단계B"), 1000, meta);
+	const eReset = m.mergeTodo(eInit, m.parseTodo("- [ ] 하던단계A\n- [~] 하던단계B"), 4000, meta);
+	check("E: 하던 단계 -> [ ] 는 reset 기록 (ended=갱신시각), 하던 단계 -> [~] 는 기록 없음",
+		eReset.removed?.length === 1
+		&& eReset.removed[0].text === "하던단계A" && eReset.removed[0].why === "reset" && eReset.removed[0].status === "doing"
+		&& eReset.removed[0].started === 1000 && eReset.removed[0].ended === 4000
+		&& eReset.items[0].status === "todo" && eReset.items[0].started === null
+		&& eReset.items[1].status === "doing" && eReset.items[1].started === 1000);
+
+	// B: todo 도구 결과 안내 시험
+	// B-1: 끝난 두 단계를 빼고 시작하지 않은 단계 하나도 뺀 목록 -> '단계 수가... 줄었습니다' 대신 시작하지 않은 단계 글을 든 안내 + 기록 안내
+	await on.input[0]({ text: "시험 B 복합", source: "interactive" }, ctx);
+	await tools.todo.execute("b-init", { text: "- [x] 완료1\n- [x] 완료2\n- [ ] 미시작1\n- [~] 진행중1" }, undefined, undefined, ctx);
+	const resB_both = await tools.todo.execute("b-drop-both", { text: "- [~] 진행중1" }, undefined, undefined, ctx);
+	const textB_both = resB_both.content[0].text;
+	check("B: 끝난 단계 + 시작하지 않은 단계 뺌 -> '단계 수가...줄었습니다' 없이 시작하지 않은 단계 목록 안내 + 기록 안내",
+		!textB_both.includes("단계 수가") && !textB_both.includes("줄었습니다")
+		&& textB_both.includes("시작하지 않은 단계 '미시작1' 가 목록에서 빠졌습니다. 빠뜨린 것이면 그 단계만 다시 넣어 보내 주세요")
+		&& textB_both.includes("목록에서 뺀 단계 2개(끝남 2)는 작업 기록에 남겼습니다. 다시 넣지 않아도 됩니다."), textB_both);
+
+	// B-2: 끝난 단계만 뺀 목록 -> 줄었다는 안내 없음 + 기록 안내
+	await on.input[0]({ text: "시험 B 끝남만", source: "interactive" }, ctx);
+	await tools.todo.execute("b-done-init", { text: "- [x] 완료A\n- [x] 완료B\n- [~] 진행중A" }, undefined, undefined, ctx);
+	const resB_doneOnly = await tools.todo.execute("b-drop-done", { text: "- [~] 진행중A" }, undefined, undefined, ctx);
+	const textB_doneOnly = resB_doneOnly.content[0].text;
+	check("B: 끝난 단계만 뺀 목록 -> 줄었다는 안내 없음 + 기록 안내",
+		!textB_doneOnly.includes("단계 수가") && !textB_doneOnly.includes("줄었습니다")
+		&& !textB_doneOnly.includes("시작하지 않은 단계")
+		&& textB_doneOnly.includes("목록에서 뺀 단계 2개(끝남 2)는 작업 기록에 남겼습니다. 다시 넣지 않아도 됩니다."), textB_doneOnly);
+
+	// B-3: reopened 및 reset 시 기록 안내 문구
+	await on.input[0]({ text: "시험 B 재오픈", source: "interactive" }, ctx);
+	await tools.todo.execute("b-re-init", { text: "- [x] 완료X\n- [~] 진행Y" }, undefined, undefined, ctx);
+	const resB_reopen = await tools.todo.execute("b-reopen", { text: "- [~] 완료X\n- [ ] 진행Y" }, undefined, undefined, ctx);
+	const textB_reopen = resB_reopen.content[0].text;
+	check("B: reopened/reset 시 기록 안내 문구 ('다시 넣지 않아도' 없이 '앞서 쓴 시간은 작업 기록에 남겼습니다')",
+		textB_reopen.includes("다시 열거나 되돌린 단계 2개의 앞서 쓴 시간은 작업 기록에 남겼습니다.")
+		&& textB_reopen.includes("끝났던 단계 1개가 다시 안 끝난 것으로 바뀌었습니다")
+		&& !textB_reopen.includes("다시 넣지 않아도 됩니다"), textB_reopen);
+
+	process.env.PI_COPILOT_USER_CONFIG = oldCfg || undefined;
+	if (oldCfg === undefined) delete process.env.PI_COPILOT_USER_CONFIG;
+	rmSync(TR, { recursive: true, force: true });
 }
 
 rmSync(AGENT0, { recursive: true, force: true });

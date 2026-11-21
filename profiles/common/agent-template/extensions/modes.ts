@@ -850,6 +850,18 @@ export function mrComment(found: string, o: { who: string; when: Date; focus?: s
 //  모델은 목록과 상태만 보내고, 시각·진행률은 이 확장이 적는다 (모델이 적은 시각은 믿기 어려움). 승인한 계획의 단계도 같은 목록으로
 export type TodoStatus = "todo" | "doing" | "done";
 export type TodoItem = { level: number; text: string; status: TodoStatus; started: number | null; ended: number | null; approx?: boolean };
+export type RemovedStep = {
+	text: string;
+	path?: string;
+	level: number;
+	status: "done" | "doing";
+	started: number | null;
+	ended: number;
+	approx?: boolean;
+	at: number;
+	why: "dropped" | "reopened" | "reset";
+};
+export const REMOVED_MAX = 50;
 export type TodoState = {
 	v: 1;
 	project: string;
@@ -861,6 +873,7 @@ export type TodoState = {
 	updated: number;
 	updates: number;
 	items: TodoItem[];
+	removed?: RemovedStep[];
 	// 목록이 다 끝나지 않은 채 요청이 끝난 때 (모델이 남은 단계를 고치지 않고 답을 끝냄). 목록을 고치거나 다음 요청이 시작되면 지움
 	stopped?: number | null;
 };
@@ -953,7 +966,12 @@ export function readTodo(text: unknown): TodoRead {
 export const parseTodo = (text: unknown): TodoLine[] => readTodo(text).lines;
 /** todo 결과에 덧붙이는 말: 읽지 못한 것·뜻이 바뀐 것을 '고쳤습니다' 만으로 넘기지 않음 (2026-11-06 사용자: 체크가 안 됐는데 성공으로 답해 모델이 된 줄 앎).
  *  prev·next 는 같은 작업을 고칠 때의 앞뒤 목록 */
-export function todoNotes(r: TodoRead, prev: { items: TodoItem[] } | null = null, next: { items: TodoItem[] } | null = null): string[] {
+export function todoNotes(
+	r: TodoRead,
+	prev: { items: TodoItem[] } | null = null,
+	next: { items: TodoItem[] } | null = null,
+	removed?: RemovedStep[],
+): string[] {
 	const out: string[] = [];
 	if (r.skipped.length) out.push(`목록 모양이 아니라 넣지 않은 줄 ${r.skipped.length}개: ${r.skipped.slice(0, 3).map((s) => `'${cut(s, 40)}'`).join(", ")}${r.skipped.length > 3 ? " …" : ""} ('- [ ] 할 일' 모양으로 보내 주세요)`);
 	if (r.over) out.push(`${TODO_MAX}개까지만 받아 뒤의 ${r.over}개는 넣지 않았습니다 (단계를 묶어 ${TODO_MAX}개 안으로 보내 주세요)`);
@@ -962,7 +980,15 @@ export function todoNotes(r: TodoRead, prev: { items: TodoItem[] } | null = null
 		const now = new Map(next.items.map((it) => [textKey(it.text), it.status]));
 		const back = prev.items.filter((it) => it.status === "done" && now.has(textKey(it.text)) && now.get(textKey(it.text)) !== "done");
 		if (back.length) out.push(`끝났던 단계 ${back.length}개가 다시 안 끝난 것으로 바뀌었습니다 ('${cut(back[0].text, 40)}'${back.length > 1 ? " 등" : ""}). 실수면 [x] 로 다시 보내 주세요`);
-		if (next.items.length < prev.items.length) out.push(`단계 수가 ${prev.items.length}개에서 ${next.items.length}개로 줄었습니다. 빠뜨린 것이면 목록 전체를 다시 보내 주세요`);
+		if (removed === undefined) {
+			if (next.items.length < prev.items.length) out.push(`단계 수가 ${prev.items.length}개에서 ${next.items.length}개로 줄었습니다. 빠뜨린 것이면 목록 전체를 다시 보내 주세요`);
+		} else {
+			const unstarted = prev.items.filter((it, idx) => !hasKids(prev.items, idx) && it.status === "todo" && !now.has(textKey(it.text)));
+			if (unstarted.length) {
+				const names = unstarted.slice(0, 3).map((it) => `'${cut(it.text, 40)}'`).join(", ") + (unstarted.length > 3 ? " …" : "");
+				out.push(`시작하지 않은 단계 ${names} 가 목록에서 빠졌습니다. 빠뜨린 것이면 그 단계만 다시 넣어 보내 주세요`);
+			}
+		}
 	}
 	return out;
 }
@@ -1000,11 +1026,121 @@ function rollUp(items: TodoItem[]) {
 		else delete it.approx;
 	}
 }
+function durText(ms: number): string {
+	let s = Math.max(0, Math.round(ms / 1000));
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	s = s % 60;
+	return h ? `${h}시간 ${m}분` : m ? `${m}분 ${s}초` : `${s}초`;
+}
+export function unionDuration(spans: { started: number | null | undefined; ended: number }[]): { ms: number; known: number } {
+	let known = 0;
+	const intervals: [number, number][] = [];
+	for (const s of spans) {
+		if (s.started !== null && s.started !== undefined) {
+			known++;
+			if (s.ended > s.started) intervals.push([s.started, s.ended]);
+		}
+	}
+	if (!intervals.length) return { ms: 0, known };
+	intervals.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+	let ms = 0;
+	let curStart = intervals[0][0];
+	let curEnd = intervals[0][1];
+	for (let i = 1; i < intervals.length; i++) {
+		const [st, en] = intervals[i];
+		if (st <= curEnd) {
+			if (en > curEnd) curEnd = en;
+		} else {
+			ms += curEnd - curStart;
+			curStart = st;
+			curEnd = en;
+		}
+	}
+	ms += curEnd - curStart;
+	return { ms, known };
+}
+function removedSummary(rm: RemovedStep[] | undefined): { count: number; time: string } | null {
+	if (!rm?.length) return null;
+	const { ms, known } = unionDuration(rm);
+	return { count: rm.length, time: known ? durText(ms) : "?" };
+}
+const removedLabel = (s: { removed?: RemovedStep[] }): string => {
+	const r = removedSummary(s.removed);
+	return r ? ` · 뺀 단계 ${r.count}개 (${r.time})` : "";
+};
+function removedNotice(added: RemovedStep[]): string {
+	if (!added.length) return "";
+	const drops = added.filter((r) => r.why === "dropped");
+	const reopens = added.filter((r) => r.why === "reopened" || r.why === "reset");
+	const parts: string[] = [];
+	if (drops.length) {
+		const done = drops.filter((r) => r.status === "done").length;
+		const doing = drops.length - done;
+		const sub = [...(done ? [`끝남 ${done}`] : []), ...(doing ? [`하던 중 ${doing}`] : [])].join(", ");
+		parts.push(`목록에서 뺀 단계 ${drops.length}개(${sub})는 작업 기록에 남겼습니다. 다시 넣지 않아도 됩니다.`);
+	}
+	if (reopens.length) {
+		// reopened = 끝난 단계를 다시 엶, reset = 하던 단계를 할 일로 되돌림
+		const hasReset = reopens.some((r) => r.why === "reset");
+		const hasReopen = reopens.some((r) => r.why === "reopened");
+		const what = hasReset && hasReopen ? "다시 열거나 되돌린" : hasReset ? "되돌린" : "다시 연";
+		parts.push(`${what} 단계 ${reopens.length}개의 앞서 쓴 시간은 작업 기록에 남겼습니다.`);
+	}
+	return parts.join(" ");
+}
+/** 글이 '조금 고친 것'인지: 한쪽 글이 다른 쪽을 포함하거나, 글자 2개 묶음 Dice 계수 0.5 이상 */
+function nearText(a: string, b: string): boolean {
+	const sa = textKey(a);
+	const sb = textKey(b);
+	if (!sa || !sb) return false;
+	const ca = sa.replace(/\s+/g, "");
+	const cb = sb.replace(/\s+/g, "");
+	if (Math.min(ca.length, cb.length) < 2) {
+		const [sh, lg] = sa.length <= sb.length ? [sa, sb] : [sb, sa];
+		return sh === lg || lg.startsWith(`${sh} `) || lg.startsWith(`${sh}(`);
+	}
+	if (sa.includes(sb) || sb.includes(sa) || ca.includes(cb) || cb.includes(ca)) return true;
+	const ma = new Map<string, number>();
+	for (let i = 0; i < ca.length - 1; i++) {
+		const g = ca.slice(i, i + 2);
+		ma.set(g, (ma.get(g) || 0) + 1);
+	}
+	let hit = 0;
+	for (let i = 0; i < cb.length - 1; i++) {
+		const g = cb.slice(i, i + 2);
+		const n = ma.get(g) || 0;
+		if (n > 0) {
+			hit++;
+			ma.set(g, n - 1);
+		}
+	}
+	return (2 * hit) / (ca.length - 1 + (cb.length - 1)) >= 0.5;
+}
 /** 새로 받은 목록에 앞 목록의 시각을 이어 붙인다 (같은 단계·같은 글, 아니면 같은 번호의 자리). 하는 중이 되면 시작, 끝나면 끝 시각 */
-export function mergeTodo(prev: TodoState | null, lines: TodoLine[], now: number, meta: TodoMeta): TodoState {
+export function mergeTodo(
+	prev: TodoState | null,
+	lines: TodoLine[],
+	now: number,
+	meta: TodoMeta,
+	opts?: { sameTask?: boolean; range?: { from: number; to: number }; outRemoved?: RemovedStep[] },
+): TodoState {
 	const old = prev?.items || [];
 	const key = textKey;
 	const [oldNo, newNo] = [todoNumbers(old), todoNumbers(lines)];
+	const oldPath: (string | undefined)[] = [];
+	const oldTop: number[] = [];
+	{
+		const stack: string[] = [];
+		let topN = 0;
+		for (const o of old) {
+			if (o.level === 0) topN++;
+			stack.length = o.level;
+			oldPath.push(o.level > 0 ? stack.filter(Boolean).join(" > ") : undefined);
+			oldTop.push(topN);
+			stack[o.level] = o.text;
+		}
+	}
 	const used = new Set<number>();
 	const find = (ok: (o: TodoItem, k: number) => boolean) => {
 		const j = old.findIndex((o, k) => !used.has(k) && ok(o, k));
@@ -1013,17 +1149,28 @@ export function mergeTodo(prev: TodoState | null, lines: TodoLine[], now: number
 	};
 	const match = lines.map((p) => find((o) => o.level === p.level && key(o.text) === key(p.text)));
 	const fresh = !prev || used.size === 0; // 글이 같은 단계가 하나도 없으면 새 작업 (앞 목록의 시각을 쓰지 않음)
-	// 글만 조금 고친 단계: 같은 번호의 자리
-	if (!fresh) lines.forEach((p, i) => match[i] < 0 && (match[i] = find((o, k) => o.level === p.level && oldNo[k] === newNo[i])));
+	// 글만 조금 고친 단계: 같은 번호의 자리 (전혀 다른 글이면 시각을 물려받지 않고 옛 단계는 dropped 로 기록)
+	if (!fresh) {
+		lines.forEach((p, i) => {
+			if (match[i] >= 0) return;
+			const k = find((o, idx) => o.level === p.level && oldNo[idx] === newNo[i]);
+			if (k < 0) return;
+			if (nearText(old[k].text, p.text)) match[i] = k;
+		});
+	}
+	const same = !!prev && (!fresh || !!opts?.sameTask);
 	const items: TodoItem[] = lines.map((p, i) => {
 		const o = !fresh && match[i] >= 0 ? old[match[i]] : null;
 		const it: TodoItem = { level: p.level, text: p.text, status: p.status, started: o?.started ?? null, ended: o?.ended ?? null };
 		if (o?.approx) it.approx = true;
 		if (p.status === "todo") [it.started, it.ended, it.approx] = [null, null, undefined];
-		if (p.status === "doing") [it.ended, it.started] = [null, it.started ?? now];
+		if (p.status === "doing") {
+			const reopened = o?.status === "done";
+			[it.ended, it.started, it.approx] = [null, reopened ? now : (it.started ?? now), reopened ? undefined : it.approx];
+		}
 		return it;
 	});
-	const since = fresh ? now : (prev as TodoState).updated;
+	const since = same ? (prev as TodoState).updated : now;
 	for (let i = 0; i < items.length; i++) {
 		if (lines[i].status !== "done") continue;
 		endTodo(items[i], now, since);
@@ -1032,17 +1179,50 @@ export function mergeTodo(prev: TodoState | null, lines: TodoLine[], now: number
 	}
 	for (const it of items) if (it.approx === undefined) delete it.approx;
 	rollUp(items);
+	const added: RemovedStep[] = [];
+	if (same) {
+		const oldToNew = new Map<number, number>();
+		match.forEach((k, i) => { if (k >= 0) oldToNew.set(k, i); });
+		const rg = opts?.range;
+		for (let k = 0; k < old.length; k++) {
+			if (hasKids(old, k)) continue;
+			const o = old[k];
+			if (o.status !== "done" && o.status !== "doing") continue;
+			if (rg && (oldTop[k] < rg.from || oldTop[k] > rg.to)) continue;
+			let why: RemovedStep["why"] | null = null;
+			if (oldToNew.has(k)) {
+				const ni = oldToNew.get(k)!;
+				if (o.status === "done" && items[ni].status !== "done") why = "reopened";
+				else if (o.status === "doing" && items[ni].status === "todo") why = "reset";
+			} else why = "dropped";
+			if (!why) continue;
+			added.push({
+				text: o.text,
+				...(oldPath[k] ? { path: oldPath[k] } : {}),
+				level: o.level,
+				status: o.status,
+				started: o.started,
+				ended: o.status === "done" ? (o.ended ?? now) : now,
+				...(o.approx ? { approx: true } : {}),
+				at: now,
+				why,
+			});
+		}
+		opts?.outRemoved?.push(...added);
+	}
+	const removed = same ? [...(prev?.removed || []), ...added].slice(-REMOVED_MAX) : [];
 	return {
 		v: 1,
 		project: meta.project,
 		cwd: meta.cwd,
 		remote: meta.remote,
 		source: meta.source || "todo",
-		request: (fresh ? meta.request : prev?.request || meta.request) || "",
-		created: fresh ? now : (prev as TodoState).created,
+		request: (same ? prev?.request || meta.request : meta.request) || "",
+		created: same ? (prev as TodoState).created : now,
 		updated: now,
-		updates: fresh ? 1 : (prev as TodoState).updates + 1,
+		updates: same ? (prev as TodoState).updates + 1 : 1,
 		items,
+		...(removed.length ? { removed } : {}),
 	};
 }
 /** 승인한 계획의 단계 -> 목록 (첫 단계는 하는 중) */
@@ -1050,7 +1230,7 @@ export const planTodo = (steps: string[], now: number, meta: TodoMeta): TodoStat
 	mergeTodo(null, steps.map((text, i) => ({ level: 0, text, status: i === 0 ? "doing" : "todo" })), now, { ...meta, source: "plan" });
 /** 계획을 다듬어 다시 승인: 끝나지 않은 목록(prev)이 있으면 이어 붙임. 앞 목록에서 끝난 단계와 글이 같거나 (끝남) 을 붙인 단계는 끝남,
  *  남은 첫 단계가 하는 중. 같은 단계의 시작·끝 시각과 처음 요청은 이어 감 (겹치는 단계가 없으면 mergeTodo 가 새 목록으로) */
-export function replanTodo(prev: TodoState | null, steps: string[], now: number, meta: TodoMeta, kids: TodoLine[][] = []): TodoState {
+export function replanTodo(prev: TodoState | null, steps: string[], now: number, meta: TodoMeta, kids: TodoLine[][] = [], opts?: { sameTask?: boolean }): TodoState {
 	const old = prev?.items.length && !todoSummary(prev).all ? prev : null;
 	const key = textKey;
 	const doneOld = new Set((old?.items || []).filter((it) => it.level === 0 && it.status === "done").map((it) => key(it.text)));
@@ -1071,7 +1251,7 @@ export function replanTodo(prev: TodoState | null, steps: string[], now: number,
 		const s0 = sub.find((x) => x.status !== "done");
 		if (s0) s0.status = "doing";
 	}
-	return mergeTodo(old, lines, now, { ...meta, source: "plan" });
+	return mergeTodo(old, lines, now, { ...meta, source: "plan" }, opts);
 }
 /** "[N단계 완료]": 맨 위 단계 N (과 그 하위 단계)을 끝내고 다음 단계를 하는 중으로. 바뀌었으면 true */
 export function stepDone(s: TodoState, n: number, now: number): boolean {
@@ -1125,8 +1305,8 @@ export function todoWidget(s: TodoState & { no?: number }): string {
 	const gateText = gate ? ` · ${gate.state === "wait" ? "리뷰 대기" : gate.state === "fix" ? "리뷰에서 고칠 것" : "리뷰 통과"} (${gate.step}단계${gate.by ? ` · ${gate.by}` : ""})` : "";
 	const head =
 		s.source === "plan"
-			? `── 계획 진행 ${sum.done}/${sum.total}${gateText}${rangeLabel(s as Task)}${sum.all && !gate ? " · 모두 완료 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`
-			: `── 할 일 ${sum.done}/${sum.total} (${sum.pct}%)${sum.all ? " · 모두 끝남 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`;
+			? `── 계획 진행 ${sum.done}/${sum.total}${gateText}${rangeLabel(s as Task)}${removedLabel(s)}${sum.all && !gate ? " · 모두 완료 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`
+			: `── 할 일 ${sum.done}/${sum.total} (${sum.pct}%)${removedLabel(s)}${sum.all ? " · 모두 끝남 (다음 요청 때 닫힘)" : stop}${task} · 작업판: /todo open ──`;
 	// 12줄이 넘으면 맨 위 단계와 지금 단계(하는 중, 없으면 남은 첫 단계)의 하위 단계만 (다른 단계는 하위 단계 수만). 2026-11-05 실제 Copilot: 5단계 + 하위 22개
 	let show = s.items.map((it, i) => i);
 	const kidsOf = (i: number) => {
@@ -1325,7 +1505,8 @@ export function addTask(b: Board, s: TodoState, now: number): Task {
 }
 /** 같은 작업의 목록을 바꿈 (번호·상태·by 는 그대로. 단계가 다시 열리면 저절로 완료된 작업은 다시 진행) */
 export function putTask(t: Task, s: TodoState, now: number) {
-	const keep = { id: t.id, no: t.no, state: t.state, closed: t.closed, by: t.by };
+	const removed = s.removed?.length ? s.removed : t.removed;
+	const keep = { id: t.id, no: t.no, state: t.state, closed: t.closed, by: t.by, ...(removed?.length ? { removed: removed.slice(-REMOVED_MAX) } : {}) };
 	Object.assign(t, s, keep);
 	if (t.state === "done" && !t.manual && !todoSummary(t).all) [t.state, t.closed] = ["doing", null];
 	finishIfDone(t, now);
@@ -1629,6 +1810,10 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
 .ic{width:1.2em;text-align:center;flex:none}.no{color:var(--mute);flex:none;min-width:2.6em}.tx{flex:1;min-width:0;overflow-wrap:anywhere}.tm{flex:none;text-align:right;font-size:12.5px;color:var(--mute);white-space:nowrap}
 .todo .ic{color:var(--todo)}.doing .ic,.doing .tx{color:var(--doing)}.doing .tx{font-weight:600}.done .ic{color:var(--done)}.done .tx{color:var(--mute)}
 .kids{font-size:12px;color:var(--mute)}.warn{color:var(--warn)}.empty{padding:20px 4px;color:var(--mute)}
+.removed{margin-top:8px;border-top:1px dashed var(--line);padding-top:6px;font-size:13px;color:var(--mute)}
+.removed>summary{cursor:pointer}.rlist{margin-top:4px}.rrow{display:flex;gap:8px;align-items:baseline;padding:3px 4px}
+.rwhy{font-size:11.5px;border:1px solid var(--line);border-radius:6px;padding:0 5px;white-space:nowrap}
+.rtx{flex:1;min-width:0;overflow-wrap:anywhere}.rtx del{color:var(--mute)}.rpath{font-size:12px;color:var(--mute)}
 </style></head>
 <body><main>
 <h1>pi 작업판</h1><div id="sub" class="mute small"></div>
@@ -1706,14 +1891,55 @@ details.task>summary::-webkit-details-marker{display:none}details.task>summary:b
     });
     return html;
   }
+  var WHY = { dropped: "뺌", reopened: "다시 엶", reset: "되돌림" };
+  function spanUnion(rm) {
+    var known = 0, intervals = [];
+    for (var i = 0; i < rm.length; i++) {
+      var r = rm[i];
+      if (r.started !== null && r.started !== undefined) {
+        known++;
+        if (r.ended > r.started) intervals.push([r.started, r.ended]);
+      }
+    }
+    if (!intervals.length) return { ms: 0, known: known };
+    intervals.sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+    var ms = 0, curStart = intervals[0][0], curEnd = intervals[0][1];
+    for (var j = 1; j < intervals.length; j++) {
+      var st = intervals[j][0], en = intervals[j][1];
+      if (st <= curEnd) {
+        if (en > curEnd) curEnd = en;
+      } else {
+        ms += curEnd - curStart;
+        curStart = st;
+        curEnd = en;
+      }
+    }
+    ms += curEnd - curStart;
+    return { ms: ms, known: known };
+  }
+  function removedHtml(t) {
+    var rm = t.removed || [];
+    if (!rm.length) return "";
+    var u = spanUnion(rm);
+    var rows = rm.map(function (r) {
+      var has = r.started !== null && r.started !== undefined;
+      var tm = has ? (r.approx ? "~" : "") + dur(r.ended - r.started) : "?";
+      var p = r.path ? '<span class=rpath>' + esc(r.path) + " &gt; </span>" : "";
+      return '<div class=rrow><span class=rwhy>' + (WHY[r.why] || esc(r.why)) + '</span><span class=rtx>' + p + "<del>" + esc(r.text) + '</del></span><span class=tm>' + tm + "</span></div>";
+    }).join("");
+    return '<details class=removed><summary>뺀 단계 ' + rm.length + "개 · 쓴 시간 " + (u.known ? dur(u.ms) : "?") + "</summary><div class=rlist>" + rows + "</div></details>";
+  }
   function card(t) {
     var s = sum(t.items || []), op = openMap[t.id] !== undefined ? openMap[t.id] : tab === "open";
+    var rmStarts = (t.removed || []).map(function (x) { return x.started; }).filter(function (x) { return x !== null && x !== undefined; });
+    var allStarts = (s.started ? [s.started] : []).concat(rmStarts);
+    var cardStart = allStarts.length ? Math.min.apply(null, allStarts) : null;
     var end = t.state === "dropped" ? "폐기 " + when(t.closed) : t.state === "done" ? when(s.ended || t.closed) : t.stopped ? "요청 끝 " + when(t.stopped) : t.state === "paused" ? "쉬는 중" : "진행 중";
-    var took = s.started ? dur((t.state === "doing" && !t.stopped ? Date.now() : s.ended || t.closed || t.stopped || t.updated) - s.started) : "—";
+    var took = cardStart ? dur((t.state === "doing" && !t.stopped ? Date.now() : s.ended || t.closed || t.stopped || t.updated) - cardStart) : "—";
     return '<details class="task st-' + t.state + '" data-id="' + t.id + '"' + (op ? " open" : "") + "><summary><span class=tno>#" + t.no + "</span><span class=ttl>" + esc(t.request || "(요청 글 없음)") +
       "</span>" + (t.range ? '<span class="bd">범위 ' + t.range.from + "~" + t.range.to + "단계</span>" : "") + badge(t, s) + '<span class=prog><i style="width:' + s.pct + '%"></i></span><span class=cnt>' + s.done + "/" + s.total + "</span><span class=up data-u=" + t.updated + ">" + ago(t.updated) + "</span></summary>" +
-      '<div class=body><div class=grid><div><b>시작</b>' + when(s.started || t.created) + "</div><div><b>끝</b>" + end + "</div><div><b>걸린 시간</b>" + took + "</div><div><b>마지막 갱신</b>" + when(t.updated) +
-      "</div><div><b>목록</b>" + (t.source === "plan" ? "승인한 계획" : "pi 가 만든 목록") + "</div></div>" + cmds(t) + steps(t) + "</div></details>";
+      '<div class=body><div class=grid><div><b>시작</b>' + when(cardStart || t.created) + "</div><div><b>끝</b>" + end + "</div><div><b>걸린 시간</b>" + took + "</div><div><b>마지막 갱신</b>" + when(t.updated) +
+      "</div><div><b>목록</b>" + (t.source === "plan" ? "승인한 계획" : "pi 가 만든 목록") + "</div></div>" + cmds(t) + steps(t) + removedHtml(t) + "</div></details>";
   }
   function render() {
     var tasks = (data && data.tasks) || [], open = tasks.filter(opened), closed = tasks.filter(function (t) { return !opened(t); });
@@ -2649,7 +2875,7 @@ export default function (pi: ExtensionAPI) {
 				const now0 = openTodoOf();
 				const made = replanTodo(now0, found, Date.now(), meta, kids);
 				const refine = !!now0 && (made.updates > 1) !== flipped;
-				const task = refine || !flipped ? made : replanTodo(null, found, Date.now(), meta, kids);
+				const task = !refine ? replanTodo(null, found, Date.now(), meta, kids) : made.updates === 1 ? replanTodo(now0, found, Date.now(), meta, kids, { sameTask: true }) : made;
 				const plan = how ? planOutline(found, kids) : "";
 				if (how === "fresh") {
 					// 새 대화로 진행 (2026-11-05, Claude Code 의 '승인할 때 대화 비우기' 를 보고): pi 는 새 세션을 명령에서만 열 수 있어,
@@ -2881,7 +3107,8 @@ export default function (pi: ExtensionAPI) {
 				lines = fit;
 			}
 			const meta = { project: w.project, cwd: w.cwd, remote: w.remote, request: lastReq };
-			const next = mergeTodo(prev, lines, Date.now(), { ...meta, source: prev?.source === "plan" ? "plan" : "todo" });
+			const newlyRemoved: RemovedStep[] = [];
+			const next = mergeTodo(prev, lines, Date.now(), { ...meta, source: prev?.source === "plan" ? "plan" : "todo" }, { sameTask: !!prev && (!!prev.range || sameReq), range: prev?.range, outRemoved: newlyRemoved });
 			const topKeys = (s: TodoState) => s.items.filter((it) => it.level === 0).map((it) => textKey(it.text));
 			const topDiff = (() => {
 				const a = prev ? topKeys(prev) : [];
@@ -2931,13 +3158,17 @@ export default function (pi: ExtensionAPI) {
 				const pick = await ctx.ui.select(title, opts);
 				if (pick === OPT_OVERWRITE && canOverwrite) {
 					// 덮어쓰기: 현재 작업을 이 목록으로 고친다
-					await updateTask(ctx, next, alias);
+					const overRemoved: RemovedStep[] = [];
+					const overNext = mergeTodo(prev, lines, Date.now(), { ...meta, source: prev?.source === "plan" ? "plan" : "todo" }, { sameTask: true, range: prev?.range, outRemoved: overRemoved });
+					await updateTask(ctx, overNext, alias);
 					listUpdated();
 					const s = todoSummary(cur());
-					const notes = todoNotes(read, prev, next);
+					const notes = todoNotes(read, prev, overNext, overRemoved);
+					const rmNote = removedNotice(overRemoved);
 					return reply(
 						`할 일 목록을 고쳤습니다 (끝남 ${s.done}/${s.total}${s.current ? `, 하는 중: ${s.current}` : ""})` +
-							(notes.length ? `\n확인할 것: ${notes.join(" / ")}` : ""),
+							(notes.length ? `\n확인할 것: ${notes.join(" / ")}` : "") +
+							(rmNote ? `\n${rmNote}` : ""),
 					);
 				}
 				if (pick === OPT_SKIP || !pick) {
@@ -2976,7 +3207,8 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (sameTask) await updateTask(ctx, next, alias);
 			else {
-				mixed = !!prev && next.updates > 1; // 앞 작업의 단계를 섞어 보냄
+				// 앞 작업의 단계를 섞어 보냄: 글이 같은 단계가 있을 때만 (같은 요청이면 겹침이 없어도 next 가 같은 작업으로 이어져 updates > 1 이 됨)
+				mixed = !!prev && lines.some((l) => prev.items.some((o) => o.level === l.level && textKey(o.text) === textKey(l.text)));
 				taskResult = await newTask(ctx, mergeTodo(null, lines, Date.now(), { ...meta, source: "todo" }));
 			}
 			if (sameTask && gateStep > 0) {
@@ -2987,15 +3219,17 @@ export default function (pi: ExtensionAPI) {
 			}
 			listUpdated();
 			const s = todoSummary(cur());
-			const notes = todoNotes(read, sameTask ? prev : null, sameTask ? next : null);
+			const notes = todoNotes(read, sameTask ? prev : null, sameTask ? next : null, sameTask ? newlyRemoved : undefined);
 			const paused = taskResult.paused;
 			const newTaskNote = taskResult.note
 				? ` · 새 작업 #${cur()?.no} (${taskResult.note}${mixed ? ". 앞 작업의 단계는 작업판에 있으니 이 목록에는 이 작업의 단계만 적어 주세요" : ""}. 앞 작업을 끝낼 일이면 사용자가 /todo 완료 ${(paused as Task)?.no})`
 				: "";
+			const rmNote = sameTask ? removedNotice(newlyRemoved) : "";
 			return reply(
 				`할 일 목록을 고쳤습니다 (끝남 ${s.done}/${s.total}${s.current ? `, 하는 중: ${s.current}` : ""})` +
 					newTaskNote +
-					(notes.length ? `\n확인할 것: ${notes.join(" / ")}` : ""),
+					(notes.length ? `\n확인할 것: ${notes.join(" / ")}` : "") +
+					(rmNote ? `\n${rmNote}` : ""),
 			);
 		},
 	});
@@ -3058,7 +3292,7 @@ export default function (pi: ExtensionAPI) {
 				const s = todoSummary(t);
 				const where = here(t) ? "" : ` · ${t.project}`;
 				const gate = t.gate ? ` · ${t.gate.state === "wait" ? "리뷰 대기" : t.gate.state === "fix" ? "리뷰에서 고칠 것" : "리뷰 통과"} (${t.gate.step}단계${t.gate.by ? ` · ${t.gate.by}` : ""})` : "";
-				return `${t.id === curId ? "▶" : " "} #${t.no} ${cut(t.request || "(요청 글 없음)", 40)} — ${t.source === "plan" ? "계획" : "할 일"} ${s.done}/${s.total} · ${t.id === curId ? "지금 작업" : t.state === "paused" ? "쉬는 중" : "하는 중"}${gate}${rangeLabel(t)}${where}`;
+				return `${t.id === curId ? "▶" : " "} #${t.no} ${cut(t.request || "(요청 글 없음)", 40)} — ${t.source === "plan" ? "계획" : "할 일"} ${s.done}/${s.total} · ${t.id === curId ? "지금 작업" : t.state === "paused" ? "쉬는 중" : "하는 중"}${gate}${rangeLabel(t)}${removedLabel(t)}${where}`;
 			};
 			ctx.ui.notify(
 				open.length
